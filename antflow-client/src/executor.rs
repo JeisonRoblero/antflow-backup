@@ -913,7 +913,7 @@ pub async fn run_task(
                                     })).await;
                                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 }
-                                if let Ok(img) = take_screenshot(patterns).await {
+                                if let Ok(img) = take_screenshot(patterns, prompt).await {
                         messages.push(ChatMessage::with_image(
                             &format!(
                                 "[SCREEN] Task: \"{}\". Pick ONE element, get its x/y from this image, output JSON action NOW. \
@@ -1219,7 +1219,7 @@ pub async fn run_task(
                             "Screenshot requested but this model has no vision capability."));
                         continue 'cgae;
                     }
-                    let img = take_screenshot(patterns).await?;
+                    let img = take_screenshot(patterns, prompt).await?;
                     messages.push(ChatMessage::with_image("Current screen:", &img));
                     continue 'cgae;
                 }
@@ -1647,7 +1647,7 @@ public class WinFocus {{
                         ));
                         continue;
                     }
-                    let img = take_screenshot(patterns).await?;
+                    let img = take_screenshot(patterns, prompt).await?;
 
                     let new_hash = screenshot_hash(&img);
                     let screen_changed = last_screenshot_hash
@@ -1926,7 +1926,7 @@ $hwnd = [Win32]::GetForegroundWindow()
 
         // After plan completes, take one screenshot and re-enter loop so AI sees real state
         if vision_capable && failed.is_none() && early_done.is_none() {
-            if let Ok(img) = take_screenshot(patterns).await {
+            if let Ok(img) = take_screenshot(patterns, prompt).await {
                 dbg_log!("[cycle {}] post-plan screenshot injected", cycles);
 
                 let new_hash = screenshot_hash(&img);
@@ -1976,7 +1976,7 @@ $hwnd = [Win32]::GetForegroundWindow()
                 return Ok(plan_summary);
             }
 
-            let img = take_screenshot(patterns).await?;
+            let img = take_screenshot(patterns, prompt).await?;
 
             let new_hash = screenshot_hash(&img);
             last_screenshot_hash = Some(new_hash);
@@ -2029,9 +2029,146 @@ $hwnd = [Win32]::GetForegroundWindow()
     }
 }
 
-async fn take_screenshot(patterns: &RedactPatterns) -> Result<String> {
+fn get_target_app_and_text(prompt: &str) -> (Option<&'static str>, Option<String>) {
+    let prompt_lower = prompt.to_lowercase();
+    
+    let target_app = if prompt_lower.contains("word") || prompt_lower.contains("winword") {
+        Some("word")
+    } else if prompt_lower.contains("excel") {
+        Some("excel")
+    } else if prompt_lower.contains("notepad") || prompt_lower.contains("bloc de notas") || prompt_lower.contains("wordpad") {
+        Some("notepad")
+    } else if prompt_lower.contains("paint") || prompt_lower.contains("mspaint") || prompt_lower.contains("dibujar") {
+        Some("paint")
+    } else {
+        None
+    };
+
+    let mut target_text = None;
+    if let Some(start_idx) = prompt.find('"') {
+        if let Some(end_idx) = prompt[start_idx + 1..].find('"') {
+            target_text = Some(prompt[start_idx + 1..start_idx + 1 + end_idx].to_string());
+        }
+    }
+    if target_text.is_none() {
+        if let Some(start_idx) = prompt.find('\'') {
+            if let Some(end_idx) = prompt[start_idx + 1..].find('\'') {
+                target_text = Some(prompt[start_idx + 1..start_idx + 1 + end_idx].to_string());
+            }
+        }
+    }
+    if target_text.is_none() {
+        if let Some(start_idx) = prompt.find('«') {
+            if let Some(end_idx) = prompt[start_idx + 1..].find('»') {
+                target_text = Some(prompt[start_idx + 1..start_idx + 1 + end_idx].to_string());
+            }
+        }
+    }
+
+    (target_app, target_text)
+}
+
+#[cfg(windows)]
+fn autofocus_target_app(prompt: &str) {
+    let (app, text) = get_target_app_and_text(prompt);
+    if app.is_none() {
+        return;
+    }
+    let app = app.unwrap();
+    let text_val = text.unwrap_or_default().replace("'", "''");
+
+    let script = match app {
+        "word" => format!(r#"
+$found = $false
+try {{
+    $word = [Runtime.InteropServices.Marshal]::GetActiveObject('Word.Application')
+    if ($word) {{
+        foreach ($doc in $word.Documents) {{
+            if ($doc.Content.Text -like '*{text_val}*') {{
+                $wshell = New-Object -ComObject WScript.Shell
+                $wshell.AppActivate($word.Caption) | Out-Null
+                $found = $true
+                break
+            }}
+        }}
+    }}
+}} catch {{}}
+if (-not $found) {{
+    $wordProc = Get-Process winword -ErrorAction SilentlyContinue
+    if ($wordProc) {{
+        $wshell = New-Object -ComObject WScript.Shell
+        $wshell.AppActivate($wordProc[0].Id) | Out-Null
+    }} else {{
+        Start-Process winword
+    }}
+}}
+"#),
+        "excel" => format!(r#"
+$found = $false
+try {{
+    $excel = [Runtime.InteropServices.Marshal]::GetActiveObject('Excel.Application')
+    if ($excel) {{
+        foreach ($wb in $excel.Workbooks) {{
+            foreach ($sheet in $wb.Sheets) {{
+                $range = $sheet.UsedRange
+                if ($range) {{
+                    $foundCell = $range.Find('{text_val}')
+                    if ($foundCell) {{
+                        $wshell = New-Object -ComObject WScript.Shell
+                        $wshell.AppActivate($excel.Caption) | Out-Null
+                        $found = $true
+                        break
+                    }}
+                }}
+            }}
+            if ($found) {{ break }}
+        }}
+    }}
+}} catch {{}}
+if (-not $found) {{
+    $excelProc = Get-Process excel -ErrorAction SilentlyContinue
+    if ($excelProc) {{
+        $wshell = New-Object -ComObject WScript.Shell
+        $wshell.AppActivate($excelProc[0].Id) | Out-Null
+    }} else {{
+        Start-Process excel
+    }}
+}}
+"#),
+        "notepad" => r#"
+$notepads = Get-Process notepad -ErrorAction SilentlyContinue
+if ($notepads) {
+    $wshell = New-Object -ComObject WScript.Shell
+    $wshell.AppActivate($notepads[0].Id) | Out-Null
+} else {
+    Start-Process notepad
+}
+"#.to_string(),
+        "paint" => r#"
+$paints = Get-Process mspaint -ErrorAction SilentlyContinue
+if ($paints) {
+    $wshell = New-Object -ComObject WScript.Shell
+    $wshell.AppActivate($paints[0].Id) | Out-Null
+} else {
+    Start-Process mspaint
+}
+"#.to_string(),
+        _ => return,
+    };
+
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .spawn();
+}
+
+#[cfg(not(windows))]
+fn autofocus_target_app(_prompt: &str) {}
+
+async fn take_screenshot(patterns: &RedactPatterns, prompt: &str) -> Result<String> {
     hide_console_window();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    #[cfg(windows)]
+    autofocus_target_app(prompt);
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let png = capture_redacted(patterns)?;
     show_console_window();
     Ok(to_base64(&png))

@@ -535,7 +535,8 @@ pub fn run_script(params: &Value) -> Result<Option<String>> {
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("powershell");
-        c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+        let full_script = format!("$ErrorActionPreference = 'Stop'; {}", script);
+        c.args(["-NoProfile", "-NonInteractive", "-Command", &full_script]);
         c
     } else {
         let mut c = std::process::Command::new("sh");
