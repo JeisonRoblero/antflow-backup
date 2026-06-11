@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Antflow</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="libs/katex/katex.min.css">
+<link rel="stylesheet" href="index.css">
+</head>
+<body>
+
+<!-- Native-like Launch Splash Screen -->
+<div id="launch-splash">
+  <div class="splash-logo">
+    <svg viewBox="0 0 24 24" width="80" height="80" fill="none" stroke="var(--accent)" stroke-width="2.2">
+      <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+    </svg>
+  </div>
+  <div class="splash-title">Antflow</div>
+  <div class="splash-spinner"></div>
+</div>
+
+<!-- Diagnostic Debug Banner (auto-hides in production) -->
+<div id="debug-banner" style="position:fixed;top:0;left:0;right:0;background:rgba(220,38,38,0.95);color:white;font-family:'DM Mono',monospace;font-size:11px;padding:10px 12px;z-index:99999;display:none;max-height:130px;overflow-y:auto;border-bottom:2px solid #ef4444;box-shadow:0 4px 12px rgba(0,0,0,0.5);word-break:break-all;pointer-events:auto;">
+  <div style="font-weight:bold;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center;">
+    <span>⚠ JS Error:</span>
+    <button onclick="this.parentElement.parentElement.style.display='none'" style="background:none;border:none;color:white;font-size:16px;cursor:pointer;padding:0 4px;">×</button>
+  </div>
+  <pre id="debug-errs" style="white-space:pre-wrap;margin:0;font-size:10px;"></pre>
+</div>
+
+<!-- Draggable titlebar area spanning the top -->
+<div id="max-titlebar" data-tauri-drag-region></div>
+
+<!-- Maximized Status & Title (visible only when maximized) -->
+<div id="max-status-container" data-tauri-drag-region>
+  <div class="max-app-title" data-tauri-drag-region>Antflow</div>
+  <div class="max-status-chip" onclick="openOverlay('model')">
+    <span id="max-status-model">-</span>
+    <span class="max-status-divider">|</span>
+    <span id="max-status-ctx">-</span>
+  </div>
+</div>
+
+<!-- Custom Context Menu -->
+<div id="context-menu" class="hidden">
+  <button onclick="contextMenuCopy()">Copy</button>
+  <button onclick="contextMenuPaste()">Paste</button>
+  <button onclick="contextMenuClearChat()">Clear Chat</button>
+  <div class="context-menu-divider"></div>
+  <button onclick="toggleMaximize()">Toggle Fullscreen</button>
+</div>
+
+<!-- Maximized Window Controls (visible only when maximized) -->
+<div id="max-window-controls">
+  <button class="hbtn wbtn wbtn-toggle" id="hbtn-toggle-view" title="Toggle Compact View" onclick="toggleCompactView()">
+    <svg viewBox="0 0 24 24"><path d="M4 14h6v6M20 10h-6V4M14 10l7-7M10 14l-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>
+  <button class="hbtn wbtn wbtn-min" title="Minimize" onclick="minimizeWindow()">
+    <svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="2" rx="1"/></svg>
+  </button>
+  <button class="hbtn wbtn wbtn-max" id="hbtn-max-global" title="Restore" onclick="toggleMaximize()">
+    <svg viewBox="0 0 24 24"><rect x="4" y="9" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="9" y="4" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+  </button>
+  <button class="hbtn wbtn wbtn-close danger" title="Close" onclick="closeApp()">
+    <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+  </button>
+</div>
+
+<!-- Slide-in Sidebar (visible only when maximized) -->
+<div id="max-sidebar">
+  <div class="sidebar-header" data-tauri-drag-region>
+    <span class="sidebar-title" data-tauri-drag-region>Antflow Workspace</span>
+  </div>
+  
+  <div class="sidebar-section" id="sidebar-convs" style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
+    <div class="sidebar-section-header">
+      <span>Conversations</span>
+      <button class="sidebar-action-btn" onclick="newConversationSidebar()" title="New conversation">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+      </button>
+    </div>
+    <div id="sidebar-conv-list" class="sidebar-list" style="flex: 1; overflow-y: auto;"></div>
+  </div>
+
+  <!-- System/Device Info Section -->
+  <div class="sidebar-section" id="sidebar-device">
+    <div class="sidebar-section-header" style="cursor: pointer;" onclick="toggleSidebarDevice()">
+      <span>System Stats</span>
+      <button class="sidebar-action-btn" id="sidebar-device-toggle" title="Toggle System Stats">
+        <svg id="device-arrow-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" style="transition: transform 0.2s;"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      </button>
+    </div>
+    <div id="sidebar-device-content" class="sidebar-device-grid">
+      <!-- Loaded dynamically via JS -->
+    </div>
+  </div>
+
+  <!-- Clickable footer links in sidebar -->
+  <div class="sidebar-footer-links">
+    <button class="sidebar-link-btn" onclick="openOverlay('tasks')" title="Open Scheduled Tasks">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="10"></circle>
+        <polyline points="12 6 12 12 16 14"></polyline>
+      </svg>
+      <span>Scheduled Tasks</span>
+      <svg class="chevron-right" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+    </button>
+    <button class="sidebar-link-btn" onclick="openOverlay('settings')" title="Open Settings">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"></circle>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+      </svg>
+      <span>Settings</span>
+      <svg class="chevron-right" viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+    </button>
+  </div>
+</div>
+
+<!-- Sidebar Toggle Button (visible only when maximized) -->
+<button id="sidebar-toggle" onclick="event.stopPropagation(); toggleSidebar()" title="Toggle Sidebar">
+  <svg class="burger-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="3" y1="6" x2="21" y2="6"></line>
+    <line x1="3" y1="12" x2="21" y2="12"></line>
+    <line x1="3" y1="18" x2="21" y2="18"></line>
+  </svg>
+  <svg class="close-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18"></line>
+    <line x1="6" y1="6" x2="18" y2="18"></line>
+  </svg>
+</button>
+
+<!-- Wake word indicator -->
+<div id="wake-indicator">
+  <div class="wake-dot"></div>
+  <span>Say your command...</span>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<!-- Onboarding overlay -->
+<div id="onboarding">
+  <div class="ob-card" id="ob-card"><!-- filled by JS --></div>
+</div>
+
+<!-- Model select panel -->
+<div class="overlay" id="overlay-model">
+  <div class="panel" style="max-height:420px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <button class="panel-back" onclick="goBackOverlay('model')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg><span>Back</span></button>
+      <span class="panel-title">Switch Model</span>
+      <button class="panel-close" onclick="closeOverlay('model')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-search-wrapper" style="padding: 16px 20px 16px 20px; flex-shrink: 0;">
+      <input class="panel-search" id="model-search" placeholder="Search models..." style="margin-bottom:0">
+    </div>
+    <div class="panel-body" id="model-panel-body" style="flex:1;overflow-y:auto;padding-top:0">
+      <div id="model-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Conversations panel -->
+<div class="overlay" id="overlay-conv">
+  <div class="panel" style="max-height:380px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <button class="panel-back" onclick="goBackOverlay('conv')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg><span>Back</span></button>
+      <span class="panel-title">Conversations</span>
+      <button class="panel-close" onclick="closeOverlay('conv')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="flex:1;overflow-y:auto">
+      <button class="new-conv-btn" id="new-conv-btn">
+        <svg viewBox="0 0 24 24"><path d="M19 11H13V5h-2v6H5v2h6v6h2v-6h6z"/></svg>
+        New conversation
+      </button>
+      <div id="conv-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Tasks panel -->
+<div class="overlay" id="overlay-tasks">
+  <div class="panel" style="max-height:400px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <button class="panel-back" onclick="goBackOverlay('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg><span>Back</span></button>
+      <span class="panel-title">Scheduled Tasks</span>
+      <button class="panel-close" onclick="closeOverlay('tasks')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="flex:1;overflow-y:auto" id="tasks-body">
+      <div id="tasks-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings panel -->
+<div class="overlay" id="overlay-settings">
+  <div class="panel" style="max-height:420px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <button class="panel-back" onclick="goBackOverlay('settings')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg><span>Back</span></button>
+      <span class="panel-title">Settings</span>
+      <button class="panel-close" onclick="closeOverlay('settings')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="flex:1;overflow-y:auto" id="settings-body">
+    </div>
+  </div>
+</div>
+
+<!-- API Key Verification Overlay -->
+<div class="overlay" id="overlay-apikey">
+  <div class="panel" style="max-width:400px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <button class="panel-back" onclick="goBackOverlay('apikey')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg><span>Back</span></button>
+      <span class="panel-title">Verify API Key</span>
+      <button class="panel-close" onclick="closeOverlay('apikey')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="padding:16px 20px">
+      <div id="apikey-title" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;text-align:center"></div>
+      <input class="panel-search" id="apikey-input" type="password" placeholder="sk-..." style="margin-bottom:16px">
+      <div id="apikey-status" style="font-size:12px;margin-bottom:16px;min-height:18px;text-align:center;font-weight:500"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="task-btn" onclick="closeOverlay('apikey')">Cancel</button>
+        <button class="task-btn" id="apikey-verify-btn" style="background:var(--accent);color:#fff;border-color:var(--accent)" onclick="verifyAndSaveKey()">Verify & Switch</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Custom Confirmation Modal -->
+<div class="overlay" id="overlay-confirm">
+  <div class="panel" style="max-width:380px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <span class="panel-title" id="confirm-title">Confirm</span>
+      <button class="panel-close" onclick="closeOverlay('confirm')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="padding:16px 20px;text-align:center">
+      <div id="confirm-message" style="font-size:13px;color:var(--text-secondary);margin-bottom:20px;line-height:1.5"></div>
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="task-btn" id="confirm-cancel-btn">Cancel</button>
+        <button class="task-btn" id="confirm-ok-btn" style="background:var(--accent);color:#fff;border-color:var(--accent)">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Custom Prompt Modal for Renaming -->
+<div class="overlay" id="overlay-prompt">
+  <div class="panel" style="max-width:380px;display:flex;flex-direction:column">
+    <div class="panel-header">
+      <span class="panel-title" id="prompt-title">Rename</span>
+      <button class="panel-close" onclick="closeOverlay('prompt')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+    </div>
+    <div class="panel-body" style="padding:16px 20px">
+      <div id="prompt-message" style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.5"></div>
+      <input class="panel-search" id="prompt-input" style="margin-bottom:16px">
+      <div style="display:flex;gap:10px;justify-content:flex-end">
+        <button class="task-btn" id="prompt-cancel-btn">Cancel</button>
+        <button class="task-btn" id="prompt-ok-btn" style="background:var(--accent);color:#fff;border-color:var(--accent)">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+<!-- Local On-Device AI Setup Overlay (Mobile Only) -->
+<div class="overlay" id="overlay-mobile-setup">
+  <div class="panel" style="max-width:400px; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; padding:32px 24px;">
+    <div style="margin-bottom:20px; width:64px; height:64px; border-radius:50%; background:rgba(91,159,255,0.1); display:flex; align-items:center; justify-content:center;">
+      <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="var(--accent)" stroke-width="2.2" style="animation: pulse 2s infinite ease-in-out;">
+        <rect x="4" y="4" width="16" height="16" rx="3" />
+        <path d="M9 9h6v6H9z" />
+        <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 15h3M1 9h3M1 15h3" />
+      </svg>
+    </div>
+    <span class="panel-title" style="font-size:22px; font-weight:700; margin-bottom:10px; color:var(--text-primary);">Set Up Local AI</span>
+    <div id="mobile-setup-sub" style="font-size:14px; color:var(--text-secondary); line-height:1.6; margin-bottom:24px; max-width:290px;">
+      Downloading local AI on-device engine (~640 MB). This runs 100% offline with zero server connections.
+    </div>
+    
+    <div id="mobile-setup-progress-area" style="width:100%; margin-bottom:28px;">
+      <div class="model-progress-container" style="height:8px; background:rgba(255,255,255,0.06); border-radius:4px; overflow:hidden; position:relative; margin-bottom:10px;">
+        <div id="mobile-setup-progress-bar" style="height:100%; width:0%; background:var(--accent); border-radius:4px; transition:width 0.2s ease;"></div>
+      </div>
+      <div style="display:flex; justify-content:space-between; font-size:12px; color:var(--text-dim); font-family:'DM Mono',monospace; font-weight:500;">
+        <span id="mobile-setup-progress-percent">0%</span>
+        <span id="mobile-setup-progress-size">0 MB / 640 MB</span>
+      </div>
+      <div id="mobile-setup-progress-status" style="font-size:12.5px; color:var(--text-secondary); margin-top:8px; font-style:italic;">Initializing...</div>
+    </div>
+    
+    <div style="display:flex; gap:8px; width:100%; flex-wrap: wrap;">
+      <button class="task-btn" id="mobile-setup-pause-btn" onclick="togglePauseMobileSetup()" style="flex:1; min-width: 80px; border-color:var(--glass-border); color:var(--text-secondary);">Pause</button>
+      <button class="task-btn" id="mobile-setup-bg-btn" onclick="closeOverlay('mobile-setup')" style="flex:1.5; min-width: 120px; background:var(--accent); border-color:var(--accent); color:#fff;">Background</button>
+      <button class="task-btn" id="mobile-setup-cancel-btn" onclick="cancelMobileSetup()" style="flex:1; min-width: 80px; background:rgba(239,68,68,0.15); border-color:rgba(239,68,68,0.25); color:#ef4444;">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Interactive Product Tour Overlay -->
+<div id="tour-overlay" class="hidden">
+  <div id="tour-step-card">
+    <div id="tour-step-header">
+      <span id="tour-step-title">Welcome to Antflow</span>
+      <span id="tour-step-progress">Step 1 of 5</span>
+    </div>
+    <div id="tour-step-body">Learn how to use Antflow's workspace and automation controls.</div>
+    <div id="tour-step-footer">
+      <button class="tour-btn tour-btn-skip" onclick="skipTour()">Skip Tour</button>
+      <button class="tour-btn tour-btn-next" id="tour-next-btn" onclick="nextTourStep()">Next</button>
+    </div>
+  </div>
+</div>
+
+<!-- Main root -->
+<div id="root">
+  <!-- Welcome Container -->
+  <div id="welcome-container">
+    <h1 id="welcome-title">How can I help you today?</h1>
+    <p id="welcome-subtitle">Ask anything or start conversation mode...</p>
+  </div>
+
+  <!-- Messages -->
+  <div id="messages-wrap">
+    <div id="messages"></div>
+  </div>
+
+  <!-- Bar shell -->
+  <div id="bar-shell">
+    <!-- Attachments Preview -->
+    <div id="attachments-preview" class="hidden"></div>
+    <!-- Hover controls (appear on hover) -->
+    <div id="hover-controls">
+      <div id="hover-controls-left">
+        <button class="hbtn" id="hbtn-pin" title="Always on top" onclick="togglePin()">
+          <svg viewBox="0 0 24 24"><path d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2z"/></svg>
+        </button>
+        <button class="hbtn" id="hbtn-conv" title="Conversations" onclick="toggleOverlay('conv')">
+          <svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>
+        </button>
+        <button class="hbtn" id="hbtn-tasks" title="Scheduled tasks" onclick="toggleOverlay('tasks')">
+          <svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>
+        </button>
+        <button class="hbtn" id="hbtn-settings" title="Settings" onclick="toggleOverlay('settings')">
+          <svg viewBox="0 0 24 24"><path d="M20.2 13.1a8 8 0 0 0 .05-1.1 8 8 0 0 0-.05-1.1l2-1.55a.8.8 0 0 0 .2-1l-1.9-3.3a.8.8 0 0 0-.95-.35l-2.35.95a8.5 8.5 0 0 0-1.9-1.1l-.35-2.5a.8.8 0 0 0-.8-.65h-3.8a.8.8 0 0 0-.8.65l-.35 2.5a8.5 8.5 0 0 0-1.9 1.1l-2.35-.95a.8.8 0 0 0-.95.35l-1.9 3.3a.8.8 0 0 0 .2 1l2 1.55a8 8 0 0 0-.05 1.1 8 8 0 0 0 .05 1.1l-2 1.55a.8.8 0 0 0-.2 1l1.9 3.3c.2.35.62.5.95.35l2.35-.95a8.5 8.5 0 0 0 1.9 1.1l.35 2.5c.06.38.38.65.8.65h3.8c.42 0 .74-.27.8-.65l.35-2.5a8.5 8.5 0 0 0 1.9-1.1l2.35.95c.33.15.75 0 .95-.35l1.9-3.3a.8.8 0 0 0-.2-1l-2-1.55zM12 15.4A3.4 3.4 0 1 1 12 8.6a3.4 3.4 0 0 1 0 6.8z"/></svg>
+        </button>
+      </div>
+      <div id="hover-controls-right">
+        <button class="hbtn wbtn wbtn-min" title="Minimize" onclick="minimizeWindow()">
+          <svg viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="2" rx="1"/></svg>
+        </button>
+        <button class="hbtn wbtn wbtn-max" id="hbtn-max" title="Maximize Workspace" onclick="toggleMaximize()">
+          <svg viewBox="0 0 24 24"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="hbtn wbtn wbtn-close danger" title="Close" onclick="closeApp()">
+          <svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        </button>
+      </div>
+    </div>
+
+
+    <!-- Talkbar -->
+    <div id="talkbar" data-tauri-drag-region>
+      <div id="aura"></div>
+
+      <!-- Brand / logo -->
+      <button id="brand-btn" title="Antflow" onclick="toggleOverlay('settings')">
+        <img id="brand-img" src="icon.png" alt="Antflow Logo">
+      </button>
+
+      <!-- Input -->
+      <div id="input-wrap">
+        <textarea id="input" rows="1" placeholder="Ask anything..." autocomplete="off" spellcheck="false"></textarea>
+        <!-- Model Selector Pill -->
+        <div id="talkbar-model-select" onclick="toggleOverlay('model')" title="Click to switch model">
+          <span id="talkbar-model-name">Loading...</span>
+          <svg class="chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="6 9 12 15 18 9"></polyline>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Token ctx -->
+      <div id="ctx-bar" title="Tokens used / limit"></div>
+
+      <!-- Action button -->
+      <button id="action-btn" title="Voice input">
+        <svg id="action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+          <path d="M12 2v20M17 5v14M7 5v14M22 9v6M2 9v6"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<div id="resize-handle"></div>
+
+<script src="libs/katex/katex.min.js" defer></script>
+<script src="libs/mermaid/mermaid.min.js" defer></script>
+<script src="libs/chart/chart.umd.min.js" defer></script>
+<script src="libs/lottie/lottie.min.js" defer></script>
+<!-- Conversation Options Context Menu -->
+<div id="conv-context-menu" style="display:none;">
+  <button id="conv-menu-rename-btn">
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+    Rename
+  </button>
+  <button id="conv-menu-delete-btn" style="color:var(--danger)">
+    <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+    Delete
+  </button>
+</div>
+
+<script src="index.js" defer></script>
+</body>
+</html>

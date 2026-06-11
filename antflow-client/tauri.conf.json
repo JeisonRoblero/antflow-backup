@@ -1,0 +1,50 @@
+{
+  "productName": "Antflow",
+  "version": "0.1.0",
+  "identifier": "com.antflow.app",
+  "build": {
+    "frontendDist": "src-tauri/frontend",
+    "features": ["gui"]
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Antflow",
+        "width": 700,
+        "height": 130,
+        "minWidth": 400,
+        "minHeight": 40,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "resizable": true,
+        "center": false,
+        "skipTaskbar": false,
+        "visible": true,
+        "focus": true,
+        "shadow": false,
+        "browserExtensionsEnabled": false,
+        "userAgent": "Mozilla/5.0 (compatible; Antflow)"
+      }
+    ],
+    "macOSPrivateApi": true,
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ]
+  }
+}

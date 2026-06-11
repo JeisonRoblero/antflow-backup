@@ -1,0 +1,38 @@
+# Rust / Cargo build artifacts
+**/target/
+
+# Built binaries & release installers (Tauri packages)
+**/releases/
+
+# Log files and crash dumps
+*.log
+**/*.log
+**/hs_err_pid*
+**/replay_pid*
+
+# Temporary testing & scratch files
+/fixesUI/
+/matches.txt
+/scratch/
+**/scratch/
+/antflow-client/temp.txt
+
+# Databases (SQLite logs/sessions created locally)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# IDE configurations
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS metadata files
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,103 @@
+[package]
+name = "antflow"
+version = "0.1.0"
+edition = "2021"
+[lib]
+name = "antflow"
+path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["tui"]
+tui = []
+gui = ["tauri"]
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"], optional = true }
+
+# --- Async runtime ---
+tokio = { version = "1", features = ["full"] }
+
+# --- Signal handling ---
+ctrlc = "3"
+
+# --- HTTP client ---
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "blocking", "rustls-tls"] }
+
+# --- JSON serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- TOML config ---
+toml = "0.8"
+
+# --- SQLite ---
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# --- Image encoding / decoding (global for screencap support) ---
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+
+# --- Terminal UI helpers ---
+crossterm = "0.27"
+
+# --- Console spinner / animation ---
+indicatif = "0.17"
+
+# --- Date and time ---
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Cron expression parsing ---
+cron = "0.12"
+
+# --- UUID ---
+uuid = { version = "1", features = ["v4"] }
+
+# --- System info ---
+sysinfo = "0.30"
+
+# --- Open URLs / files ---
+open = "5"
+
+# --- Regex for redaction heuristics ---
+regex = "1"
+
+# --- Random number generation (jitter in retry backoff) ---
+rand = "0.8"
+
+# --- Anyhow for ergonomic error handling ---
+anyhow = "1"
+
+# --- Dirs for platform config paths ---
+dirs = "5"
+
+# --- Process management ---
+async-trait = "0.1"
+ratatui = "0.26"
+gag = "1"
+
+# --- Windows-specific APIs ---
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
+[package.metadata]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = "0.14"
+screenshots = "0.8"
+rusty-tesseract = "1"
+enigo = "0.2"
+arboard = "3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
