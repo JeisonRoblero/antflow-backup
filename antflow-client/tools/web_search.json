@@ -1,0 +1,11 @@
+{
+  "name": "web_search",
+  "description": "Performs a Google search and returns text summaries of search results.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string" }
+    },
+    "required": ["query"]
+  }
+}

@@ -368,6 +368,16 @@ const state = {
   tokenLimit: 0,
   currentConvId: '',
   conversations: [],
+  convSearchQuery: '',
+  sidebarConvSearchQuery: '',
+  convLimit: 20,
+  sidebarConvLimit: 20,
+  runningConvs: {},
+  finishedConvs: new Set(),
+  msgOffset: 0,
+  msgLimit: 20,
+  hasMoreMessages: true,
+  isLoadingMore: false,
   tasks: [],
   cfg: {},
   modelSearch: '',
@@ -389,6 +399,9 @@ const state = {
   windowAiAvailable: false,
   finalTranscript: '',
   forceExpanded: false,
+  historySearch: '',
+  historyPage: 0,
+  historyPageSize: 10,
 };
 
 // ── Chat pattern detection (simple chat vs executor task) ──────────────
@@ -678,7 +691,7 @@ function renderInlineMd(text) {
   const links = [];
   // Images: ![alt](url)
   s = s.replace(/!\[(.*?)\]\((.*?)\)/g, (_, alt, url) => {
-    links.push(`<img src="${url}" alt="${alt}">`);
+    links.push(`<div class="inline-image-wrap"><img src="${url}" alt="${alt}" class="assistant-inline-img" onload="this.closest('.inline-image-wrap').classList.add('loaded')" onerror="handleInlineImageError(this)"></div>`);
     return `\uFFFCZLINKZ${links.length - 1}Z\uFFFC`;
   });
   // Links: [text](url)
@@ -721,6 +734,43 @@ function renderInlineMd(text) {
 function renderMd(text) {
   let s = String(text || '');
   
+  // Protect search widget HTML blocks from layout-breaking line-split & <p> wrapping
+  const searchBoxes = [];
+  let startIndex = s.indexOf('<div class="web-search-box">');
+  while (startIndex !== -1) {
+    let divCount = 1;
+    let scanIndex = startIndex + '<div class="web-search-box">'.length;
+    let foundEnd = false;
+    while (scanIndex < s.length) {
+      const nextOpen = s.indexOf('<div', scanIndex);
+      const nextClose = s.indexOf('</div>', scanIndex);
+      
+      if (nextClose === -1) {
+        break; // Malformed HTML
+      }
+      
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        divCount++;
+        scanIndex = nextOpen + 4;
+      } else {
+        divCount--;
+        scanIndex = nextClose + 6;
+        if (divCount === 0) {
+          const matchStr = s.substring(startIndex, scanIndex);
+          searchBoxes.push(matchStr);
+          const placeholder = `\uFFFCZSEARCHBOXZ${searchBoxes.length - 1}Z\uFFFC`;
+          s = s.substring(0, startIndex) + placeholder + s.substring(scanIndex);
+          foundEnd = true;
+          break;
+        }
+      }
+    }
+    if (!foundEnd) {
+      break;
+    }
+    startIndex = s.indexOf('<div class="web-search-box">');
+  }
+
   // Auto-close unclosed fenced code blocks for smooth token-by-token streaming
   let openBackticks = (s.match(/```/g) || []).length;
   if (openBackticks % 2 === 1) {
@@ -766,7 +816,7 @@ function renderMd(text) {
 
   // 2. Protect safe HTML tags (including custom elements for video, maps, embeds, collapsed details)
   const safeHtmlBlocks = [];
-  const safeTagRegex = /<(\/?)(details|summary|kbd|mark|audio|video|iframe|div|span|br|sub|sup|del|ins|b|i|u|a|img|font)(\s+[^>]*)?>/gi;
+  const safeTagRegex = /<(\/?)(details|summary|kbd|mark|audio|video|iframe|div|span|br|sub|sup|del|ins|b|i|u|a|img|font|svg|path|polyline|circle|line)(\s+[^>]*)?>/gi;
   s = s.replace(safeTagRegex, (match, isClosing, tagName, attrs) => {
     let cleanAttrs = attrs || '';
     if (cleanAttrs) {
@@ -843,6 +893,13 @@ function renderMd(text) {
   for (let i = 0; i < lines.length; i++) {
     let line = lines[i];
     let trimmed = line.trim();
+
+    // Check if line is indented and we are currently in a list (to keep it open and indent content)
+    const hasIndent = line.startsWith('  ') || line.startsWith('\t');
+    if (hasIndent && inList !== 'none' && trimmed !== '') {
+      output.push(`<li style="list-style-type: none; margin-left: 16px; margin-top: 4px; margin-bottom: 8px; color: var(--text-secondary); line-height: 1.55;">${renderInlineMd(trimmed)}</li>`);
+      continue;
+    }
 
     // --- Table ---
     const isTableLine = /^\|.*\|$/.test(trimmed);
@@ -982,10 +1039,313 @@ function renderMd(text) {
     finalHtml = finalHtml.split(`\uFFFCZCODEZ${i}Z\uFFFC`).join(codeBlocks[i]);
   }
 
+  // Restore search widget HTML blocks
+  if (searchBoxes.length > 0) {
+    const parser = new DOMParser();
+    const searches = [];
+    const images = [];
+
+    searchBoxes.forEach(html => {
+      try {
+        const doc = parser.parseFromString(html, 'text/html');
+        
+        const masterResults = doc.querySelector('.master-search-results');
+        if (masterResults) {
+          const queryContainers = doc.querySelectorAll('.web-search-query-container');
+          queryContainers.forEach(container => {
+            const queryEl = container.querySelector('.web-search-query-text');
+            const countEl = container.querySelector('.web-search-query-count');
+            const resultsBox = container.querySelector('.web-search-query-results-box');
+            if (queryEl && resultsBox) {
+              searches.push({
+                query: queryEl.textContent.trim().replace(/^"|"$/g, ''),
+                count: countEl ? countEl.textContent.trim() : '',
+                resultsHtml: resultsBox.innerHTML
+              });
+            }
+          });
+        } else {
+          const queryEl = doc.querySelector('.web-search-q');
+          const countEl = doc.querySelector('.web-search-count');
+          const resultsEl = doc.querySelector('.web-search-results');
+          if (queryEl && resultsEl) {
+            searches.push({
+              query: queryEl.textContent.replace(/^"|"$/g, '').trim(),
+              count: countEl ? countEl.textContent.trim() : '',
+              resultsHtml: resultsEl.innerHTML
+            });
+          } else {
+            const titleEl = doc.querySelector('.web-search-title');
+            if (titleEl && resultsEl) {
+              searches.push({
+                query: titleEl.textContent.replace('Searched the web for', '').replace(/^"|"$/g, '').trim(),
+                count: countEl ? countEl.textContent.trim() : '',
+                resultsHtml: resultsEl.innerHTML
+              });
+            }
+          }
+        }
+
+        const imgCards = doc.querySelectorAll('.web-search-image-card');
+        imgCards.forEach(card => {
+          const img = card.querySelector('.web-search-img');
+          const domainEl = card.querySelector('.web-search-img-domain');
+          if (img && img.src) {
+            if (!images.some(item => item.url === img.src)) {
+              images.push({
+                url: img.src,
+                domain: domainEl ? domainEl.textContent.trim() : ''
+              });
+            }
+          }
+        });
+      } catch (err) {
+        console.warn("Failed to parse search widget HTML:", err);
+      }
+    });
+
+    if (searches.length > 0) {
+      let masterHtml = `
+        <div class="web-search-box">
+          <div class="web-search-header">
+            <svg class="web-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+            <span class="web-search-title">Searched the web (${searches.length} queries)</span>
+            <svg class="web-search-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </div>
+          <div class="web-search-results master-search-results hidden">
+      `;
+
+      searches.forEach(s => {
+        masterHtml += `
+          <div class="web-search-query-container">
+            <div class="web-search-query-header">
+              <svg class="web-search-query-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+              <span class="web-search-query-text">"${s.query}"</span>
+              <span class="web-search-query-count">${s.count}</span>
+            </div>
+            <div class="web-search-query-results-box">
+              ${s.resultsHtml}
+            </div>
+          </div>
+        `;
+      });
+
+      masterHtml += `
+          </div>
+          <div class="web-search-done">
+            <svg class="web-search-done-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+            <span class="web-search-done-text">Search Completed</span>
+          </div>
+      `;
+
+      if (images.length > 0) {
+        masterHtml += `
+          <div class="web-search-images-gallery">
+        `;
+        images.forEach(img => {
+          masterHtml += `
+            <div class="web-search-image-card">
+              <img class="web-search-img" src="${img.url}" alt="Search result" onerror="this.closest('.web-search-image-card').style.display='none';" />
+              <span class="web-search-img-domain">${img.domain}</span>
+            </div>
+          `;
+        });
+        masterHtml += `
+          </div>
+          <span class="web-search-images-caption">Results from the web</span>
+        `;
+      }
+
+      masterHtml += `
+        </div>
+      `;
+
+      for (let i = 0; i < searchBoxes.length; i++) {
+        const replacement = (i === 0) ? masterHtml : "";
+        finalHtml = finalHtml.split(`\uFFFCZSEARCHBOXZ${i}Z\uFFFC`).join(replacement);
+      }
+    } else {
+      for (let i = 0; i < searchBoxes.length; i++) {
+        finalHtml = finalHtml.split(`\uFFFCZSEARCHBOXZ${i}Z\uFFFC`).join(searchBoxes[i]);
+      }
+    }
+  }
+
   return finalHtml;
 }
 
-function renderRichMediaInElement(container) {
+let citationPopup = null;
+let activeCitationPill = null;
+let hoverTimeout = null;
+
+function getOrCreateCitationPopup() {
+  if (citationPopup) return citationPopup;
+  
+  citationPopup = document.createElement('div');
+  citationPopup.className = 'citation-popup hidden';
+  citationPopup.innerHTML = `
+    <div class="citation-popup-header">
+      <div class="citation-popup-nav">
+        <button class="citation-nav-btn prev-btn" title="Previous">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        </button>
+        <button class="citation-nav-btn next-btn" title="Next">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+        </button>
+      </div>
+      <span class="citation-popup-page"></span>
+    </div>
+    <div class="citation-popup-body">
+      <div class="citation-popup-site">
+        <img class="citation-popup-favicon" src="">
+        <span class="citation-popup-domain"></span>
+      </div>
+      <div class="citation-popup-title"></div>
+      <div class="citation-popup-snippet"></div>
+    </div>
+  `;
+  document.body.appendChild(citationPopup);
+  
+  citationPopup.addEventListener('click', (e) => {
+    e.stopPropagation();
+  });
+  
+  const prevBtn = citationPopup.querySelector('.prev-btn');
+  const nextBtn = citationPopup.querySelector('.next-btn');
+  
+  prevBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!activeCitationPill) return;
+    const items = activeCitationPill._citationItems;
+    let idx = activeCitationPill._citationIndex;
+    idx = (idx - 1 + items.length) % items.length;
+    activeCitationPill._citationIndex = idx;
+    activeCitationPill.href = items[idx].url;
+    updateCitationPopupContent(items[idx], idx, items.length);
+  });
+  
+  nextBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!activeCitationPill) return;
+    const items = activeCitationPill._citationItems;
+    let idx = activeCitationPill._citationIndex;
+    idx = (idx + 1) % items.length;
+    activeCitationPill._citationIndex = idx;
+    activeCitationPill.href = items[idx].url;
+    updateCitationPopupContent(items[idx], idx, items.length);
+  });
+  
+  citationPopup.addEventListener('mouseenter', () => {
+    if (hoverTimeout) clearTimeout(hoverTimeout);
+  });
+  
+  citationPopup.addEventListener('mouseleave', () => {
+    hideCitationPopup();
+  });
+  
+  const popupBody = citationPopup.querySelector('.citation-popup-body');
+  popupBody.addEventListener('click', (e) => {
+    if (activeCitationPill) {
+      const items = activeCitationPill._citationItems;
+      const idx = activeCitationPill._citationIndex;
+      const url = items[idx].url;
+      if (url) {
+        if (window.__TAURI__) {
+          window.__TAURI__.core.invoke('open_browser_url', { url }).catch(console.error);
+        } else {
+          window.open(url, '_blank');
+        }
+      }
+    }
+  });
+  
+  return citationPopup;
+}
+
+function updateCitationPopupContent(item, index, total) {
+  const popup = getOrCreateCitationPopup();
+  const pageSpan = popup.querySelector('.citation-popup-page');
+  const favicon = popup.querySelector('.citation-popup-favicon');
+  const domain = popup.querySelector('.citation-popup-domain');
+  const title = popup.querySelector('.citation-popup-title');
+  const snippet = popup.querySelector('.citation-popup-snippet');
+  
+  const navContainer = popup.querySelector('.citation-popup-nav');
+  if (total > 1) {
+    navContainer.style.display = 'flex';
+    pageSpan.style.display = 'inline';
+    pageSpan.textContent = `${index + 1}/${total}`;
+  } else {
+    navContainer.style.display = 'none';
+    pageSpan.style.display = 'none';
+  }
+  
+  favicon.src = `https://icons.duckduckgo.com/ip3/${item.domain}.ico`;
+  favicon.style.display = 'inline-block';
+  domain.textContent = item.domain;
+  title.textContent = item.title;
+  snippet.textContent = item.snippet || "No description available.";
+}
+
+function showCitationPopup(pill) {
+  if (hoverTimeout) clearTimeout(hoverTimeout);
+  activeCitationPill = pill;
+  
+  const items = pill._citationItems;
+  const idx = pill._citationIndex;
+  const item = items[idx];
+  
+  updateCitationPopupContent(item, idx, items.length);
+  
+  const popup = getOrCreateCitationPopup();
+  popup.classList.remove('hidden');
+  
+  const pillRect = pill.getBoundingClientRect();
+  const popupRect = popup.getBoundingClientRect();
+  
+  let left = pillRect.left + (pillRect.width / 2) - (popupRect.width / 2);
+  let top = pillRect.bottom + window.scrollY + 8;
+  
+  if (left < 10) left = 10;
+  if (left + popupRect.width > window.innerWidth - 10) {
+    left = window.innerWidth - popupRect.width - 10;
+  }
+  
+  if (pillRect.bottom + popupRect.height + 20 > window.innerHeight) {
+    top = pillRect.top + window.scrollY - popupRect.height - 8;
+  }
+  
+  popup.style.left = `${left}px`;
+  popup.style.top = `${top}px`;
+}
+
+function hideCitationPopup() {
+  if (hoverTimeout) clearTimeout(hoverTimeout);
+  hoverTimeout = setTimeout(() => {
+    const popup = getOrCreateCitationPopup();
+    popup.classList.add('hidden');
+    activeCitationPill = null;
+  }, 200);
+}
+
+function setupCitationPillEvents(pill) {
+  pill.addEventListener('mouseenter', () => {
+    showCitationPopup(pill);
+  });
+  pill.addEventListener('mouseleave', () => {
+    hideCitationPopup();
+  });
+}
+
+window.addEventListener('scroll', () => {
+  if (citationPopup && !citationPopup.classList.contains('hidden')) {
+    citationPopup.classList.add('hidden');
+  }
+}, { passive: true });
+
+function renderRichMediaInElement(container, isStreaming = false) {
   if (!container) return;
 
   // 1. Render block math
@@ -1024,7 +1384,7 @@ function renderRichMediaInElement(container) {
 
   // 3. Render Mermaid diagrams
   const mermaids = container.querySelectorAll('.lazy-mermaid');
-  if (mermaids.length > 0 && window.mermaid) {
+  if (mermaids.length > 0 && window.mermaid && !isStreaming) {
     mermaids.forEach(async el => {
       const code = el.getAttribute('data-code');
       if (!code || code.trim() === '') {
@@ -1053,7 +1413,7 @@ function renderRichMediaInElement(container) {
 
   // 4. Render ChartJS elements
   const charts = container.querySelectorAll('.lazy-chart');
-  if (charts.length > 0 && window.Chart) {
+  if (charts.length > 0 && window.Chart && !isStreaming) {
     charts.forEach(el => {
       const configStr = el.getAttribute('data-config');
       if (!configStr || configStr.trim() === '') {
@@ -1080,7 +1440,7 @@ function renderRichMediaInElement(container) {
 
   // 5. Render Lottie animations
   const lotties = container.querySelectorAll('.lazy-lottie');
-  if (lotties.length > 0 && window.lottie) {
+  if (lotties.length > 0 && window.lottie && !isStreaming) {
     lotties.forEach(el => {
       const configStr = el.getAttribute('data-config');
       if (!configStr || configStr.trim() === '') {
@@ -1107,6 +1467,161 @@ function renderRichMediaInElement(container) {
         console.warn("Lottie parse/render error:", err);
         el.innerHTML = `<pre class="lottie-raw-fallback">${escHtml(configStr)}</pre>`;
       }
+    });
+  }
+
+  // 6. Wire up DuckDuckGo search widgets
+  const searchBoxes = container.querySelectorAll('.web-search-box');
+  searchBoxes.forEach(widget => {
+    const header = widget.querySelector('.web-search-header');
+    const results = widget.querySelector('.web-search-results');
+    const chevron = widget.querySelector('.web-search-chevron');
+    if (header && results && !header.dataset.listenerWired) {
+      header.dataset.listenerWired = 'true';
+      header.addEventListener('click', (e) => {
+        e.stopPropagation();
+        results.classList.toggle('hidden');
+        if (chevron) {
+          chevron.classList.toggle('open');
+        }
+        syncWindowSize();
+      });
+    }
+  });
+
+  // 7. Wire up conversational link citation pills
+  const contentLinks = Array.from(container.querySelectorAll('a')).filter(a => {
+    return !a.closest('.web-search-box') && !a.classList.contains('citation-pill');
+  });
+
+  if (contentLinks.length > 0) {
+    // Collect all search items from this bubble (or globally if none in this bubble)
+    let searchItems = Array.from(container.querySelectorAll('.web-search-item')).map(item => {
+      const b64Url = item.getAttribute('data-url');
+      const b64Title = item.getAttribute('data-title');
+      const b64Domain = item.getAttribute('data-domain');
+      const b64Snippet = item.getAttribute('data-snippet');
+      return {
+        url: b64Url ? base64ToUtf8(b64Url) : item.querySelector('.web-search-link')?.href || '',
+        title: b64Title ? base64ToUtf8(b64Title) : item.querySelector('.web-search-link')?.textContent || '',
+        domain: b64Domain ? base64ToUtf8(b64Domain) : item.querySelector('.web-search-domain')?.textContent || '',
+        snippet: b64Snippet ? base64ToUtf8(b64Snippet) : ''
+      };
+    });
+
+    if (searchItems.length === 0) {
+      // Fallback: search globally across the chat area
+      searchItems = Array.from(document.querySelectorAll('.web-search-item')).map(item => {
+        const b64Url = item.getAttribute('data-url');
+        const b64Title = item.getAttribute('data-title');
+        const b64Domain = item.getAttribute('data-domain');
+        const b64Snippet = item.getAttribute('data-snippet');
+        return {
+          url: b64Url ? base64ToUtf8(b64Url) : item.querySelector('.web-search-link')?.href || '',
+          title: b64Title ? base64ToUtf8(b64Title) : item.querySelector('.web-search-link')?.textContent || '',
+          domain: b64Domain ? base64ToUtf8(b64Domain) : item.querySelector('.web-search-domain')?.textContent || '',
+          snippet: b64Snippet ? base64ToUtf8(b64Snippet) : ''
+        };
+      });
+    }
+
+    function extractDomain(urlStr) {
+      try {
+        const parsed = new URL(urlStr);
+        let hostname = parsed.hostname;
+        if (hostname.startsWith('www.')) {
+          hostname = hostname.substring(4);
+        }
+        return hostname;
+      } catch (e) {
+        return 'Web';
+      }
+    }
+
+    function normalizeUrl(urlStr) {
+      try {
+        const u = new URL(urlStr);
+        return (u.hostname + u.pathname + u.search).replace(/\/$/, '').toLowerCase();
+      } catch (e) {
+        return urlStr.toLowerCase();
+      }
+    }
+
+    contentLinks.forEach(linkEl => {
+      const url = linkEl.href;
+      if (!url || (!url.startsWith('http://') && !url.startsWith('https://'))) return;
+
+      // Check if the URL points to a direct image resource
+      const isImage = /\.(jpg|jpeg|png|webp|gif|svg|bmp)(?:\?.*)?$/i.test(url) || 
+                      url.toLowerCase().includes('upload.wikimedia.org') || 
+                      url.toLowerCase().includes('/images/');
+
+      if (isImage) {
+        const imgWrap = document.createElement('div');
+        imgWrap.className = 'inline-image-wrap';
+        
+        const img = document.createElement('img');
+        img.className = 'assistant-inline-img';
+        img.alt = linkEl.textContent && !linkEl.textContent.startsWith('http') ? linkEl.textContent : 'Image';
+        img.onload = function() {
+          imgWrap.classList.add('loaded');
+        };
+        img.onerror = function() {
+          if (typeof handleInlineImageError === 'function') {
+            handleInlineImageError(this);
+          }
+        };
+        img.src = url;
+        
+        imgWrap.appendChild(img);
+        linkEl.parentNode.replaceChild(imgWrap, linkEl);
+        return;
+      }
+
+      const domain = extractDomain(url);
+
+      // Find matching search results by domain
+      let matchingItems = searchItems.filter(item => {
+        return extractDomain(item.url).toLowerCase() === domain.toLowerCase();
+      });
+
+      // Ensure exact URL match is first if it exists
+      const exactIdx = matchingItems.findIndex(item => normalizeUrl(item.url) === normalizeUrl(url));
+      if (exactIdx > 0) {
+        const [exact] = matchingItems.splice(exactIdx, 1);
+        matchingItems.unshift(exact);
+      } else if (exactIdx === -1) {
+        // Prepended current link details
+        matchingItems.unshift({
+          url: url,
+          title: linkEl.textContent && !linkEl.textContent.startsWith('http') ? linkEl.textContent : domain,
+          domain: domain,
+          snippet: "Click to visit webpage."
+        });
+      }
+
+      // Create the citation pill element
+      const pill = document.createElement('a');
+      pill.className = 'citation-pill';
+      pill.href = matchingItems[0].url;
+      pill.target = '_blank';
+      pill._citationItems = matchingItems;
+      pill._citationIndex = 0;
+
+      const siteName = matchingItems[0].domain || domain;
+      const extraCount = matchingItems.length - 1;
+      const countBadge = extraCount > 0 ? `<span class="citation-extra-count">+${extraCount}</span>` : '';
+
+      pill.innerHTML = `
+        <img class="citation-favicon" src="https://icons.duckduckgo.com/ip3/${siteName}.ico" onerror="this.style.display='none'">
+        <span class="citation-site-name">${siteName}</span>${countBadge}
+      `;
+
+      // Replace linkEl with the citation pill in the DOM
+      linkEl.parentNode.replaceChild(pill, linkEl);
+
+      // Add event listeners to the pill
+      setupCitationPillEvents(pill);
     });
   }
 }
@@ -1348,9 +1863,36 @@ function splitTextIntoSpeechChunks(text, maxLength) {
   return chunks;
 }
 
+function updateAllTtsButtons() {
+  const buttons = document.querySelectorAll('.speak-btn');
+  buttons.forEach(btn => {
+    const isThisSpeaking = state.ttsSpeaking && btn._speakText === state.ttsActiveText;
+    if (isThisSpeaking) {
+      btn.title = "Stop Speaking";
+      btn.classList.add('speaking');
+      btn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor" stroke="currentColor" stroke-width="2.5"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect></svg>`;
+    } else {
+      btn.title = "Speak Message";
+      btn.classList.remove('speaking');
+      btn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`;
+    }
+  });
+}
+
+function handleSpeakBtnClick(btn, text) {
+  if (state.ttsSpeaking && state.ttsActiveText === text) {
+    cancelTtsQueue();
+  } else {
+    speakText(text);
+  }
+}
+
 function speakText(text) {
   if (!window.speechSynthesis) return;
   cancelTtsQueue();
+  
+  state.ttsActiveText = text;
+  state.ttsStreamFinished = true;
   
   const clean = cleanTextForSpeech(text);
   if (!clean) return;
@@ -1364,6 +1906,7 @@ function speakText(text) {
 
   if (state.ttsQueue.length > 0) {
     speakNextQueueItem();
+    updateAllTtsButtons();
   }
 }
 
@@ -1399,6 +1942,8 @@ function speakNextQueueItem() {
     }
     if (state.ttsStreamFinished) {
       state.ttsSpeaking = false;
+      state.ttsActiveText = '';
+      updateAllTtsButtons();
       state.ttsLastSpokeTime = Date.now();
       state.currentSpokenText = '';
       if (state.listening) {
@@ -1421,9 +1966,12 @@ function speakNextQueueItem() {
   utterance.lang = detectLanguage(text);
   state.ttsActiveUtterance = utterance;
 
+  updateAllTtsButtons();
+
   utterance.onstart = () => {
     state.voiceState = 'speaking';
     updateVoiceVisuals('speaking');
+    updateAllTtsButtons();
     state.finalTranscript = '';
     if (state.listening && recognition) {
       try { recognition.stop(); } catch(_) {}
@@ -1479,6 +2027,8 @@ function cancelTtsQueue() {
   state.ttsQueue = [];
   state.ttsActiveUtterance = null;
   state.ttsSpeaking = false;
+  state.ttsActiveText = '';
+  updateAllTtsButtons();
   state.currentSpokenText = '';
   state.accumulatedSpokenText = '';
   state.ttsLastSpokeTime = 0;
@@ -1527,8 +2077,151 @@ function handleStreamError(stream, accumulatedText, errorMsg) {
   addMsg(String(errorMsg), 'error');
 }
 
+function utf8ToBase64(str) {
+  try {
+    return btoa(unescape(encodeURIComponent(str || '')));
+  } catch (e) {
+    return '';
+  }
+}
+
+function base64ToUtf8(b64) {
+  try {
+    return decodeURIComponent(escape(atob(b64 || '')));
+  } catch (e) {
+    return '';
+  }
+}
+
+function formatSearchWidget(query, results, images) {
+  let html = `
+    <div class="web-search-box">
+      <div class="web-search-header">
+        <svg class="web-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+        <span class="web-search-title">Searched the web for <span class="web-search-q">"${escHtml(query)}"</span></span>
+        <span class="web-search-count">${results.length} results</span>
+        <svg class="web-search-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      </div>
+      <div class="web-search-results hidden">
+  `;
+
+  results.forEach(item => {
+    const b64Url = utf8ToBase64(item.url || '');
+    const b64Title = utf8ToBase64(item.title || '');
+    const b64Domain = utf8ToBase64(item.domain || '');
+    const b64Snippet = utf8ToBase64(item.snippet || '');
+    html += `
+        <div class="web-search-item" data-url="${b64Url}" data-title="${b64Title}" data-domain="${b64Domain}" data-snippet="${b64Snippet}">
+          <img class="web-search-favicon" src="https://icons.duckduckgo.com/ip3/${escAttr(item.domain)}.ico" onerror="this.style.display='none'">
+          <a class="web-search-link" href="${escAttr(item.url)}" target="_blank">${escHtml(item.title)}</a>
+          <span class="web-search-domain">${escHtml(item.domain)}</span>
+        </div>
+    `;
+  });
+
+  html += `
+      </div>
+  `;
+
+  if (images && images.length > 0) {
+    html += `  <div class="web-search-images-gallery">\n`;
+    images.slice(0, 10).forEach(img => {
+      html += `
+        <div class="web-search-image-card">
+          <img class="web-search-img" src="${escAttr(img.url)}" alt="Search result" onerror="this.closest('.web-search-image-card').style.display='none';" />
+          <span class="web-search-img-domain">${escHtml(img.domain)}</span>
+        </div>
+      `;
+    });
+    html += `  </div>\n`;
+    html += `  <span class="web-search-images-caption">Results from the web</span>\n`;
+  }
+
+  html += `
+    </div>
+  `;
+  return html;
+}
+
+function createThinkingElement(secs, stepsList) {
+  const el = document.createElement('div');
+  el.className = 'msg thinking completed';
+  
+  const uniqueId = 'think-' + Math.random().toString(36).substring(2, 9);
+  
+  el.innerHTML = `
+    <div class="think-header">
+      <span class="think-label" id="${uniqueId}-lbl">Thought process</span>
+      <span class="think-secs" id="${uniqueId}-secs">${secs}s</span>
+      <svg class="think-chevron" id="${uniqueId}-chev" viewBox="0 0 24 24">
+        <path fill="currentColor" d="M7 10l5 5 5-5z"/>
+      </svg>
+    </div>
+    <div class="think-steps hidden" id="${uniqueId}-steps"></div>
+  `;
+  
+  const stepsContainer = el.querySelector(`#${uniqueId}-steps`);
+  if (Array.isArray(stepsList)) {
+    stepsList.forEach(step => {
+      const chip = document.createElement('div');
+      chip.className = 'think-step-chip';
+      
+      if (step.startsWith('JSON_SEARCH:')) {
+        try {
+          const payload = JSON.parse(step.substring(12));
+          chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
+          renderRichMediaInElement(chip);
+        } catch(_) {
+          chip.textContent = step;
+        }
+      } else {
+        chip.textContent = step;
+      }
+      stepsContainer.appendChild(chip);
+    });
+  }
+  
+  const header = el.querySelector('.think-header');
+  const chev = el.querySelector('.think-chevron');
+  header.addEventListener('click', () => {
+    stepsContainer.classList.toggle('hidden');
+    chev.classList.toggle('open');
+    syncWindowSize();
+  });
+  
+  return el;
+}
+
 // ── Add message ─────────────────────────────────────────────────────────
-function addMsg(text, role = 'assistant') {
+function createMessageElement(text, role = 'assistant') {
+  if (role === 'thinking') {
+    let secs = 0;
+    let stepsList = [];
+    try {
+      const parsed = JSON.parse(text);
+      secs = parsed.secs || 0;
+      stepsList = parsed.steps || [];
+    } catch (_) {
+      stepsList = [text];
+    }
+    const el = createThinkingElement(secs, stepsList);
+    return { element: el, displayWord: '' };
+  }
+
+  if (role === 'user' && typeof text === 'string') {
+    const trimmed = text.trim();
+    if (
+      (trimmed.startsWith('Step ') && trimmed.includes('failed:') && trimmed.includes('Reply with a corrected plan.')) ||
+      trimmed.startsWith('Command output:') ||
+      trimmed.startsWith('The last command failed with') ||
+      trimmed === 'Executing corrected plan now.' ||
+      trimmed === 'Executing step' ||
+      (trimmed.includes('exit_code=Some') && trimmed.includes('stderr='))
+    ) {
+      return null; // Hide automated feedback loop messages
+    }
+  }
+
   let displayWord = text;
   let userImages = [];
 
@@ -1568,7 +2261,7 @@ function addMsg(text, role = 'assistant') {
         trimmed = lines.join('\n').trim();
       }
       if (trimmed === '{}' || trimmed === '{ }' || trimmed === '') {
-        return; // Filter out empty braces
+        return null; // Filter out empty braces
       }
       if (trimmed.startsWith('{')) {
         try {
@@ -1587,13 +2280,13 @@ function addMsg(text, role = 'assistant') {
               if (keys.length === 1 && keys[0].includes(' ') && keys[0].length > 15) {
                 displayWord = keys[0];
               } else {
-                return; // plan-only JSON, ignore
+                return null; // plan-only JSON, ignore
               }
             }
           }
         } catch (_) {
           if (trimmed.replace(/[{}\s]/g, '') === '') {
-            return; // ignore malformed bracket
+            return null; // ignore malformed bracket
           }
         }
       }
@@ -1601,7 +2294,7 @@ function addMsg(text, role = 'assistant') {
   }
 
   if (!displayWord || displayWord.trim() === '' || displayWord.trim() === '{}') {
-    return;
+    return null;
   }
 
   const el = document.createElement('div');
@@ -1645,112 +2338,141 @@ function addMsg(text, role = 'assistant') {
   }
   el.appendChild(bubble);
 
-  // Generate Timestamp
-  const now = new Date();
-  const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (role === 'user' || role === 'assistant') {
+    // Generate Timestamp
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-  // Create meta action bar
-  const meta = document.createElement('div');
-  meta.className = 'msg-meta';
-  
-  let actionsHtml = '';
-  // Copy button (all bubbles)
-  actionsHtml += `
-    <button class="msg-action-btn copy-btn" title="Copy Message">
-      <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-    </button>
-  `;
-
-  if (role === 'user') {
-    // Edit button
+    // Create meta action bar
+    const meta = document.createElement('div');
+    meta.className = 'msg-meta';
+    
+    let actionsHtml = '';
+    // Copy button (all bubbles)
     actionsHtml += `
-      <button class="msg-action-btn edit-btn" title="Edit Message">
-        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"></path></svg>
+      <button class="msg-action-btn copy-btn" title="Copy Message">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
       </button>
     `;
-    // Retry/Regenerate button
-    actionsHtml += `
-      <button class="msg-action-btn retry-btn" title="Retry/Regenerate">
-        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
-      </button>
-    `;
-  }
 
-  meta.innerHTML = `
-    <span class="msg-time">${timeStr}</span>
-    <div class="msg-actions">${actionsHtml}</div>
-  `;
-  el.appendChild(meta);
-
-  // Wire click listeners:
-  // Copy button
-  meta.querySelector('.copy-btn').addEventListener('click', (e) => {
-    e.stopPropagation();
-    navigator.clipboard.writeText(displayWord).then(() => {
-      toast('Copied message text');
-    });
-  });
-
-  if (role === 'user') {
-    // Retry button
-    meta.querySelector('.retry-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      sendMessage(displayWord);
-    });
-
-    // Edit button
-    meta.querySelector('.edit-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (el.classList.contains('editing')) return;
-      el.classList.add('editing');
-      
-      const originalText = bubble.textContent;
-      bubble.innerHTML = '';
-      
-      const ta = document.createElement('textarea');
-      ta.className = 'msg-edit-textarea';
-      ta.value = originalText;
-      bubble.appendChild(ta);
-      
-      const btnGrp = document.createElement('div');
-      btnGrp.className = 'msg-edit-buttons';
-      btnGrp.innerHTML = `
-        <button class="msg-edit-save-btn">Save & Submit</button>
-        <button class="msg-edit-cancel-btn">Cancel</button>
+    if (role === 'assistant') {
+      actionsHtml += `
+        <button class="msg-action-btn speak-btn" title="Speak Message">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
+        </button>
       `;
-      bubble.appendChild(btnGrp);
-      
-      ta.focus();
+    }
 
-      const cancelEdit = () => {
-        bubble.innerHTML = '';
-        bubble.textContent = originalText;
-        el.classList.remove('editing');
-        syncWindowSize();
-      };
+    if (role === 'user') {
+      // Edit button
+      actionsHtml += `
+        <button class="msg-action-btn edit-btn" title="Edit Message">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4Z"></path></svg>
+        </button>
+      `;
+      // Retry/Regenerate button
+      actionsHtml += `
+        <button class="msg-action-btn retry-btn" title="Retry/Regenerate">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path></svg>
+        </button>
+      `;
+    }
 
-      btnGrp.querySelector('.msg-edit-cancel-btn').addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        cancelEdit();
-      });
+    meta.innerHTML = `
+      <span class="msg-time">${timeStr}</span>
+      <div class="msg-actions">${actionsHtml}</div>
+    `;
+    el.appendChild(meta);
 
-      btnGrp.querySelector('.msg-edit-save-btn').addEventListener('click', async (ev) => {
-        ev.stopPropagation();
-        const newVal = ta.value.trim();
-        if (!newVal) return;
-        
-        let sib = el.nextElementSibling;
-        while (sib) {
-          const next = sib.nextElementSibling;
-          sib.remove();
-          sib = next;
-        }
-
-        el.remove();
-        await sendMessage(newVal);
+    // Wire click listeners:
+    // Copy button
+    meta.querySelector('.copy-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(displayWord).then(() => {
+        toast('Copied message text');
       });
     });
+
+    if (role === 'assistant') {
+      const speakBtn = meta.querySelector('.speak-btn');
+      if (speakBtn) {
+        speakBtn._speakText = displayWord;
+        speakBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          handleSpeakBtnClick(speakBtn, displayWord);
+        });
+      }
+    }
+
+    if (role === 'user') {
+      // Retry button
+      meta.querySelector('.retry-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        sendMessage(displayWord);
+      });
+
+      // Edit button
+      meta.querySelector('.edit-btn').addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (el.classList.contains('editing')) return;
+        el.classList.add('editing');
+        
+        const originalText = bubble.textContent;
+        bubble.innerHTML = '';
+        
+        const ta = document.createElement('textarea');
+        ta.className = 'msg-edit-textarea';
+        ta.value = originalText;
+        bubble.appendChild(ta);
+        
+        const btnGrp = document.createElement('div');
+        btnGrp.className = 'msg-edit-buttons';
+        btnGrp.innerHTML = `
+          <button class="msg-edit-save-btn">Save & Submit</button>
+          <button class="msg-edit-cancel-btn">Cancel</button>
+        `;
+        bubble.appendChild(btnGrp);
+        
+        ta.focus();
+
+        const cancelEdit = () => {
+          bubble.innerHTML = '';
+          bubble.textContent = originalText;
+          el.classList.remove('editing');
+          syncWindowSize();
+        };
+
+        btnGrp.querySelector('.msg-edit-cancel-btn').addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          cancelEdit();
+        });
+
+        btnGrp.querySelector('.msg-edit-save-btn').addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          const newVal = ta.value.trim();
+          if (!newVal) return;
+          
+          let sib = el.nextElementSibling;
+          while (sib) {
+            const next = sib.nextElementSibling;
+            sib.remove();
+            sib = next;
+          }
+
+          el.remove();
+          await sendMessage(newVal);
+        });
+      });
+    }
   }
+
+  return { element: el, displayWord };
+}
+
+function addMsg(text, role = 'assistant') {
+  const res = createMessageElement(text, role);
+  if (!res) return null;
+  const { element: el, displayWord } = res;
 
   msgs.appendChild(el);
   msgs.scrollTop = msgs.scrollHeight;
@@ -2096,7 +2818,10 @@ function addMsgStream(role = 'assistant') {
   return {
     update: (text) => {
       if (text.trim()) {
-        bubble.innerHTML = renderMd(text);
+        const tempDiv = document.createElement('div');
+        tempDiv.innerHTML = renderMd(text);
+        morphDOM(bubble, tempDiv);
+        renderRichMediaInElement(bubble, true);
       }
       msgs.scrollTop = msgs.scrollHeight;
 
@@ -2170,8 +2895,14 @@ function addMsgStream(role = 'assistant') {
       }
     },
     done: (text) => {
-      bubble.innerHTML = renderMd(text);
-      renderRichMediaInElement(bubble);
+      const tempDiv = document.createElement('div');
+      tempDiv.innerHTML = renderMd(text);
+      morphDOM(bubble, tempDiv);
+      renderRichMediaInElement(bubble, false);
+
+      if (state.ttsSpeaking && state.ttsQueue.length >= 0) {
+        state.ttsActiveText = text;
+      }
       
       let actionsHtml = `
         <button class="msg-action-btn copy-btn" title="Copy Message">
@@ -2192,10 +2923,12 @@ function addMsgStream(role = 'assistant') {
       }
       const speakBtn = meta.querySelector('.speak-btn');
       if (speakBtn) {
+        speakBtn._speakText = text;
         speakBtn.addEventListener('click', () => {
-          speakText(text);
+          handleSpeakBtnClick(speakBtn, text);
         });
       }
+      updateAllTtsButtons();
       
       if (state.listening) {
         const remainingText = text.substring(state.ttsProcessedIndex);
@@ -2219,11 +2952,14 @@ function addMsgStream(role = 'assistant') {
 }
 
 // ── Thinking bubble ─────────────────────────────────────────────────────
-function startThinking() {
+function startThinking(initialSteps) {
   if (state.thinkingEl) return;
   state.thinking = true;
   state.accumulatedSpokenText = '';
   state.thinkingSecs = 0;
+
+  const stepsList = (Array.isArray(initialSteps) && initialSteps.length > 0) ? initialSteps : ['Analyzing request...'];
+  state.thinkingSteps = [...stepsList];
 
   if (state.listening) {
     state.voiceState = 'thinking';
@@ -2257,11 +2993,23 @@ function startThinking() {
     syncWindowSize();
   });
 
-  // Pre-populate with initial step
-  const chip = document.createElement('div');
-  chip.className = 'think-step-chip';
-  chip.textContent = 'Analyzing request...';
-  steps.appendChild(chip);
+  // Pre-populate with steps
+  stepsList.forEach(step => {
+    const chip = document.createElement('div');
+    chip.className = 'think-step-chip';
+    if (step.startsWith('JSON_SEARCH:')) {
+      try {
+        const payload = JSON.parse(step.substring(12));
+        chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
+        renderRichMediaInElement(chip);
+      } catch(_) {
+        chip.textContent = step;
+      }
+    } else {
+      chip.textContent = step;
+    }
+    steps.appendChild(chip);
+  });
 
   msgs.appendChild(el);
   msgs.scrollTop = msgs.scrollHeight;
@@ -2276,15 +3024,60 @@ function startThinking() {
 }
 
 function updateThinkingLabel(msg) {
-  const lbl = $('think-lbl');
-  if (lbl) lbl.textContent = msg;
-  const steps = $('think-steps');
+  let lbl = $('think-lbl');
+  let steps = $('think-steps');
+  if (!lbl && state.thinkingEl) {
+    lbl = state.thinkingEl.querySelector('.think-label');
+  }
+  if (!steps && state.thinkingEl) {
+    steps = state.thinkingEl.querySelector('.think-steps');
+  }
+  
+  if (msg.startsWith('JSON_SEARCH:')) {
+    if (lbl) lbl.textContent = 'Searching...';
+  } else {
+    if (lbl) lbl.textContent = msg;
+  }
+  
   if (steps && msg) {
+    // Check if the last step chip has the same message to avoid duplicates
+    const lastChip = steps.lastElementChild;
+    if (lastChip && lastChip.textContent.trim() === msg.trim()) {
+      return;
+    }
     const chip = document.createElement('div');
     chip.className = 'think-step-chip';
-    chip.textContent = msg;
+    
+    if (msg.startsWith('JSON_SEARCH:')) {
+      try {
+        const payload = JSON.parse(msg.substring(12));
+        chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
+        renderRichMediaInElement(chip);
+      } catch(_) {
+        chip.textContent = msg;
+      }
+    } else {
+      chip.textContent = msg;
+    }
+    
     steps.appendChild(chip);
     steps.scrollTop = steps.scrollHeight;
+
+    if (!state.thinkingSteps) {
+      state.thinkingSteps = [];
+    }
+    state.thinkingSteps.push(msg);
+
+    // Also update runningConvs steps if it exists
+    if (state.currentConvId && state.runningConvs && state.runningConvs[state.currentConvId]) {
+      if (!state.runningConvs[state.currentConvId].steps) {
+        state.runningConvs[state.currentConvId].steps = [];
+      }
+      const stepsArr = state.runningConvs[state.currentConvId].steps;
+      if (stepsArr.length === 0 || stepsArr[stepsArr.length - 1] !== msg) {
+        stepsArr.push(msg);
+      }
+    }
   }
 }
 
@@ -2323,6 +3116,16 @@ function stopThinking() {
         syncWindowSize();
       });
     }
+
+    if (state.currentConvId && state.thinkingSteps && state.thinkingSteps.length > 0) {
+      invoke('save_thinking_steps', {
+        session_id: state.currentConvId,
+        steps_json: JSON.stringify({
+          secs: state.thinkingSecs,
+          steps: state.thinkingSteps
+        })
+      }).catch(console.error);
+    }
     
     state.thinkingEl = null;
   }
@@ -2340,6 +3143,7 @@ function stopThinking() {
   }
 }
 
+// ── Send message ────────────────────────────────────────────────────────
 // ── Send message ────────────────────────────────────────────────────────
 async function sendMessage(text) {
   if (!state.currentConvId) {
@@ -2412,6 +3216,14 @@ async function sendMessage(text) {
   addMsg(promptPayload, 'user');
   startThinking();
 
+  if (!state.runningConvs) state.runningConvs = {};
+  state.runningConvs[activeConvIdAtStart] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant' };
+  if (state.finishedConvs) {
+    state.finishedConvs.delete(activeConvIdAtStart);
+  }
+  renderSidebarConvs();
+  renderConvList();
+
   if (state.cfg?.ai?.provider === 'window.ai') {
     let stream = null;
     let session;
@@ -2451,6 +3263,15 @@ async function sendMessage(text) {
       if (session) {
         try { session.destroy(); } catch (_) {}
       }
+    } finally {
+      if (state.runningConvs) {
+        delete state.runningConvs[activeConvIdAtStart];
+        renderSidebarConvs();
+        renderConvList();
+      }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(activeConvIdAtStart);
+      }
     }
     return;
   }
@@ -2480,6 +3301,15 @@ async function sendMessage(text) {
       stopThinking();
     } catch (err) {
       handleStreamError(stream, lastText, err);
+    } finally {
+      if (state.runningConvs) {
+        delete state.runningConvs[activeConvIdAtStart];
+        renderSidebarConvs();
+        renderConvList();
+      }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(activeConvIdAtStart);
+      }
     }
     return;
   }
@@ -2489,7 +3319,7 @@ async function sendMessage(text) {
       currentChatStream = null;
       accumulatedChatReply = "";
 
-      const response = await invoke('run_chat', { prompt: promptPayload, system_language: sysLangPayload });
+      const response = await invoke('run_chat', { prompt: promptPayload, system_language: sysLangPayload, session_id: activeConvIdAtStart });
       const result = typeof response === 'string' ? response : JSON.stringify(response);
       
       if (currentChatStream) {
@@ -2510,6 +3340,15 @@ async function sendMessage(text) {
       const cleanText = extractStreamingMessage(accumulatedChatReply);
       handleStreamError(currentChatStream, cleanText, displayError);
       currentChatStream = null;
+    } finally {
+      if (state.runningConvs) {
+        delete state.runningConvs[activeConvIdAtStart];
+        renderSidebarConvs();
+        renderConvList();
+      }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(activeConvIdAtStart);
+      }
     }
     return;
   }
@@ -2518,9 +3357,17 @@ async function sendMessage(text) {
     currentChatStream = null;
     accumulatedChatReply = "";
 
-    const response = await invoke('run_prompt', { prompt: promptPayload, system_language: sysLangPayload });
+    const response = await invoke('run_prompt', { prompt: promptPayload, system_language: sysLangPayload, session_id: activeConvIdAtStart });
 
     if (activeConvIdAtStart !== state.currentConvId) {
+      if (state.runningConvs) {
+        delete state.runningConvs[activeConvIdAtStart];
+        renderSidebarConvs();
+        renderConvList();
+      }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(activeConvIdAtStart);
+      }
       return;
     }
 
@@ -2528,6 +3375,12 @@ async function sendMessage(text) {
       if (currentChatStream) {
         currentChatStream.cancel();
         currentChatStream = null;
+      }
+      if (state.runningConvs && state.runningConvs[activeConvIdAtStart]) {
+        state.runningConvs[activeConvIdAtStart].thinking = false;
+        state.runningConvs[activeConvIdAtStart].label = 'Waiting for clarification...';
+        renderSidebarConvs();
+        renderConvList();
       }
       showClarification(response.clarification.question, response.clarification.options);
       stopThinking();
@@ -2541,8 +3394,24 @@ async function sendMessage(text) {
       }
       updateTokens(response);
       stopThinking();
+      if (state.runningConvs) {
+        delete state.runningConvs[activeConvIdAtStart];
+        renderSidebarConvs();
+        renderConvList();
+      }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(activeConvIdAtStart);
+      }
     }
   } catch (err) {
+    if (state.runningConvs) {
+      delete state.runningConvs[activeConvIdAtStart];
+      renderSidebarConvs();
+      renderConvList();
+    }
+    if (state.finishedConvs) {
+      state.finishedConvs.add(activeConvIdAtStart);
+    }
     if (activeConvIdAtStart !== state.currentConvId) {
       return;
     }
@@ -2586,7 +3455,16 @@ function showClarification(question, options) {
       btn.classList.add('selected');
       const chosen = options[+btn.dataset.idx];
       const activeConvIdAtStart = state.currentConvId;
-      await invoke('answer_clarification', { answer: chosen });
+      
+      if (!state.runningConvs) state.runningConvs = {};
+      state.runningConvs[activeConvIdAtStart] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant' };
+      if (state.finishedConvs) {
+        state.finishedConvs.delete(activeConvIdAtStart);
+      }
+      renderSidebarConvs();
+      renderConvList();
+
+      await invoke('answer_clarification', { answer: chosen, session_id: activeConvIdAtStart });
       addMsg(chosen, 'user');
       startThinking();
       try {
@@ -2594,6 +3472,14 @@ function showClarification(question, options) {
         accumulatedChatReply = "";
         const res = await invoke('continue_after_clarification', { session_id: activeConvIdAtStart });
         if (activeConvIdAtStart !== state.currentConvId) {
+          if (state.runningConvs) {
+            delete state.runningConvs[activeConvIdAtStart];
+            renderSidebarConvs();
+            renderConvList();
+          }
+          if (state.finishedConvs) {
+            state.finishedConvs.add(activeConvIdAtStart);
+          }
           return;
         }
         const result = typeof res === 'string' ? res : JSON.stringify(res);
@@ -2614,6 +3500,15 @@ function showClarification(question, options) {
         }
         stopThinking();
         addMsg(e, 'error');
+      } finally {
+        if (state.runningConvs) {
+          delete state.runningConvs[activeConvIdAtStart];
+          renderSidebarConvs();
+          renderConvList();
+        }
+        if (state.finishedConvs) {
+          state.finishedConvs.add(activeConvIdAtStart);
+        }
       }
     });
   });
@@ -3444,12 +4339,20 @@ async function stopAgent() {
   try {
     state.forceStopButton = false;
     if (state.listening) {
-      await stopVoiceMode();
+      stopVoiceMode().catch(console.error);
     }
-    await invoke('stop_agent');
+    invoke('stop_agent', { session_id: state.currentConvId }).catch(console.error);
     if (currentChatStream) {
       currentChatStream.cancel();
       currentChatStream = null;
+    }
+    if (state.runningConvs && state.runningConvs[state.currentConvId]) {
+      delete state.runningConvs[state.currentConvId];
+      renderSidebarConvs();
+      renderConvList();
+    }
+    if (state.finishedConvs) {
+      state.finishedConvs.add(state.currentConvId);
     }
     stopThinking();
     addMsg('Stopped', 'system');
@@ -3626,6 +4529,13 @@ async function syncWindowSize() {
   const barShell = $('bar-shell');
   const barHeight = (barShell && barShell.offsetHeight > 0) ? barShell.offsetHeight : 66;
   
+  const slashMenu = $('slash-menu');
+  let slashHeight = 0;
+  if (slashMenu && !slashMenu.classList.contains('hidden')) {
+    const itemsCount = slashMenu.querySelectorAll('.slash-item').length;
+    slashHeight = Math.min(250, itemsCount * 44 + 16);
+  }
+  
   if (expanded) {
     document.body.classList.add('expanded');
     w = 520;
@@ -3633,11 +4543,11 @@ async function syncWindowSize() {
   } else if (isMouseOverBar) {
     document.body.classList.remove('expanded');
     w = 520;
-    h = barHeight + 24 + 50; // Dynamic height based on talkbar & attachments content + hover controls space
+    h = barHeight + 24 + 50 + (slashHeight > 0 ? slashHeight + 10 : 0); // Dynamic height based on talkbar & attachments content + hover controls space + autocomplete
   } else {
     document.body.classList.remove('expanded');
     w = 520;
-    h = barHeight + 24; // Dynamic height based on talkbar & attachments content
+    h = barHeight + 24 + (slashHeight > 0 ? slashHeight + 10 : 0); // Dynamic height based on talkbar & attachments content + autocomplete
   }
   
   window.targetHeight = h;
@@ -5013,21 +5923,43 @@ async function verifyAndSaveKey() {
 
 // ── Conversation list ───────────────────────────────────────────────────
 async function renderConvList() {
+  const list = $('conv-list');
+  if (!list) return;
+
+  const query = ($('conv-search')?.value || '').trim();
   let convs = [];
-  try { convs = await invoke('list_conversations'); } catch(_) {}
+  try {
+    convs = await invoke('list_conversations', { query: query || null });
+  } catch(e) {
+    console.error('[renderConvList] Failed to load conversations:', e);
+  }
   state.conversations = convs;
 
-  const list = $('conv-list');
-  if (!convs.length) {
-    list.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">No conversations yet.</div>';
+  const sorted = convs.sort((a, b) => {
+    const timeA = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
+    const timeB = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
+    return timeB - timeA;
+  });
+
+  if (!sorted.length) {
+    list.innerHTML = `<div style="color:var(--text-dim);font-size:12px;padding:8px">${query ? 'No matching conversations.' : 'No conversations yet.'}</div>`;
     return;
   }
-  list.innerHTML = convs.map(c => {
+
+  list.innerHTML = sorted.map(c => {
     const isActive = c.id === state.currentConvId;
-    const displayName = c.name || c.preview || c.id;
+    const displayName = c.name || cleanPreviewText(c.preview) || c.id;
+    const isRunning = state.runningConvs && state.runningConvs[c.id];
+    const spinnerHtml = isRunning ? `<span class="conv-row-spinner"></span>` : '';
+    const dateHtml = `<span class="conv-date-hover">${escHtml(formatShortDate(c.last_message_at))}</span>`;
+
     return `<div class="conv-row${isActive?' active':''}" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
       <span class="conv-title">${escHtml(displayName)}</span>
-      <button class="conv-options-btn" onclick="event.stopPropagation();showConvOptions(event, '${escAttr(c.id)}', '${escAttr(displayName)}')" title="Options">⋮</button>
+      <div class="conv-meta-actions">
+        ${dateHtml}
+        <button class="conv-options-btn" onclick="event.stopPropagation();showConvOptions(event, '${escAttr(c.id)}', '${escAttr(displayName)}')" title="Options">⋮</button>
+        ${spinnerHtml}
+      </div>
     </div>`;
   }).join('');
 }
@@ -5036,30 +5968,142 @@ onDOMContentLoaded(() => {
   $('new-conv-btn').addEventListener('click', async () => {
     try {
       const id = await invoke('new_conversation');
-      state.currentConvId = id;
-      msgs.innerHTML = '';
-      closeAllOverlays();
+      await loadConversation(id);
       toast('New conversation started');
       updateSidebarIfOpen();
-      syncWindowSize();
     } catch(e) { toast('Error: ' + e); }
   });
 });
 
-async function loadConversation(id) {
-  try {
-    const history = await invoke('load_conversation', { session_id: id });
-    state.currentConvId = id;
-    msgs.innerHTML = '';
-    if (Array.isArray(history)) {
-      history.forEach(m => {
-        if (m.role !== 'system') addMsg(m.content, m.role);
-      });
+function reorderHistoryMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  const reordered = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg.role === 'thinking') {
+      if (reordered.length > 0 && reordered[reordered.length - 1].role === 'assistant') {
+        const assistantMsg = reordered.pop();
+        reordered.push(msg);
+        reordered.push(assistantMsg);
+      } else {
+        reordered.push(msg);
+      }
+    } else {
+      reordered.push(msg);
     }
+  }
+  return reordered;
+}
+
+function prependMessages(messages) {
+  const ordered = reorderHistoryMessages(messages);
+  if (ordered.length === 0) return;
+  const fragment = document.createDocumentFragment();
+  ordered.forEach(m => {
+    if (m.role === 'system') return;
+    const res = createMessageElement(m.content, m.role);
+    if (res) {
+      fragment.appendChild(res.element);
+    }
+  });
+  if (msgs.firstChild) {
+    msgs.insertBefore(fragment, msgs.firstChild);
+  } else {
+    msgs.appendChild(fragment);
+  }
+}
+
+function appendMessages(messages) {
+  const ordered = reorderHistoryMessages(messages);
+  if (ordered.length === 0) return;
+  const fragment = document.createDocumentFragment();
+  ordered.forEach(m => {
+    if (m.role === 'system') return;
+    const res = createMessageElement(m.content, m.role);
+    if (res) {
+      fragment.appendChild(res.element);
+    }
+  });
+  msgs.appendChild(fragment);
+}
+
+async function loadConversation(id) {
+  const wrap = $('messages-wrap');
+  if (!wrap) return;
+  const existingOverlay = wrap.querySelector('.chat-loading-overlay');
+  if (existingOverlay) existingOverlay.remove();
+  
+  const overlay = document.createElement('div');
+  overlay.className = 'chat-loading-overlay';
+  overlay.innerHTML = `
+    <span class="chat-loading-spinner"></span>
+    <span style="font-size:12px;color:var(--text-dim);margin-top:8px">Loading conversation...</span>
+  `;
+  wrap.appendChild(overlay);
+
+  state.loadingConvId = id;
+
+  try {
+    await invoke('load_conversation', { session_id: id });
+    if (state.loadingConvId !== id) {
+      overlay.remove();
+      return;
+    }
+    state.currentConvId = id;
+    
+    state.msgOffset = 0;
+    state.msgLimit = 20;
+    state.hasMoreMessages = true;
+    state.isLoadingMore = false;
+    
+    const history = await invoke('get_messages_page', { session_id: id, limit: state.msgLimit, offset: state.msgOffset });
+    if (state.loadingConvId !== id) {
+      overlay.remove();
+      return;
+    }
+    
+    msgs.innerHTML = '';
+    
+    if (Array.isArray(history)) {
+      appendMessages(history);
+      if (history.length < state.msgLimit) {
+        state.hasMoreMessages = false;
+      }
+    } else {
+      state.hasMoreMessages = false;
+    }
+    
+    msgs.scrollTop = msgs.scrollHeight;
+
+    if (state.runningConvs && state.runningConvs[id]) {
+      const runState = state.runningConvs[id];
+      currentChatStream = addMsgStream(runState.role || 'assistant');
+      if (runState.accumulated) {
+        currentChatStream.update(runState.accumulated);
+      }
+      if (runState.thinking) {
+        startThinking(runState.steps);
+        if (runState.label) {
+          updateThinkingLabel(runState.label);
+        }
+      }
+    } else {
+      currentChatStream = null;
+      stopThinking();
+    }
+    
     closeAllOverlays();
     updateSidebarIfOpen();
     syncWindowSize();
-  } catch(e) { toast('Error: ' + e); }
+  } catch(e) { 
+    if (state.loadingConvId === id) {
+      toast('Error: ' + e); 
+    }
+  } finally {
+    if (state.loadingConvId === id) {
+      overlay.remove();
+    }
+  }
 }
 
 async function deleteConversation(id) {
@@ -5249,6 +6293,13 @@ if (speakers.length === 0) {
     </div>
     <div class="setting-row has-select">
       <div>
+        <div class="setting-label">Agent Mode</div>
+        <div class="setting-sub">Choose when to trigger task execution vs conversation</div>
+      </div>
+      <div id="mode-select-container"></div>
+    </div>
+    <div class="setting-row has-select">
+      <div>
         <div class="setting-label">Theme</div>
         <div class="setting-sub">Choose app appearance</div>
       </div>
@@ -5295,6 +6346,13 @@ if (speakers.length === 0) {
         <div class="setting-sub">Choose audio output device</div>
       </div>
       <div id="speaker-select-container"></div>
+    </div>
+    <div class="setting-row has-select">
+      <div>
+        <div class="setting-label">Ollama Concurrency</div>
+        <div class="setting-sub">Configure max parallel local generation processes</div>
+      </div>
+      <div id="parallel-select-container"></div>
     </div>
     <div class="setting-row">
       <div>
@@ -5373,6 +6431,49 @@ if (speakers.length === 0) {
     currentTheme,
     (val) => {
       setTheme(val);
+    }
+  );
+
+  const currentConcurrency = String(cfg.num_parallel || 4);
+  createCustomSelect(
+    $('parallel-select-container'),
+    [
+      { value: '1', label: '1 (Single-threaded)' },
+      { value: '2', label: '2 Parallel' },
+      { value: '3', label: '3 Parallel' },
+      { value: '4', label: '4 Parallel' },
+      { value: '6', label: '6 Parallel' },
+      { value: '8', label: '8 Parallel' }
+    ],
+    currentConcurrency,
+    async (val) => {
+      try {
+        const num = parseInt(val, 10);
+        await invoke('set_concurrency', { value: num });
+        state.cfg.num_parallel = num;
+        toast('Ollama concurrency set to ' + num);
+      } catch (e) {
+        toast('Failed to change concurrency: ' + e);
+      }
+    }
+  );
+
+  const currentMode = cfg.mode === 'chat' ? 'chat' : 'auto';
+  createCustomSelect(
+    $('mode-select-container'),
+    [
+      { value: 'auto', label: 'Task (AI gate dynamic verify)' },
+      { value: 'chat', label: 'Chat (No automation)' }
+    ],
+    currentMode,
+    async (val) => {
+      try {
+        await invoke('set_app_mode', { mode: val });
+        state.cfg.mode = val;
+        toast('Agent mode changed to: ' + (val === 'chat' ? 'Chat' : 'Task'));
+      } catch (e) {
+        toast('Failed to change agent mode: ' + e);
+      }
     }
   );
 
@@ -6291,6 +7392,11 @@ async function setupEventListeners() {
     }
   });
 
+  await listen('sidebar-refresh', () => {
+    renderSidebarConvs();
+    renderConvList();
+  });
+
   // Listen to native window maximization state changes
   await listen('tauri://maximized', () => {
     updateMaximizedState(true);
@@ -6343,7 +7449,28 @@ async function setupEventListeners() {
   // Agent step updates (mirrors executor msg_tx channel)
   await listen('agent-step', e => {
     const session_id = e.payload?.session_id || '';
+    if (session_id && state.finishedConvs && state.finishedConvs.has(session_id)) return;
     const msg = e.payload?.message || (typeof e.payload === 'string' ? e.payload : '');
+    
+    if (session_id) {
+      if (!state.runningConvs) state.runningConvs = {};
+      if (!state.runningConvs[session_id]) {
+        state.runningConvs[session_id] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant', steps: ['Analyzing request...'] };
+        renderSidebarConvs();
+        renderConvList();
+      } else {
+        state.runningConvs[session_id].thinking = true;
+        state.runningConvs[session_id].label = String(msg);
+        if (!state.runningConvs[session_id].steps) {
+          state.runningConvs[session_id].steps = ['Analyzing request...'];
+        }
+        const stepsArr = state.runningConvs[session_id].steps;
+        if (stepsArr.length === 0 || stepsArr[stepsArr.length - 1] !== String(msg)) {
+          stepsArr.push(String(msg));
+        }
+      }
+    }
+
     if (session_id && !state.currentConvId) {
       state.currentConvId = session_id;
     }
@@ -6354,7 +7481,17 @@ async function setupEventListeners() {
   // Agent done
   await listen('agent-done', e => {
     const session_id = e.payload?.session_id || '';
+    if (session_id && state.finishedConvs) {
+      state.finishedConvs.add(session_id);
+    }
     const result = e.payload?.content || (typeof e.payload === 'string' ? e.payload : '');
+    
+    if (session_id && state.runningConvs) {
+      delete state.runningConvs[session_id];
+      renderSidebarConvs();
+      renderConvList();
+    }
+
     if (session_id && !state.currentConvId) {
       state.currentConvId = session_id;
     }
@@ -6371,7 +7508,19 @@ async function setupEventListeners() {
   // Chat token streaming received
   await listen('chat-token', e => {
     const session_id = e.payload?.session_id || '';
+    if (session_id && state.finishedConvs && state.finishedConvs.has(session_id)) return;
     const text = e.payload?.token || (typeof e.payload === 'string' ? e.payload : '');
+    
+    if (session_id) {
+      if (!state.runningConvs) state.runningConvs = {};
+      if (!state.runningConvs[session_id]) {
+        state.runningConvs[session_id] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant' };
+        renderSidebarConvs();
+        renderConvList();
+      }
+      state.runningConvs[session_id].accumulated += text;
+    }
+
     if (session_id && !state.currentConvId) {
       state.currentConvId = session_id;
     }
@@ -6558,6 +7707,135 @@ function dismissToast() {
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────
+function morphDOM(oldEl, newEl) {
+  if (oldEl.tagName !== newEl.tagName) {
+    oldEl.parentNode.replaceChild(newEl.cloneNode(true), oldEl);
+    return;
+  }
+
+  const oldAttrs = oldEl.attributes;
+  const newAttrs = newEl.attributes;
+  if (oldAttrs && newAttrs) {
+    for (let i = oldAttrs.length - 1; i >= 0; i--) {
+      const attrName = oldAttrs[i].name;
+      if (!newEl.hasAttribute(attrName)) {
+        oldEl.removeAttribute(attrName);
+      }
+    }
+    for (let i = 0; i < newAttrs.length; i++) {
+      const attrName = newAttrs[i].name;
+      const attrVal = newAttrs[i].value;
+      if (oldEl.getAttribute(attrName) !== attrVal) {
+        oldEl.setAttribute(attrName, attrVal);
+      }
+    }
+  }
+
+  if (oldEl.tagName === 'INPUT' || oldEl.tagName === 'TEXTAREA') {
+    if (oldEl.value !== newEl.value) {
+      oldEl.value = newEl.value;
+    }
+  }
+
+  const oldChildren = Array.from(oldEl.childNodes);
+  const newChildren = Array.from(newEl.childNodes);
+  const oldLen = oldChildren.length;
+  const newLen = newChildren.length;
+  const maxLen = Math.max(oldLen, newLen);
+
+  for (let i = 0; i < maxLen; i++) {
+    const oldChild = oldChildren[i];
+    const newChild = newChildren[i];
+
+    if (!oldChild && newChild) {
+      oldEl.appendChild(newChild.cloneNode(true));
+    } else if (oldChild && !newChild) {
+      oldChild.remove();
+    } else if (oldChild && newChild) {
+      if (oldChild.nodeType === 1 && newChild.nodeType === 1) {
+        // Case A: Image wrapper matching
+        if (oldChild.classList.contains('inline-image-wrap')) {
+          const oldImg = oldChild.querySelector('img.assistant-inline-img');
+          const oldOriginalSrc = oldImg ? (oldImg._originalSrc || oldImg.getAttribute('src')) : null;
+          
+          let newSrc = null;
+          if (newChild.classList.contains('inline-image-wrap')) {
+            const newImg = newChild.querySelector('img.assistant-inline-img');
+            newSrc = newImg ? newImg.getAttribute('src') : null;
+          } else if (newChild.tagName === 'A') {
+            newSrc = newChild.getAttribute('href');
+          } else if (newChild.tagName === 'IMG') {
+            newSrc = newChild.getAttribute('src');
+          }
+          
+          if (oldOriginalSrc && newSrc && oldOriginalSrc === newSrc) {
+            continue; // Keep old image wrap completely intact
+          }
+        }
+        
+        // Case B: Citation pill matching
+        if (oldChild.classList.contains('citation-pill') && newChild.tagName === 'A') {
+          const oldHref = oldChild.getAttribute('href');
+          const newHref = newChild.getAttribute('href');
+          if (oldHref && newHref && oldHref === newHref) {
+            continue; // Keep old citation pill completely intact
+          }
+        }
+      }
+
+      if (oldChild.nodeType !== newChild.nodeType) {
+        oldEl.replaceChild(newChild.cloneNode(true), oldChild);
+      } else if (oldChild.nodeType === 3) { // TEXT_NODE
+        if (oldChild.nodeValue !== newChild.nodeValue) {
+          oldChild.nodeValue = newChild.nodeValue;
+        }
+      } else if (oldChild.nodeType === 1) { // ELEMENT_NODE
+        if (oldChild.tagName === 'IMG' && oldChild.src === newChild.src) {
+          const newImgAttrs = newChild.attributes;
+          if (newImgAttrs) {
+            for (let j = 0; j < newImgAttrs.length; j++) {
+              oldChild.setAttribute(newImgAttrs[j].name, newImgAttrs[j].value);
+            }
+          }
+        } else if (oldChild.classList.contains('web-search-box') || oldChild.classList.contains('lazy-mermaid') || oldChild.classList.contains('lazy-chart') || oldChild.classList.contains('lazy-lottie')) {
+          if (oldChild.outerHTML === newChild.outerHTML) {
+            continue;
+          } else {
+            morphDOM(oldChild, newChild);
+          }
+        } else {
+          morphDOM(oldChild, newChild);
+        }
+      }
+    }
+  }
+}
+
+window.handleInlineImageError = function(img) {
+  if (!img) return;
+  if (!img._originalSrc) {
+    img._originalSrc = img.src;
+  }
+  if (!img._fallbackUrls) {
+    const searchImgs = Array.from(document.querySelectorAll('.web-search-img'))
+      .map(i => i.src)
+      .filter((src, idx, self) => src && src.startsWith('http') && src !== img.src && self.indexOf(src) === idx);
+    img._fallbackUrls = searchImgs;
+    img._fallbackIndex = 0;
+  }
+  if (img._fallbackIndex < img._fallbackUrls.length) {
+    const nextUrl = img._fallbackUrls[img._fallbackIndex];
+    img._fallbackIndex++;
+    img.src = nextUrl;
+  } else {
+    img.style.display = 'none';
+    const wrap = img.closest('.inline-image-wrap');
+    if (wrap) {
+      wrap.style.display = 'none';
+    }
+  }
+};
+
 function escHtml(s) {
   return String(s||'')
     .replace(/&/g,'&amp;').replace(/</g,'&lt;')
@@ -6791,23 +8069,105 @@ async function renderSidebarDevice() {
   }
 }
 
+function formatShortDate(isoString) {
+  if (!isoString) return '';
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return '';
+    const month = d.toLocaleDateString(undefined, { month: 'short' });
+    const day = d.getDate();
+    const hours = String(d.getHours()).padStart(2, '0');
+    const minutes = String(d.getMinutes()).padStart(2, '0');
+    return `${month} ${day}, ${hours}:${minutes}`;
+  } catch(_) {
+    return '';
+  }
+}
+
+function cleanPreviewText(text) {
+  if (!text) return '';
+  let trimmed = text.trim();
+  
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        const textPart = parsed.find(part => part.type === 'text');
+        if (textPart) {
+          trimmed = textPart.text.trim();
+        }
+      }
+    } catch (_) {}
+  }
+  
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed) {
+        if (typeof parsed.message === 'string') {
+          return parsed.message;
+        }
+        if (typeof parsed.summary === 'string') {
+          return parsed.summary;
+        }
+        if (parsed.plan) {
+          return 'Automation Plan';
+        }
+      }
+    } catch (_) {}
+  }
+  
+  if (
+    trimmed.startsWith('Step ') && trimmed.includes('failed:') ||
+    trimmed.startsWith('Command output:') ||
+    trimmed.startsWith('The last command failed with') ||
+    trimmed === 'Executing corrected plan now.' ||
+    trimmed === 'Executing step'
+  ) {
+    return 'Automation Running...';
+  }
+  
+  return trimmed;
+}
+
 async function renderSidebarConvs() {
+  const query = (state.sidebarConvSearchQuery || '').trim();
   let convs = [];
-  try { convs = await invoke('list_conversations'); } catch(_) {}
+  try {
+    convs = await invoke('list_conversations', { query: query || null });
+  } catch(e) {
+    console.error('[renderSidebarConvs] Failed to load conversations:', e);
+  }
   state.conversations = convs;
 
   const list = $('sidebar-conv-list');
   if (!list) return;
-  if (!convs.length) {
-    list.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">No conversations yet.</div>';
+
+  const sorted = convs.sort((a, b) => {
+    const timeA = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
+    const timeB = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
+    return timeB - timeA;
+  });
+
+  if (!sorted.length) {
+    list.innerHTML = `<div style="color:var(--text-dim);font-size:12px;padding:8px">${query ? 'No matching conversations.' : 'No conversations yet.'}</div>`;
     return;
   }
-  list.innerHTML = convs.map(c => {
+
+  list.innerHTML = sorted.map(c => {
     const isActive = c.id === state.currentConvId;
-    const displayName = c.name || c.preview || c.id;
+    const displayName = c.name || cleanPreviewText(c.preview) || c.id;
+    const isRunning = state.runningConvs && state.runningConvs[c.id];
+    const spinnerHtml = isRunning ? `<span class="conv-row-spinner"></span>` : '';
+    const dateHtml = `<span class="conv-date-hover">${escHtml(formatShortDate(c.last_message_at))}</span>`;
+
     return `<div class="conv-row${isActive?' active':''}" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
       <span class="conv-title">${escHtml(displayName)}</span>
-      <button class="conv-options-btn" onclick="event.stopPropagation();showConvOptions(event, '${escAttr(c.id)}', '${escAttr(displayName)}')" title="Options">⋮</button>
+      <div class="conv-meta-actions">
+        ${dateHtml}
+        <button class="conv-options-btn" onclick="event.stopPropagation();showConvOptions(event, '${escAttr(c.id)}', '${escAttr(displayName)}')" title="Options">⋮</button>
+        ${spinnerHtml}
+      </div>
     </div>`;
   }).join('');
 }
@@ -6815,11 +8175,9 @@ async function renderSidebarConvs() {
 async function newConversationSidebar() {
   try {
     const id = await invoke('new_conversation');
-    state.currentConvId = id;
-    msgs.innerHTML = '';
+    await loadConversation(id);
     toast('New conversation started');
     renderSidebarConvs();
-    syncWindowSize();
   } catch(e) { toast('Error: ' + e); }
 }
 
@@ -7923,8 +9281,76 @@ function updateMobilePermissionsUI(perms) {
 }
 window.updateMobilePermissionsUI = updateMobilePermissionsUI;
 
+async function handleMessagesScroll() {
+  if (!state.currentConvId || !state.hasMoreMessages || state.isLoadingMore) return;
+  
+  if (msgs.scrollTop < 30) {
+    state.isLoadingMore = true;
+    
+    const spinner = document.createElement('div');
+    spinner.id = 'messages-load-more-spinner';
+    spinner.className = 'messages-load-more-spinner-container';
+    spinner.innerHTML = `
+      <span class="spinner-small" style="width:12px;height:12px;border:2px solid rgba(255,255,255,0.1);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite;"></span>
+      <span style="font-size:11px;color:var(--text-dim)">Loading previous messages...</span>
+    `;
+    msgs.insertBefore(spinner, msgs.firstChild);
+    
+    const oldScrollHeight = msgs.scrollHeight;
+    const activeConvId = state.currentConvId;
+    
+    try {
+      state.msgOffset += state.msgLimit;
+      const prevMsgs = await invoke('get_messages_page', { 
+        session_id: activeConvId, 
+        limit: state.msgLimit, 
+        offset: state.msgOffset 
+      });
+      
+      const spinnerEl = $('messages-load-more-spinner');
+      if (spinnerEl) spinnerEl.remove();
+      
+      if (activeConvId !== state.currentConvId) return;
+      
+      if (Array.isArray(prevMsgs) && prevMsgs.length > 0) {
+        prependMessages(prevMsgs);
+        if (prevMsgs.length < state.msgLimit) {
+          state.hasMoreMessages = false;
+        }
+        msgs.scrollTop = msgs.scrollHeight - oldScrollHeight;
+      } else {
+        state.hasMoreMessages = false;
+      }
+    } catch (e) {
+      console.error('Failed to load older messages:', e);
+      const spinnerEl = $('messages-load-more-spinner');
+      if (spinnerEl) spinnerEl.remove();
+    } finally {
+      state.isLoadingMore = false;
+    }
+  }
+}
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Intercept link clicks globally and open in default browser
+  document.addEventListener('click', (e) => {
+    const link = e.target.closest('a');
+    if (link && link.href && (link.href.startsWith('http://') || link.href.startsWith('https://'))) {
+      e.preventDefault();
+      invoke('open_browser_url', { url: link.href }).catch(console.error);
+      return;
+    }
+    // Clicking anywhere on a web-search-item opens the link in the browser
+    const searchItem = e.target.closest('.web-search-item');
+    if (searchItem) {
+      const searchLink = searchItem.querySelector('.web-search-link');
+      if (searchLink && searchLink.href) {
+        e.preventDefault();
+        invoke('open_browser_url', { url: searchLink.href }).catch(console.error);
+      }
+    }
+  });
+
   const isWeb = !window.__TAURI__ || window.__TAURI__.core?.invoke?.toString().includes('MOCK');
   if (isWeb) {
     document.body.classList.add('is-web');
@@ -7936,6 +9362,25 @@ document.addEventListener('DOMContentLoaded', () => {
   actionIcon = $('action-icon');
   ctxBar = $('ctx-bar');
   barShell = $('bar-shell');
+  
+  if (msgs) {
+    msgs.addEventListener('scroll', handleMessagesScroll);
+  }
+
+  const sidebarSearch = $('sidebar-conv-search');
+  if (sidebarSearch) {
+    sidebarSearch.addEventListener('input', (e) => {
+      state.sidebarConvSearchQuery = e.target.value;
+      renderSidebarConvs();
+    });
+  }
+  const convSearch = $('conv-search');
+  if (convSearch) {
+    convSearch.addEventListener('input', (e) => {
+      state.convSearchQuery = e.target.value;
+      renderConvList();
+    });
+  }
   
   // Visual Viewport Keyboard Height Recalculation
   if (window.visualViewport) {
@@ -8090,6 +9535,190 @@ onDOMContentLoaded(() => {
     });
   }
 
+  // ── Slash Commands Autocomplete Menu ─────────────────────────────────
+  const SLASH_COMMANDS = [
+    { name: '/mode', desc: 'Toggle mode (chat/task)', action: async () => {
+        const nextMode = state.cfg.mode === 'chat' ? 'auto' : 'chat';
+        try {
+          await invoke('set_app_mode', { mode: nextMode });
+          state.cfg.mode = nextMode;
+          const body = $('settings-body');
+          if (body) renderSettings();
+          toast('Agent Mode changed to: ' + (nextMode === 'chat' ? 'Chat' : 'Task'));
+        } catch (e) {
+          toast('Error changing mode: ' + e);
+        }
+      }
+    },
+    { name: '/model', desc: 'Switch AI model', action: () => openOverlay('model') },
+    { name: '/tasks', desc: 'Manage scheduled tasks', action: () => openOverlay('tasks') },
+    { name: '/settings', desc: 'Configure application settings', action: () => openOverlay('settings') },
+    { name: '/chats', desc: 'Switch conversation', action: () => openOverlay('conv') },
+    { name: '/clear', desc: 'Clear current chat history', action: () => {
+        if (typeof window.contextMenuClearChat === 'function') {
+          window.contextMenuClearChat();
+        } else {
+          msgs.innerHTML = '';
+          syncWindowSize();
+          toast('Chat cleared');
+        }
+      }
+    },
+    { name: '/newchat', desc: 'Create new conversation', action: () => {
+        if (typeof newConversationSidebar === 'function') {
+          newConversationSidebar();
+        }
+      }
+    },
+    { name: '/tour', desc: 'Show interactive tour', action: () => {
+        if (typeof startProductTour === 'function') {
+          startProductTour();
+        }
+      }
+    },
+    { name: '/stop', desc: 'Stop running agent task', action: () => {
+        if (typeof stopAgent === 'function') {
+          stopAgent();
+        }
+      }
+    }
+  ];
+
+  let slashMenuVisible = false;
+  let slashMenuSelectedIndex = 0;
+  let filteredSlashCommands = [];
+
+  function initSlashMenu() {
+    const barShell = $('bar-shell');
+    if (!barShell) return;
+
+    const slashMenu = document.createElement('div');
+    slashMenu.id = 'slash-menu';
+    slashMenu.className = 'hidden';
+    
+    const talkbar = $('talkbar');
+    if (talkbar) {
+      talkbar.parentNode.insertBefore(slashMenu, talkbar);
+    } else {
+      barShell.appendChild(slashMenu);
+    }
+
+    const input = $('input');
+    if (!input) return;
+
+    input.addEventListener('input', () => {
+      const val = input.value;
+      if (val.startsWith('/')) {
+        const query = val.toLowerCase();
+        filteredSlashCommands = SLASH_COMMANDS.filter(cmd => 
+          cmd.name.startsWith(query) || cmd.desc.toLowerCase().includes(query)
+        );
+
+        if (filteredSlashCommands.length > 0) {
+          slashMenuSelectedIndex = Math.min(slashMenuSelectedIndex, filteredSlashCommands.length - 1);
+          renderSlashMenu(slashMenu);
+          slashMenu.classList.remove('hidden');
+          slashMenuVisible = true;
+          syncWindowSize();
+        } else {
+          slashMenu.classList.add('hidden');
+          slashMenuVisible = false;
+          syncWindowSize();
+        }
+      } else {
+        slashMenu.classList.add('hidden');
+        slashMenuVisible = false;
+        syncWindowSize();
+      }
+    });
+
+    input.addEventListener('keydown', e => {
+      if (!slashMenuVisible) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        e.stopPropagation();
+        slashMenuSelectedIndex = (slashMenuSelectedIndex + 1) % filteredSlashCommands.length;
+        renderSlashMenu(slashMenu);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        e.stopPropagation();
+        slashMenuSelectedIndex = (slashMenuSelectedIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
+        renderSlashMenu(slashMenu);
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        e.stopPropagation();
+        executeSelectedCommand();
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        slashMenu.classList.add('hidden');
+        slashMenuVisible = false;
+        syncWindowSize();
+      }
+    }, { capture: true });
+
+    document.addEventListener('click', (e) => {
+      if (slashMenu && !slashMenu.contains(e.target) && e.target !== input) {
+        slashMenu.classList.add('hidden');
+        slashMenuVisible = false;
+        syncWindowSize();
+      }
+    });
+  }
+
+  function renderSlashMenu(el) {
+    el.innerHTML = '';
+    filteredSlashCommands.forEach((cmd, idx) => {
+      const item = document.createElement('button');
+      item.className = 'slash-item' + (idx === slashMenuSelectedIndex ? ' active' : '');
+      
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'slash-item-name';
+      nameSpan.textContent = cmd.name;
+      
+      const descSpan = document.createElement('span');
+      descSpan.className = 'slash-item-desc';
+      descSpan.textContent = cmd.desc;
+      
+      item.appendChild(nameSpan);
+      item.appendChild(descSpan);
+
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        slashMenuSelectedIndex = idx;
+        executeSelectedCommand();
+      });
+
+      item.addEventListener('mousedown', e => e.stopPropagation());
+      item.addEventListener('dblclick', e => e.stopPropagation());
+
+      el.appendChild(item);
+    });
+  }
+
+  function executeSelectedCommand() {
+    const cmd = filteredSlashCommands[slashMenuSelectedIndex];
+    if (cmd) {
+      const input = $('input');
+      if (input) {
+        input.value = '';
+        input.style.height = '32px';
+        input.focus();
+      }
+      const slashMenu = $('slash-menu');
+      if (slashMenu) {
+        slashMenu.classList.add('hidden');
+      }
+      slashMenuVisible = false;
+      syncWindowSize();
+      cmd.action();
+    }
+  }
+
+  initSlashMenu();
+
   // Prevent mousedown and double-click propagation to block window drag / maximize gestures on interactive regions
   const interactiveSelectors = [
     '.overlay',
@@ -8104,7 +9733,9 @@ onDOMContentLoaded(() => {
     '#talkbar-model-select',
     '#brand-btn',
     '#action-btn',
-    '#ctx-bar'
+    '#ctx-bar',
+    '#slash-menu',
+    '.slash-item'
   ];
   interactiveSelectors.forEach(sel => {
     document.querySelectorAll(sel).forEach(el => {

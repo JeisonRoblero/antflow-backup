@@ -1,0 +1,12 @@
+{
+  "name": "run_command",
+  "description": "Windows: runs in legacy CMD.EXE. Linux/macOS: runs in bash. Do NOT run PowerShell cmdlets (like Get-Process, Start-Process) in run_command.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "command": { "type": "string" },
+      "capture_output": { "type": "boolean" }
+    },
+    "required": ["command"]
+  }
+}

@@ -23,6 +23,12 @@ use crate::json_utils::clean_if_json;
 use crate::redact::RedactPatterns;
 use tauri::{Emitter, Manager};
 
+pub struct ActiveSessionState {
+    pub stop_flag: StopFlag,
+    pub answer_sender: Option<mpsc::Sender<String>>,
+    pub result_receiver: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+}
+
 pub struct AppState {
     pub storage_dir: Mutex<PathBuf>,
     pub session_id: Mutex<String>,
@@ -33,8 +39,10 @@ pub struct AppState {
     pub answer_sender: Mutex<Option<mpsc::Sender<String>>>,
     pub result_receiver: Mutex<Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>>,
     pub device_info_json: JsonValue,
+    pub device_info: crate::device::DeviceInfo,
     pub provider_keys_multi: Mutex<std::collections::HashMap<String, Vec<String>>>,
     pub active_downloads: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    pub running_sessions: Mutex<std::collections::HashMap<String, ActiveSessionState>>,
 }
 
 #[derive(Serialize)]
@@ -53,6 +61,7 @@ pub struct ConvInfo {
     pub id: String,
     pub name: String,
     pub preview: String,
+    pub last_message_at: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -122,6 +131,9 @@ pub async fn run(
                     }
                 }
 
+                cmd.env("OLLAMA_NUM_PARALLEL", _cfg.num_parallel.to_string());
+                std::env::set_var("OLLAMA_NUM_PARALLEL", _cfg.num_parallel.to_string());
+
                 #[cfg(windows)]
                 {
                     cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
@@ -135,7 +147,7 @@ pub async fn run(
 
     let device_info = crate::device::collect()?;
     let system_prompt =
-        crate::prompt::build_system_prompt_with_vision(&device_info, _cfg.ai.vision_capable);
+        crate::prompt::build_system_prompt_with_vision(&device_info, _cfg.ai.vision_capable, None);
     let session_id = uuid::Uuid::new_v4().to_string();
     let token_limit = crate::tui::app::estimate_token_limit(&_cfg.ai.model);
     let device_info_json = serde_json::to_value(&device_info).unwrap_or_default();
@@ -151,8 +163,10 @@ pub async fn run(
         answer_sender: Mutex::new(None),
         result_receiver: Mutex::new(None),
         device_info_json,
+        device_info,
         provider_keys_multi: Mutex::new(keys),
         active_downloads: Mutex::new(std::collections::HashMap::new()),
+        running_sessions: Mutex::new(std::collections::HashMap::new()),
     };
 
     tauri::Builder::default()
@@ -209,6 +223,7 @@ pub async fn run(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            open_browser_url,
             run_prompt,
             answer_clarification,
             continue_after_clarification,
@@ -228,15 +243,19 @@ pub async fn run(
             list_conversations,
             new_conversation,
             load_conversation,
+            get_messages_page,
             delete_conversation,
             rename_conversation,
+            save_thinking_steps,
             list_tasks,
             toggle_task,
             delete_task,
             get_provider_key,
             save_provider_key,
             set_session_memory,
+            set_concurrency,
             set_run_in_background,
+            set_app_mode,
             get_device_info,
             needs_setup,
             complete_setup,
@@ -330,29 +349,103 @@ fn get_language_instruction(system_language: &str) -> Option<String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// run_prompt
-// ---------------------------------------------------------------------------
+async fn auto_generate_title_if_needed(
+    session_id: &str,
+    first_prompt: &str,
+    state: &AppState,
+    app_handle: &tauri::AppHandle,
+) {
+    let storage_dir = {
+        state.storage_dir.lock().await.clone()
+    };
 
+    let has_name = if let Ok(conn) = crate::db::open(&storage_dir) {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conversation_metadata WHERE session_id = ?1)",
+            [session_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
+    } else {
+        false
+    };
+
+    println!("[TitleGen] session_id={}, has_name={}", session_id, has_name);
+
+    if !has_name {
+        let cfg = state.cfg.lock().await.clone();
+        let provider = crate::ai::provider_for_config(&cfg.ai);
+        
+        // Clean up first_prompt if it contains JSON/markdown/complex structures
+        let clean_prompt = if first_prompt.trim_start().starts_with('[') || first_prompt.trim_start().starts_with('{') {
+            "Generate a title for the conversation".to_string()
+        } else {
+            first_prompt.to_string()
+        };
+
+        let name_prompt = format!(
+            "You are a conversation title generator. Analyze the following user request and generate a brief, descriptive conversation title (maximum 3-5 words) in the same language. Do NOT use markdown, quotes, formatting, or any introductory text. Reply ONLY with the title.\n\nUser request: {}",
+            clean_prompt
+        );
+        
+        println!("[TitleGen] Sending name_prompt: {}", name_prompt);
+
+        let messages = vec![crate::ai::ChatMessage::text("user", &name_prompt)];
+        let sid = session_id.to_string();
+        let app = app_handle.clone();
+        tokio::spawn(async move {
+            match provider.chat(messages, Some(50)).await {
+                Ok(response) => {
+                    let mut title = response.content.trim().to_string();
+                    println!("[TitleGen] Raw title generated: {:?}", title);
+                    title = title.replace('"', "").replace('\'', "").replace('.', "").trim().to_string();
+                    if !title.is_empty() && !title.starts_with('{') {
+                        if let Ok(db_conn) = crate::db::open(&storage_dir) {
+                            let _ = crate::db::set_conversation_name(&db_conn, &sid, &title);
+                            println!("[TitleGen] Successfully saved title: '{}' for session: {}", title, sid);
+                            let _ = app.emit("sidebar-refresh", true);
+                        }
+                    } else {
+                        println!("[TitleGen] Title was empty or started with '{{' (invalid JSON/object response)");
+                    }
+                }
+                Err(e) => {
+                    println!("[TitleGen] Failed to generate title from AI provider: {:?}", e);
+                }
+            }
+        });
+    }
+}
 
 #[tauri::command(rename_all = "snake_case")]
 async fn run_prompt(
     prompt: String,
     system_language: Option<String>,
+    session_id: Option<String>,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<JsonValue, String> {
     let conn = db::open(&*state.storage_dir.lock().await).map_err(|e| e.to_string())?;
-    let sid = state.session_id.lock().await.clone();
+    let sid = if let Some(ref id) = session_id {
+        id.clone()
+    } else {
+        state.session_id.lock().await.clone()
+    };
     let _ = db::insert_message(&conn, &sid, "user", &prompt);
 
-    state.stop_flag.store(true, Ordering::Relaxed);
-    if let Some(s) = state.answer_sender.lock().await.take() {
-        let _ = s.try_send("cancelled".to_string());
+    // Cancel any existing run for this SPECIFIC session
+    {
+        let mut running = state.running_sessions.lock().await;
+        if let Some(act) = running.remove(&sid) {
+            act.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(s) = act.answer_sender {
+                let _ = s.try_send("cancelled".to_string());
+            }
+        }
     }
-    let _ = state.result_receiver.lock().await.take();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    state.stop_flag.store(false, Ordering::Relaxed);
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let (q_tx, mut q_rx) = mpsc::channel::<(String, Vec<String>)>(2);
     let (a_tx, a_rx) = mpsc::channel::<String>(2);
@@ -360,8 +453,15 @@ async fn run_prompt(
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(64);
     let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
 
-    *state.answer_sender.lock().await = Some(a_tx);
-    *state.result_receiver.lock().await = Some(res_rx);
+    // Store in running_sessions map
+    {
+        let mut running = state.running_sessions.lock().await;
+        running.insert(sid.clone(), ActiveSessionState {
+            stop_flag: stop_flag.clone(),
+            answer_sender: Some(a_tx),
+            result_receiver: None,
+        });
+    }
 
     let cfg = state.cfg.lock().await.clone();
     let mut history = state.history.lock().await.clone();
@@ -372,15 +472,14 @@ async fn run_prompt(
         history.insert(0, ChatMessage::text("system", &lang_instruction));
     }
 
-    let session_id = state.session_id.lock().await.clone();
     let storage_dir = state.storage_dir.lock().await.clone();
-    let stop = state.stop_flag.clone();
+    let stop = stop_flag.clone();
     let token_limit = *state.token_limit.lock().await;
     let p2 = prompt.clone();
-    let sid2 = session_id.clone();
+    let sid2 = sid.clone();
 
     let app2 = app_handle.clone();
-    let sid_for_msg = session_id.clone();
+    let sid_for_msg = sid.clone();
     let _msg_fwd = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
             let _ = app2.emit("status", AgentStepPayload {
@@ -395,7 +494,7 @@ async fn run_prompt(
     });
 
     let app3 = app_handle.clone();
-    let sid_for_token = session_id.clone();
+    let sid_for_token = sid.clone();
     let tokens_streamed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tokens_streamed_clone = tokens_streamed.clone();
     let _token_fwd = tokio::spawn(async move {
@@ -408,7 +507,11 @@ async fn run_prompt(
         }
     });
 
+    let app_handle_for_icon = app_handle.clone();
+    let stop_flag_cleanup = stop_flag.clone();
+    let sid_cleanup = sid.clone();
     tokio::spawn(async move {
+        update_app_icon(&app_handle_for_icon, true);
         let outcome = async {
             let patterns = RedactPatterns::new();
             let provider = ai::provider_for_config(&cfg.ai);
@@ -420,17 +523,39 @@ async fn run_prompt(
             .await
         }
         .await;
+        update_app_icon(&app_handle_for_icon, false);
+        
+        // Cleanup active run state
+        let app_state = app_handle_for_icon.state::<AppState>();
+        {
+            let mut running = app_state.running_sessions.lock().await;
+            if let Some(act) = running.get(&sid_cleanup) {
+                if Arc::ptr_eq(&act.stop_flag, &stop_flag_cleanup) {
+                    running.remove(&sid_cleanup);
+                }
+            }
+        }
+        
         let _ = res_tx.send(outcome);
     });
 
     if let Some((question, options)) = q_rx.recv().await {
+        // Clarification needed, save result_receiver in map
+        {
+            let mut running = state.running_sessions.lock().await;
+            if let Some(act) = running.get_mut(&sid) {
+                act.result_receiver = Some(res_rx);
+            }
+        }
         return Ok(json!({
             "clarification": { "question": question, "options": options }
         }));
     }
 
-    let rx = state.result_receiver.lock().await.take()
-        .ok_or("Task already finished unexpectedly")?;
+    let rx = {
+        let mut running = state.running_sessions.lock().await;
+        running.get_mut(&sid).and_then(|act| act.result_receiver.take())
+    }.unwrap_or(res_rx);
 
     match rx.await {
         Ok(Ok(response)) => {
@@ -447,11 +572,17 @@ async fn run_prompt(
                 ChatMessage::text("user", &prompt)
             };
             let friendly = clean_if_json(&response);
-            state.history.lock().await.push(user_msg);
-            state.history.lock().await.push(ChatMessage::text("assistant", &friendly));
-            if let Ok(conn) = db::open(&*state.storage_dir.lock().await) {
-                let _ = db::insert_message(&conn, &session_id, "assistant", &friendly);
+            {
+                let current_sid = state.session_id.lock().await;
+                if *current_sid == sid {
+                    state.history.lock().await.push(user_msg);
+                    state.history.lock().await.push(ChatMessage::text("assistant", &friendly));
+                }
             }
+            if let Ok(conn) = db::open(&*state.storage_dir.lock().await) {
+                let _ = db::insert_message(&conn, &sid, "assistant", &friendly);
+            }
+            auto_generate_title_if_needed(&sid, &prompt, &state, &app_handle).await;
 
             // Stream response token-by-token if not already streamed during run_task
             if !tokens_streamed.load(Ordering::Relaxed) {
@@ -468,8 +599,11 @@ async fn run_prompt(
                     chunks.push(current);
                 }
 
-                let stop = state.stop_flag.clone();
-                let sid_clone = session_id.clone();
+                let stop = {
+                    let running = state.running_sessions.lock().await;
+                    running.get(&sid).map(|act| act.stop_flag.clone()).unwrap_or_else(|| state.stop_flag.clone())
+                };
+                let sid_clone = sid.clone();
                 for chunk in chunks {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -496,10 +630,21 @@ async fn run_prompt(
 #[tauri::command(rename_all = "snake_case")]
 async fn answer_clarification(
     answer: String,
+    session_id: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> std::result::Result<(), String> {
-    let sender = state.answer_sender.lock().await.take()
-        .ok_or("No clarification pending")?;
+    let sid = if let Some(ref id) = session_id {
+        id.clone()
+    } else {
+        state.session_id.lock().await.clone()
+    };
+
+    let sender = {
+        let mut running = state.running_sessions.lock().await;
+        running.get_mut(&sid)
+            .and_then(|act| act.answer_sender.take())
+            .ok_or("No clarification pending")?
+    };
     sender.send(answer).await
         .map_err(|_| "Executor no longer waiting for clarification".to_string())
 }
@@ -514,8 +659,12 @@ async fn continue_after_clarification(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<String, String> {
-    let rx = state.result_receiver.lock().await.take()
-        .ok_or("No pending task")?;
+    let rx = {
+        let mut running = state.running_sessions.lock().await;
+        running.get_mut(&session_id)
+            .and_then(|act| act.result_receiver.take())
+            .ok_or("No pending task")?
+    };
 
     match rx.await {
         Ok(Ok(response)) => {
@@ -539,7 +688,10 @@ async fn continue_after_clarification(
                 chunks.push(current);
             }
 
-            let stop = state.stop_flag.clone();
+            let stop = {
+                let running = state.running_sessions.lock().await;
+                running.get(&session_id).map(|act| act.stop_flag.clone()).unwrap_or_else(|| state.stop_flag.clone())
+            };
             let sid_clone = session_id;
             for chunk in chunks {
                 if stop.load(Ordering::Relaxed) {
@@ -564,11 +716,30 @@ async fn continue_after_clarification(
 // ---------------------------------------------------------------------------
 
 #[tauri::command(rename_all = "snake_case")]
-async fn stop_agent(state: tauri::State<'_, AppState>) -> std::result::Result<(), String> {
+async fn stop_agent(
+    session_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let sid = if let Some(ref id) = session_id {
+        id.clone()
+    } else {
+        state.session_id.lock().await.clone()
+    };
+
+    let mut running = state.running_sessions.lock().await;
+    if let Some(act) = running.remove(&sid) {
+        act.stop_flag.store(true, Ordering::Relaxed);
+        if let Some(s) = act.answer_sender {
+            let _ = s.try_send("cancelled".to_string());
+        }
+    }
+
+    // Also trigger global stop flag for safety and compatibility
     state.stop_flag.store(true, Ordering::Relaxed);
     if let Some(s) = state.answer_sender.lock().await.take() {
         let _ = s.try_send("cancelled".to_string());
     }
+
     Ok(())
 }
 
@@ -1636,6 +1807,7 @@ async fn select_gguf_file(
 async fn run_chat(
     prompt: String,
     system_language: Option<String>,
+    session_id: Option<String>,
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<String, String> {
@@ -1652,28 +1824,42 @@ async fn run_chat(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
     let app = app_handle.clone();
-    let sid = state.session_id.lock().await.clone();
+    let sid = if let Some(ref id) = session_id {
+        id.clone()
+    } else {
+        state.session_id.lock().await.clone()
+    };
+    let sid_for_fwd = sid.clone();
     let fwd_handle = tokio::spawn(async move {
         while let Some(token) = rx.recv().await {
             let _ = app.emit("chat-token", ChatTokenPayload {
-                session_id: sid.clone(),
+                session_id: sid_for_fwd.clone(),
                 token,
             });
         }
     });
 
+    // Save user message immediately so conversation appears in sidebar
+    if let Ok(conn) = crate::db::open(&*state.storage_dir.lock().await) {
+        let _ = crate::db::insert_message(&conn, &sid, "user", &prompt);
+    }
+
     let res = provider.chat_stream(history, Some(1000), tx).await.map_err(|e| e.to_string())?;
     let _ = fwd_handle.await;
     let reply = clean_if_json(&res.content);
 
-    state.history.lock().await.push(crate::ai::ChatMessage::text("user", &prompt));
-    state.history.lock().await.push(crate::ai::ChatMessage::text("assistant", &reply));
+    {
+        let current_sid = state.session_id.lock().await;
+        if *current_sid == sid {
+            state.history.lock().await.push(crate::ai::ChatMessage::text("user", &prompt));
+            state.history.lock().await.push(crate::ai::ChatMessage::text("assistant", &reply));
+        }
+    }
 
     if let Ok(conn) = crate::db::open(&*state.storage_dir.lock().await) {
-        let sid = state.session_id.lock().await.clone();
-        let _ = crate::db::insert_message(&conn, &sid, "user", &prompt);
         let _ = crate::db::insert_message(&conn, &sid, "assistant", &reply);
     }
+    auto_generate_title_if_needed(&sid, &prompt, &state, &app_handle).await;
 
     Ok(reply)
 }
@@ -1684,32 +1870,98 @@ async fn run_chat(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn list_conversations(
+    query: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> std::result::Result<Vec<ConvInfo>, String> {
     let conn = db::open(&*state.storage_dir.lock().await).map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT m.session_id, MAX(m.created_at), m.content, meta.name
-             FROM messages m
-             LEFT JOIN conversation_metadata meta ON m.session_id = meta.session_id
-             WHERE m.role = 'user'
-             GROUP BY m.session_id
-             ORDER BY MAX(m.created_at) DESC
-             LIMIT 50",
-        )
-        .map_err(|e| e.to_string())?;
-
-    let convs = stmt
-        .query_map([], |r| {
-            Ok(ConvInfo {
-                id: r.get(0)?,
-                name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                preview: r.get::<_, String>(2).unwrap_or_default().chars().take(35).collect(),
+    
+    let convs = if let Some(ref q) = query {
+        if q.trim().is_empty() {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.session_id, MAX(m.created_at) as last_msg_at,
+                            (SELECT content FROM messages WHERE session_id = m.session_id AND role != 'thinking' ORDER BY created_at ASC LIMIT 1) as first_msg,
+                            meta.name
+                     FROM messages m
+                     LEFT JOIN conversation_metadata meta ON m.session_id = meta.session_id
+                     GROUP BY m.session_id
+                     ORDER BY last_msg_at DESC
+                     LIMIT 50",
+                )
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map([], |r| {
+                    Ok(ConvInfo {
+                        id: r.get(0)?,
+                        name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        preview: r.get::<_, String>(2).unwrap_or_default().chars().take(35).collect(),
+                        last_message_at: r.get::<_, String>(1).unwrap_or_default(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            mapped
+        } else {
+            let search_term = format!("%{}%", q.trim().to_lowercase());
+            let mut stmt = conn
+                .prepare(
+                    "SELECT m.session_id, MAX(m.created_at) as last_msg_at,
+                            (SELECT content FROM messages WHERE session_id = m.session_id AND role != 'thinking' ORDER BY created_at ASC LIMIT 1) as first_msg,
+                            meta.name
+                     FROM messages m
+                     LEFT JOIN conversation_metadata meta ON m.session_id = meta.session_id
+                     WHERE m.session_id IN (
+                          SELECT DISTINCT session_id FROM messages WHERE LOWER(content) LIKE ?1
+                          UNION
+                          SELECT session_id FROM conversation_metadata WHERE LOWER(name) LIKE ?1
+                      )
+                     GROUP BY m.session_id
+                     ORDER BY last_msg_at DESC
+                     LIMIT 50",
+                )
+                .map_err(|e| e.to_string())?;
+            let mapped = stmt
+                .query_map([&search_term], |r| {
+                    Ok(ConvInfo {
+                        id: r.get(0)?,
+                        name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        preview: r.get::<_, String>(2).unwrap_or_default().chars().take(35).collect(),
+                        last_message_at: r.get::<_, String>(1).unwrap_or_default(),
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .filter_map(|r| r.ok())
+                .collect();
+            mapped
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.session_id, MAX(m.created_at) as last_msg_at,
+                        (SELECT content FROM messages WHERE session_id = m.session_id AND role != 'thinking' ORDER BY created_at ASC LIMIT 1) as first_msg,
+                        meta.name
+                 FROM messages m
+                 LEFT JOIN conversation_metadata meta ON m.session_id = meta.session_id
+                 GROUP BY m.session_id
+                 ORDER BY last_msg_at DESC
+                 LIMIT 50",
+            )
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([], |r| {
+                Ok(ConvInfo {
+                    id: r.get(0)?,
+                    name: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    preview: r.get::<_, String>(2).unwrap_or_default().chars().take(35).collect(),
+                    last_message_at: r.get::<_, String>(1).unwrap_or_default(),
+                })
             })
-        })
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+        mapped
+    };
     Ok(convs)
 }
 
@@ -1736,12 +1988,15 @@ async fn load_conversation(
     let db_msgs = db::load_messages(&conn, &session_id, 200)
         .map_err(|e| e.to_string())?;
 
-    let device_info = crate::device::collect().map_err(|e| e.to_string())?;
-    let cfg = state.cfg.lock().await;
-    let system_prompt = crate::prompt::build_system_prompt_with_vision(&device_info, cfg.ai.vision_capable);
+    let device_info = state.device_info.clone();
+    let vision_capable = state.cfg.lock().await.ai.vision_capable;
+    let system_prompt = crate::prompt::build_system_prompt_with_vision(&device_info, vision_capable, None);
 
     let mut history = vec![ChatMessage::text("system", &system_prompt)];
     for m in &db_msgs {
+        if m.role == "thinking" {
+            continue;
+        }
         let val = if m.content.trim().starts_with('[') || m.content.trim().starts_with('{') {
             serde_json::from_str(&m.content).unwrap_or_else(|_| serde_json::Value::String(m.content.clone()))
         } else {
@@ -1756,6 +2011,26 @@ async fn load_conversation(
     *state.history.lock().await = history;
     *state.session_id.lock().await = session_id;
 
+    // Only return the most recent 30 messages to the frontend for UI performance.
+    // Note that db_msgs is ordered oldest-first in load_messages.
+    let count = db_msgs.len();
+    let start_idx = if count > 30 { count - 30 } else { 0 };
+    let msgs = db_msgs[start_idx..].iter()
+        .map(|m| MsgInfo { role: m.role.clone(), content: m.content.clone() })
+        .collect();
+    Ok(msgs)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_messages_page(
+    session_id: String,
+    limit: usize,
+    offset: usize,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<Vec<MsgInfo>, String> {
+    let conn = db::open(&*state.storage_dir.lock().await).map_err(|e| e.to_string())?;
+    let db_msgs = db::load_messages_paged(&conn, &session_id, limit, offset)
+        .map_err(|e| e.to_string())?;
     let msgs = db_msgs.into_iter()
         .map(|m| MsgInfo { role: m.role, content: m.content })
         .collect();
@@ -1796,6 +2071,17 @@ async fn rename_conversation(
 ) -> std::result::Result<(), String> {
     let conn = db::open(&*state.storage_dir.lock().await).map_err(|e| e.to_string())?;
     db::set_conversation_name(&conn, &session_id, &name).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_thinking_steps(
+    session_id: String,
+    steps_json: String,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let conn = db::open(&*state.storage_dir.lock().await).map_err(|e| e.to_string())?;
+    let _ = db::insert_message(&conn, &session_id, "thinking", &steps_json).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -2160,12 +2446,36 @@ async fn set_session_memory(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+async fn set_concurrency(
+    value: usize,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let mut cfg = state.cfg.lock().await.clone();
+    cfg.num_parallel = value;
+    config::save(&*state.storage_dir.lock().await, &cfg).map_err(|e| e.to_string())?;
+    *state.cfg.lock().await = cfg;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 async fn set_run_in_background(
     enabled: bool,
     state: tauri::State<'_, AppState>,
 ) -> std::result::Result<(), String> {
     let mut cfg = state.cfg.lock().await.clone();
     cfg.run_in_background = enabled;
+    config::save(&*state.storage_dir.lock().await, &cfg).map_err(|e| e.to_string())?;
+    *state.cfg.lock().await = cfg;
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_app_mode(
+    mode: String,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let mut cfg = state.cfg.lock().await.clone();
+    cfg.mode = mode;
     config::save(&*state.storage_dir.lock().await, &cfg).map_err(|e| e.to_string())?;
     *state.cfg.lock().await = cfg;
     Ok(())
@@ -2422,6 +2732,11 @@ async fn request_mobile_notification_permission() -> std::result::Result<(), Str
     {
         Ok(())
     }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn open_browser_url(url: String) -> std::result::Result<(), String> {
+    open::that(url).map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -2687,6 +3002,57 @@ async fn read_local_model_file(
     }
     
     std::fs::read(&path).map_err(|e| e.to_string())
+}
+
+pub fn update_app_icon(app_handle: &tauri::AppHandle, executing: bool) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if let Some(w) = app_handle.get_webview_window("main") {
+            use tauri::window::{ProgressBarState, ProgressBarStatus};
+            let status = if executing {
+                Some(ProgressBarStatus::Indeterminate)
+            } else {
+                Some(ProgressBarStatus::None)
+            };
+            let _ = w.set_progress_bar(ProgressBarState {
+                progress: None,
+                status,
+            });
+
+            // Dynamically load the app icon, overlay a glowing neon-green execution badge in the bottom-right corner
+            const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
+            if let Ok(img) = image::load_from_memory(ICON_BYTES) {
+                let mut rgba = img.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                if executing {
+                    // Draw a glowing neon-green execution dot in the bottom-right corner of the icon
+                    let r = (width as f32 * 0.16) as i32; // radius
+                    let cx = (width as i32) - r - 6;
+                    let cy = (height as i32) - r - 6;
+                    for y in (cy - r)..(cy + r) {
+                        for x in (cx - r)..(cx + r) {
+                            if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+                                let dx = x - cx;
+                                let dy = y - cy;
+                                let dist_sq = dx * dx + dy * dy;
+                                if dist_sq <= r * r {
+                                    let dist = (dist_sq as f32).sqrt();
+                                    if dist < r as f32 - 3.0 {
+                                        rgba.put_pixel(x as u32, y as u32, image::Rgba([0, 230, 118, 255])); // Vibrant Neon Green
+                                    } else {
+                                        rgba.put_pixel(x as u32, y as u32, image::Rgba([20, 20, 20, 255])); // Dark contrast border
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let raw_bytes = rgba.into_raw();
+                let icon = tauri::image::Image::new_owned(raw_bytes, width, height);
+                let _ = w.set_icon(icon);
+            }
+        }
+    }
 }
 
 

@@ -8,9 +8,9 @@ path = "src/lib.rs"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["tui"]
-tui = []
-gui = ["tauri"]
+default = ["tui", "gui"]
+tui = ["dep:ratatui", "dep:crossterm"]
+gui = ["dep:tauri"]
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api"], optional = true }
@@ -23,6 +23,11 @@ ctrlc = "3"
 
 # --- HTTP client ---
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "blocking", "rustls-tls"] }
+rust-embed = { version = "8" }
+candle-core = { version = "0.10.2", default-features = false }
+candle-nn = { version = "0.10.2", default-features = false }
+candle-transformers = { version = "0.10.2", default-features = false }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 
 # --- JSON serialization ---
 serde = { version = "1", features = ["derive"] }
@@ -39,7 +44,7 @@ image = { version = "0.24", default-features = false, features = ["png"] }
 
 
 # --- Terminal UI helpers ---
-crossterm = "0.27"
+crossterm = { version = "0.27", optional = true }
 
 # --- Console spinner / animation ---
 indicatif = "0.17"
@@ -73,7 +78,7 @@ dirs = "5"
 
 # --- Process management ---
 async-trait = "0.1"
-ratatui = "0.26"
+ratatui = { version = "0.26", optional = true }
 gag = "1"
 
 # --- Windows-specific APIs ---
@@ -84,6 +89,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"] }
 
 [profile.release]
 opt-level = "z"

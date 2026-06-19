@@ -67,6 +67,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/new",           "New conversation"),
     ("/conversations", "Browse conversations"),
     ("/model",         "Switch AI model"),
+    ("/mode",          "Change agent mode (auto/chat/task)"),
     ("/keys",          "Manage API keys"),
     ("/tasks",         "Manage scheduled tasks"),
     ("/clear",         "Clear chat history"),
@@ -248,10 +249,16 @@ pub struct App {
     pub device_changed: bool,
     pub fetched_cloud_models: Vec<crate::tui::model_fetch::FetchedModel>,
     pub fetching_models: bool,
+    #[cfg(feature = "tui")]
     pub fetch_rx: Option<tokio::sync::mpsc::Receiver<crate::tui::runner::FetchResult>>,
+    #[cfg(not(feature = "tui"))]
+    pub fetch_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     pub stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub fetch_started: Option<std::time::Instant>,
+    #[cfg(feature = "tui")]
     pub onboarding: Option<crate::tui::onboarding::OnboardingState>,
+    #[cfg(not(feature = "tui"))]
+    pub onboarding: Option<()>,
     pub clarification_question: Option<String>,
     pub clarification_options: Vec<String>,
     pub clarification_cursor: usize,
@@ -279,11 +286,14 @@ impl App {
 
         let token_limit = estimate_token_limit(&cfg.ai.model);
 
+        #[cfg(feature = "tui")]
         let onboarding = if !cfg.setup_complete {
             Some(crate::tui::onboarding::OnboardingState::new())
         } else {
             None
         };
+        #[cfg(not(feature = "tui"))]
+        let onboarding = None;
         let initial_mode = if !cfg.setup_complete {
             AppMode::Onboarding
         } else {

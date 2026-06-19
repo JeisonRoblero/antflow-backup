@@ -49,13 +49,21 @@ pub fn mouse_click(params: &Value) -> Result<Option<String>> {
     let button_str = json_str(params, "button").unwrap_or("left");
     let button = parse_button(button_str)?;
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
+    if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
+        e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     e.button(button, Direction::Click).context("Mouse click failed")?;
     Ok(None)
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn mouse_double_click(_params: &Value) -> Result<Option<String>> {
+pub fn mouse_double_click(params: &Value) -> Result<Option<String>> {
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
+    if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
+        e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     e.button(Button::Left, Direction::Click)?;
     std::thread::sleep(std::time::Duration::from_millis(50));
     e.button(Button::Left, Direction::Click)?;

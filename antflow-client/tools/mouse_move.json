@@ -1,0 +1,12 @@
+{
+  "name": "mouse_move",
+  "description": "Moves the mouse cursor to absolute (x, y) coordinates on the primary monitor.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "x": { "type": "integer" },
+      "y": { "type": "integer" }
+    },
+    "required": ["x", "y"]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "screenshot",
+  "description": "Takes a screenshot of the primary display to verify visual states and get coordinates of UI elements.",
+  "parameters": {
+    "type": "object",
+    "properties": {}
+  }
+}

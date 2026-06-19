@@ -12,12 +12,46 @@ use std::path::Path;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DB_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 // Database connection
 // ---------------------------------------------------------------------------
 
 // Opens (or creates) the SQLite database and ensures all tables exist.
 // `storage_dir` is the folder where antflow.db will be placed.
 pub fn open(storage_dir: &Path) -> Result<Connection> {
+    match open_internal(storage_dir) {
+        Ok(conn) => {
+            DB_INITIALIZED.store(true, Ordering::Relaxed);
+            Ok(conn)
+        }
+        Err(e) => {
+            let err_msg = e.to_string().to_lowercase();
+            if err_msg.contains("malformed") || err_msg.contains("corrupt") {
+                eprintln!("[DB] Database is corrupted! Attempting auto-recovery. Error: {}", e);
+                DB_INITIALIZED.store(false, Ordering::Relaxed);
+                if let Err(rec_err) = handle_corrupted_db(storage_dir) {
+                    eprintln!("[DB] Failed to rename/backup corrupted database: {}", rec_err);
+                }
+                match open_internal(storage_dir) {
+                    Ok(conn) => {
+                        DB_INITIALIZED.store(true, Ordering::Relaxed);
+                        Ok(conn)
+                    }
+                    Err(retry_err) => {
+                        anyhow::bail!("Failed to initialize database even after recovery: {}", retry_err)
+                    }
+                }
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn open_internal(storage_dir: &Path) -> Result<Connection> {
     std::fs::create_dir_all(storage_dir)
         .context("Failed to create storage directory for database")?;
 
@@ -27,14 +61,47 @@ pub fn open(storage_dir: &Path) -> Result<Connection> {
     let conn = Connection::open(&db_path)
         .with_context(|| format!("Failed to open database: {}", db_path.display()))?;
 
-    // Enable WAL (Write-Ahead Logging) mode for better concurrent performance.
-    // WAL allows reads while a write is in progress.
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // Set a busy timeout of 5 seconds to prevent immediate SQLITE_BUSY errors
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
-    // Create all tables.
-    create_tables(&conn)?;
+    if !DB_INITIALIZED.load(Ordering::Relaxed) {
+        // Enable WAL (Write-Ahead Logging) mode for better concurrent performance.
+        // WAL allows reads while a write is in progress.
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
+
+        // Create all tables.
+        create_tables(&conn)?;
+    }
+
+    // Quick verification query to detect corruption in any table
+    conn.query_row("SELECT COUNT(*) FROM messages LIMIT 1", [], |r| r.get::<_, i32>(0))?;
+    conn.query_row("SELECT COUNT(*) FROM conversation_metadata LIMIT 1", [], |r| r.get::<_, i32>(0))?;
+    conn.query_row("SELECT COUNT(*) FROM scheduled_tasks LIMIT 1", [], |r| r.get::<_, i32>(0))?;
+    conn.query_row("SELECT COUNT(*) FROM undo_log LIMIT 1", [], |r| r.get::<_, i32>(0))?;
 
     Ok(conn)
+}
+
+fn handle_corrupted_db(storage_dir: &Path) -> Result<()> {
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let db_path = storage_dir.join("antflow.db");
+    let wal_path = storage_dir.join("antflow.db-wal");
+    let shm_path = storage_dir.join("antflow.db-shm");
+
+    if db_path.exists() {
+        let new_db_path = storage_dir.join(format!("antflow.db.corrupted_{}", timestamp));
+        std::fs::rename(&db_path, &new_db_path)
+            .context("Failed to rename corrupted antflow.db")?;
+    }
+    if wal_path.exists() {
+        let new_wal_path = storage_dir.join(format!("antflow.db-wal.corrupted_{}", timestamp));
+        let _ = std::fs::rename(&wal_path, &new_wal_path);
+    }
+    if shm_path.exists() {
+        let new_shm_path = storage_dir.join(format!("antflow.db-shm.corrupted_{}", timestamp));
+        let _ = std::fs::rename(&shm_path, &new_shm_path);
+    }
+    Ok(())
 }
 
 // Creates all required tables if they do not already exist.
@@ -153,6 +220,36 @@ pub fn load_messages(conn: &Connection, session_id: &str, limit: usize) -> Resul
 
     Ok(messages)
 }
+
+pub fn load_messages_paged(conn: &Connection, session_id: &str, limit: usize, offset: usize) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, role, content, created_at
+         FROM messages
+         WHERE session_id = ?1
+         ORDER BY created_at DESC
+         LIMIT ?2 OFFSET ?3"
+    )?;
+
+    let rows = stmt.query_map(params![session_id, limit as i64, offset as i64], |row| {
+        Ok(Message {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            role: row.get(2)?,
+            content: row.get(3)?,
+            created_at: row.get::<_, String>(4)?
+                .parse::<DateTime<Utc>>()
+                .unwrap_or_else(|_| Utc::now()),
+        })
+    })?;
+
+    let mut messages: Vec<Message> = rows
+        .filter_map(|r| r.ok())
+        .collect();
+    messages.reverse();
+
+    Ok(messages)
+}
+
 
 // Returns the total number of bytes used by the database file.
 // Shown in the session-size info screen.

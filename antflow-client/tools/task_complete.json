@@ -1,0 +1,11 @@
+{
+  "name": "task_complete",
+  "description": "Call this immediately once you have verified the task is completed.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "summary": { "type": "string" }
+    },
+    "required": ["summary"]
+  }
+}

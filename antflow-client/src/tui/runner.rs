@@ -89,6 +89,8 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null());
+                cmd.env("OLLAMA_NUM_PARALLEL", cfg.num_parallel.to_string());
+                std::env::set_var("OLLAMA_NUM_PARALLEL", cfg.num_parallel.to_string());
                 #[cfg(windows)]
                 cmd.creation_flags(0x08000000);
                 let _ = cmd.spawn();
@@ -939,6 +941,20 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                 let parts: Vec<&str> = trimmed.splitn(3, |c: char| c.is_whitespace()).filter(|s| !s.is_empty()).collect();
                 let main_cmd = parts.first().copied().unwrap_or("");
                 match main_cmd {
+                    "/mode" => {
+                        if parts.len() < 2 {
+                            app.push_message("system", &format!("Current mode: {}. Usage: /mode <auto|chat|task>", app.cfg.mode));
+                        } else {
+                            let target_mode = parts[1].trim().to_lowercase();
+                            if target_mode == "auto" || target_mode == "chat" || target_mode == "task" {
+                                app.cfg.mode = target_mode.clone();
+                                let _ = crate::config::save(&storage_dir, &app.cfg);
+                                app.push_message("system", &format!("Agent mode changed to: {}", target_mode));
+                            } else {
+                                app.push_message("system", "Invalid mode. Choose from: auto, chat, task");
+                            }
+                        }
+                    }
                     "/import" => {
                         if parts.len() < 3 {
                             app.push_message("system", "Usage: /import <name> <path_to_gguf>");

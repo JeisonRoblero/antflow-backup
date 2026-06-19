@@ -1,0 +1,11 @@
+{
+  "name": "mouse_scroll",
+  "description": "Scrolls the mouse wheel vertically by the specified amount (positive for up, negative for down).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "amount": { "type": "integer" }
+    },
+    "required": ["amount"]
+  }
+}

@@ -150,8 +150,14 @@ impl VoiceSession {
                         let session_id = state.session_id.lock().await.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = run_voice_pipeline(app_handle, session_id, accumulated_samples, cancel_rx).await {
-                                                        eprintln!("Error running voice pipeline: {}", e);
+                            if let Err(e) = run_voice_pipeline(app_handle.clone(), session_id.clone(), accumulated_samples, cancel_rx).await {
+                                eprintln!("Error running voice pipeline: {}", e);
+                                let _ = app_handle.emit("voice-state", serde_json::json!({ "state": "listening" }));
+                                let _ = app_handle.emit("agent-done", serde_json::json!({
+                                    "session_id": session_id,
+                                    "content": format!("Error: {}", e),
+                                }));
+                                reset_session_to_listening().await;
                             }
                         });
                     }

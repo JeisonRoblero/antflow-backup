@@ -2,14 +2,15 @@
 // System prompt builder for the AI agent.
 
 use crate::device::DeviceInfo;
+use chrono::Local;
 
 // Unused helper functions removed - see build_system_prompt_with_vision for inlined logic.
 
 pub fn build_system_prompt(device: &DeviceInfo) -> String {
-    build_system_prompt_with_vision(device, true)
+    build_system_prompt_with_vision(device, true, None)
 }
 
-pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool) -> String {
+pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool, user_query: Option<&str>) -> String {
     let cx = device.screen.width / 2;
     let cy = device.screen.height / 2;
 
@@ -36,7 +37,7 @@ pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool
             "screenshot:{}\nmouse_move:{{\"x\":int,\"y\":int}} — moves cursor\nmouse_click:{{\"x\":int,\"y\":int,\"button\":\"left\"}} — x and y REQUIRED, use coords from screenshot\nmouse_drag:{{\"from_x\":int,\"from_y\":int,\"to_x\":int,\"to_y\":int}} — drag between two points",
             "GROUNDING RULE: After every screenshot, you MUST list the key UI elements you see with their approximate pixel coordinates before planning any mouse action. Example: \"I see: Pencil tool at (45,80), Color red at (120,45), Canvas center at (760,450)\". Then use those exact coords.",
             "2. After launch: screenshot then re-plan (vision). Maximize window.",
-            "3. Prefer: run_script > keyboard > mouse. Mouse only with screenshot coords.",
+            "3. Always prefer terminal commands over mouse/touch actions. Only use UI coordinates if terminal commands are impossible or have failed. Prefer: run_script > keyboard > mouse. Mouse only with screenshot coords.",
             "4. Never guess coords. Never task_complete right after app launch."
         )
     } else {
@@ -44,9 +45,45 @@ pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool
             "",
             "CRITICAL: You are running in TEXT-ONLY mode with NO vision capability. You cannot see the screen, take screenshots, or use coordinate-based mouse tools. Do NOT attempt to use mouse click/move/drag/screenshot. You must accomplish all tasks programmatically using run_script or run_command.",
             "2. Plan programmatically from expected state. Maximize window.",
-            "3. Perform all actions programmatically using run_script or run_command.",
+            "3. Always prefer terminal commands over mouse/touch actions. Perform all actions programmatically using run_script or run_command.",
             "4. Never task_complete right after app launch."
         )
+    };
+
+    let lower_query = user_query.unwrap_or("").to_lowercase();
+    let is_office_related = lower_query.contains("word")
+        || lower_query.contains("excel")
+        || lower_query.contains("winword")
+        || lower_query.contains("powerpoint")
+        || lower_query.contains("powerpnt")
+        || lower_query.contains("office")
+        || lower_query.contains("document")
+        || lower_query.contains("doc")
+        || lower_query.contains("xls")
+        || lower_query.contains("ppt")
+        || lower_query.contains("hoja de cálculo")
+        || lower_query.contains("hoja de calculo")
+        || lower_query.contains("libro")
+        || lower_query.contains("presentación")
+        || lower_query.contains("presentacion")
+        || lower_query.contains("diapositiva")
+        || lower_query.contains("notepad")
+        || lower_query.contains("bloc de notas")
+        || lower_query.contains("text")
+        || lower_query.contains("texto")
+        || lower_query.contains("escribe")
+        || lower_query.contains("write");
+
+    let rule_13 = if is_office_related {
+        "13. MS Office Apps (Word/Excel): When Word/Excel opens, it stops on a Welcome screen. You MUST either press the 'enter' key or click 'Documento en blanco' to get a blank document. Alternatively, for Office document creation tasks, use PowerShell COM Object programmatically: `$w = New-Object -ComObject Word.Application; $w.Visible = $true; $d = $w.Documents.Add(); $d.Content.Text = \"Text\"`."
+    } else {
+        "13. GUI Apps: Standard desktop applications can be controlled programmatically (PowerShell / terminal) or using GUI interaction tools."
+    };
+
+    let rule_15 = if is_office_related {
+        "15. MS Office/Notepad File Creation: When asked to write, type, or create content in applications (like Word, Excel, Notepad, etc.), you MUST ALWAYS create a new document/file first (e.g. by pressing Ctrl+N, clicking the 'New' template button, or using COM Object `Documents.Add()`), unless the user explicitly named an existing file to modify or requested to edit a specific file. Never start typing into whatever document happens to be currently open."
+    } else {
+        "15. Programmatic control: Always prefer programmatic execution (APIs, command-line arguments, keyboard shortcuts) over manual GUI mouse clicking or drag operations."
     };
 
     format!(r#"You are antflow, an AI agent controlling a real {platform} computer.
@@ -61,12 +98,13 @@ CRITICAL: Only output math blocks, mermaid diagrams, charts, or animations when 
 
 DEVICE
 OS:{os_edition} | Arch:{arch} | CPU:{cpu} {freq}MHz ({cores}c/{logical}t) | RAM:{ram}MB | GPU:{gpu} | Screen:{w}x{h}px scale={scale:.1} center=({cx},{cy}) | Touch:{touch}{extra_screens}
+DateTime:{current_datetime}
 Open:{open_cmd} | Shell:{shell} | Layout:{taskbar}
 Maximize:{maximize_cmd}
 
 TOOLS
 run_script:{{"script":"...","capture_output":bool}} — Windows: runs in PowerShell. Linux/macOS: runs in bash. Use for all PowerShell cmdlets/scripts, variables, loops, etc.
-run_command:{{"command":"...","capture_output":bool}} — Windows: runs in legacy CMD.EXE. Linux/macOS: runs in bash. Do NOT run PowerShell cmdlets (like Get-Process, Start-Process) in run_command.
+run_command:{{"command":"...","capture_output":bool}} — Windows: runs in legacy CMD.EXE (NOT PowerShell). Linux/macOS: runs in bash. CRITICAL: Do NOT use PowerShell cmdlets (Get-Date, Get-Process, Start-Process, Invoke-WebRequest) in run_command — they will fail. Use run_script instead.
 key_press:{{"key":"...","modifiers":["ctrl"]}}
 type_text:{{"text":"..."}}
 {screenshot_tools}
@@ -99,10 +137,13 @@ RULES
 10. Concise Plans: Keep plans very short (max 5-6 steps) to stay within the total task limit of 30 steps. Do NOT generate multiple polling/waiting steps in the plan array.
 11. No Mock Outcomes: Never add mock "result" or "post_result" fields inside plan steps. Tool outputs are populated dynamically by the executor.
 12. GUI App Launching: When starting GUI apps on Windows/Mac, NEVER use `-Wait` or blocking arguments in run_script (e.g. `Start-Process winword -Wait`). Run it in the background so the script returns immediately (e.g. `start winword` or `Start-Process winword`).
-13. MS Office Apps (Word/Excel): When Word/Excel opens, it stops on a Welcome screen. You MUST either press the 'enter' key or click 'Documento en blanco' to get a blank document. Alternatively, use PowerShell COM Object programmatically: `$w = New-Object -ComObject Word.Application; $w.Visible = $true; $d = $w.Documents.Add(); $d.Content.Text = "Text"`.
+{rule_13}
 14. Keyboard Shortcuts: For keyboard shortcuts (like Ctrl+A or Ctrl+V), use `key_press` with `modifiers: ["ctrl"]` and `key` as a single character (e.g. `"key":"a"`). Never put modifiers in `type_text` (which is only for typing literal text), and never combine modifiers in the `"key"` string (like `"ctrl+shift+n"`).
-15. MS Office/Notepad File Creation: When asked to write, type, or create content in applications (like Word, Excel, Notepad, etc.), you MUST ALWAYS create a new document/file first (e.g. by pressing Ctrl+N, clicking the 'New' template button, or using COM Object `Documents.Add()`), unless the user explicitly named an existing file to modify or requested to edit a specific file. Never start typing into whatever document happens to be currently open.
+{rule_15}
 16. Verification & Completion: Before starting and during execution, always check if the task has already been completed (e.g. check if a Word/Excel/Notepad document is already open with the target text, or if the file exists, or if a process is already running). You can check this programmatically using run_script with capture_output:true (e.g. checking active processes, open windows, COM objects, or file contents) or by examining the screen. If verified as already completed, you MUST immediately call task_complete to exit the loop. Do NOT repeat actions or recreate/overwrite files if the task is already accomplished.
+17. Web Searches: To search the internet, ALWAYS use the web_search tool. NEVER try to fetch web pages using Invoke-WebRequest, Get-Content with URLs, curl, wget, or Start-Process with URLs — those will fail. Use web_search for any query that needs current/live information from the internet.
+18. Web/Media Playback: If asked to play/reproduce a video (e.g. YouTube), open a website, or search for a video, simply open the URL directly using the `open_url` tool or run `Start-Process '<url>'` in PowerShell. Do NOT search for developer packages (like pub.dev packages), write code to compile players, or attempt to download/install players. Direct browser playback is sufficient.
+19. Temporary Files: All temporary files, downloaded items, scraped pages, or intermediate log files generated during script or command execution MUST be written to the system TEMP folder (e.g. `$env:TEMP` on Windows, or `/tmp` on macOS/Linux). NEVER write temporary files directly to the current working directory, the project source code directory, or repository folders.
 
 APP NAMES
 {app_hints}
@@ -146,11 +187,14 @@ EXAMPLE
         shell     = shell,
         taskbar   = taskbar,
         maximize_cmd = maximize_cmd,
+        current_datetime = Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
         screenshot_tools = screenshot_tools,
         grounding_rule = grounding_rule,
         rule_2 = rule_2,
         rule_3 = rule_3,
         rule_4 = rule_4,
+        rule_13 = rule_13,
+        rule_15 = rule_15,
         app_hints = {
             match device.platform.as_str() {
                 "windows" => "Windows: mspaint, notepad, calc, explorer, code (VSCode), chrome, msedge, \

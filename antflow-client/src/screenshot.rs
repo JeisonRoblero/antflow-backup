@@ -109,3 +109,68 @@ pub fn to_base64(bytes: &[u8]) -> String {
 
     output
 }
+
+pub fn draw_indicator(img: &mut DynamicImage, points: &[(i32, i32)]) {
+    let width = img.width() as i32;
+    let height = img.height() as i32;
+    let mut rgba_img = img.to_rgba8();
+
+    let color = image::Rgba([255, 0, 0, 255]); // Neon red indicator
+
+    for &(x, y) in points {
+        // Draw crosshair
+        for dx in -15..=15 {
+            let px = x + dx;
+            if px >= 0 && px < width && y >= 0 && y < height {
+                rgba_img.put_pixel(px as u32, y as u32, color);
+            }
+        }
+        for dy in -15..=15 {
+            let py = y + dy;
+            if x >= 0 && x < width && py >= 0 && py < height {
+                rgba_img.put_pixel(x as u32, py as u32, color);
+            }
+        }
+        // Draw circle of radius 8
+        for r in 1..=8 {
+            for theta in 0..360 {
+                let rad = (theta as f32).to_radians();
+                let px = x + (r as f32 * rad.cos()) as i32;
+                let py = y + (r as f32 * rad.sin()) as i32;
+                if px >= 0 && px < width && py >= 0 && py < height {
+                    rgba_img.put_pixel(px as u32, py as u32, color);
+                }
+            }
+        }
+    }
+
+    if points.len() == 2 {
+        let (x1, y1) = points[0];
+        let (x2, y2) = points[1];
+        let steps = 100;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let px = x1 + (t * (x2 - x1) as f32) as i32;
+            let py = y1 + (t * (y2 - y1) as f32) as i32;
+            if px >= 0 && px < width && py >= 0 && py < height {
+                rgba_img.put_pixel(px as u32, py as u32, color);
+            }
+        }
+    }
+
+    *img = DynamicImage::ImageRgba8(rgba_img);
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn capture_with_overlay(patterns: &RedactPatterns, points: &[(i32, i32)]) -> Result<Vec<u8>> {
+    let mut raw = capture_primary()?;
+    draw_indicator(&mut raw, points);
+    let redacted = redact::redact(raw, patterns);
+    let png_bytes = redact::encode_png(&redacted)?;
+    Ok(png_bytes)
+}
+
+#[cfg(target_os = "ios")]
+pub fn capture_with_overlay(_patterns: &RedactPatterns, _points: &[(i32, i32)]) -> Result<Vec<u8>> {
+    anyhow::bail!("Visual actions not supported on iOS.")
+}

@@ -1,0 +1,15 @@
+{
+  "name": "key_press",
+  "description": "Simulates key presses (with optional modifier keys like ctrl, alt, shift). Modifiers should be in the array, main key in key.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "key": { "type": "string" },
+      "modifiers": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "required": ["key"]
+  }
+}

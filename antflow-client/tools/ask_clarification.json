@@ -1,0 +1,15 @@
+{
+  "name": "ask_clarification",
+  "description": "Asks a multiple-choice question to resolve user intent when the prompt is vague or ambiguous.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "question": { "type": "string" },
+      "options": {
+        "type": "array",
+        "items": { "type": "string" }
+      }
+    },
+    "required": ["question", "options"]
+  }
+}

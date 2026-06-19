@@ -1,0 +1,15 @@
+{
+  "name": "mouse_drag",
+  "description": "Drags the mouse cursor from (from_x, from_y) to (to_x, to_y) coordinates while holding down the specified button.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "from_x": { "type": "integer" },
+      "from_y": { "type": "integer" },
+      "to_x": { "type": "integer" },
+      "to_y": { "type": "integer" },
+      "button": { "type": "string", "enum": ["left", "right", "middle"] }
+    },
+    "required": ["from_x", "from_y", "to_x", "to_y"]
+  }
+}

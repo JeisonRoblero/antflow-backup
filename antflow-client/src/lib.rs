@@ -58,28 +58,18 @@ pub async fn run_main() -> Result<()> {
     let exe_dir = exe_path.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
     let args: Vec<String> = env::args().skip(1).collect();
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
-    let is_tui_arg = subcommand == "tui" 
-        || args.contains(&"--tui".to_string()) 
-        || args.contains(&"cli".to_string())
-        || subcommand == "info" 
-        || subcommand == "tasks" 
-        || subcommand == "setup" 
-        || subcommand == "config" 
-        || subcommand == "stop" 
-        || subcommand == "clear" 
-        || subcommand == "undo" 
-        || subcommand == "model" 
-        || subcommand == "help" 
-        || args.contains(&"-h".to_string()) 
-        || args.contains(&"--help".to_string());
-
-    #[cfg(windows)]
+    let mut is_terminal = false;
+    #[cfg(target_os = "windows")]
     {
-        if is_tui_arg {
-            unsafe {
-                windows_sys::Win32::System::Console::AttachConsole(0xFFFFFFFF);
-            }
+        let is_gui_arg = subcommand == "gui" || args.contains(&"--gui".to_string());
+        if !is_gui_arg && cfg!(feature = "tui") {
+            is_terminal = attach_to_parent_console();
         }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::IsTerminal;
+        is_terminal = std::io::stdout().is_terminal();
     }
 
 
@@ -313,14 +303,40 @@ pub async fn run_main() -> Result<()> {
         device_info.cpu_cores,
         device_info.ram_mb,
     );
-    let system_prompt = prompt::build_system_prompt_with_vision(&device_info, cfg.ai.vision_capable);
+    let system_prompt = prompt::build_system_prompt_with_vision(&device_info, cfg.ai.vision_capable, None);
 
-    let run_tui_mode = subcommand == "tui" || args.contains(&"--tui".to_string()) || args.contains(&"cli".to_string());
-    
-    #[cfg(not(any(feature = "gui", target_os = "android", target_os = "ios")))]
-    let is_gui = false;
-    #[cfg(any(feature = "gui", target_os = "android", target_os = "ios"))]
-    let is_gui = !run_tui_mode;
+    let has_gui = cfg!(any(feature = "gui", target_os = "android", target_os = "ios"));
+    let has_tui = cfg!(feature = "tui");
+
+    let is_tui_arg = subcommand == "tui" 
+        || args.contains(&"--tui".to_string()) 
+        || args.contains(&"cli".to_string())
+        || subcommand == "info" 
+        || subcommand == "tasks" 
+        || subcommand == "setup" 
+        || subcommand == "config" 
+        || subcommand == "stop" 
+        || subcommand == "clear" 
+        || subcommand == "undo" 
+        || subcommand == "model" 
+        || subcommand == "help" 
+        || args.contains(&"-h".to_string()) 
+        || args.contains(&"--help".to_string());
+    let is_gui_arg = subcommand == "gui" || args.contains(&"--gui".to_string());
+
+    let run_tui_mode = if !has_tui {
+        false
+    } else if !has_gui {
+        true
+    } else if is_tui_arg {
+        true
+    } else if is_gui_arg {
+        false
+    } else {
+        is_terminal
+    };
+
+    let is_gui = has_gui && !run_tui_mode;
 
     if !is_gui && cfg.ai.provider.is_empty() {
         console::print_error(
@@ -368,25 +384,28 @@ pub async fn run_main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Could not unwrap connection"))?
         .into_inner();
 
-    #[cfg(any(feature = "gui", target_os = "android", target_os = "ios"))]
-    {
-        let run_tui_mode = subcommand == "tui" || args.contains(&"--tui".to_string()) || args.contains(&"cli".to_string());
-        if run_tui_mode {
+    if run_tui_mode {
+        #[cfg(feature = "tui")]
+        {
             dbg_log!("launching TUI...");
             tui::runner::run(cfg, conn, storage_dir).await?;
             dbg_log!("TUI exited cleanly");
-        } else {
+        }
+        #[cfg(not(feature = "tui"))]
+        {
+            anyhow::bail!("TUI mode is not compiled in this build of antflow.");
+        }
+    } else {
+        #[cfg(any(feature = "gui", target_os = "android", target_os = "ios"))]
+        {
             dbg_log!("launching GUI...");
             gui::run(cfg, conn, storage_dir).await?;
             dbg_log!("GUI exited cleanly");
         }
-    }
-
-    #[cfg(not(any(feature = "gui", target_os = "android", target_os = "ios")))]
-    {
-        dbg_log!("launching TUI...");
-        tui::runner::run(cfg, conn, storage_dir).await?;
-        dbg_log!("TUI exited cleanly");
+        #[cfg(not(any(feature = "gui", target_os = "android", target_os = "ios")))]
+        {
+            anyhow::bail!("GUI mode is not compiled in this build of antflow.");
+        }
     }
 
     println!("\nGoodbye.");
@@ -417,5 +436,27 @@ pub fn run() {
             .block_on(async {
                 let _ = gui::run(cfg, conn, storage_dir).await;
             });
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn attach_to_parent_console() -> bool {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    
+    #[link(name = "msvcrt")]
+    extern "C" {
+        fn freopen(filename: *const u8, mode: *const u8, stream: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn __acrt_iob_func(index: u32) -> *mut std::ffi::c_void;
+    }
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+            freopen(b"CONOUT$\0".as_ptr(), b"w\0".as_ptr(), __acrt_iob_func(1));
+            freopen(b"CONOUT$\0".as_ptr(), b"w\0".as_ptr(), __acrt_iob_func(2));
+            freopen(b"CONIN$\0".as_ptr(), b"r\0".as_ptr(), __acrt_iob_func(0));
+            true
+        } else {
+            false
+        }
     }
 }

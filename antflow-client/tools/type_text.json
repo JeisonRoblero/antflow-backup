@@ -1,0 +1,11 @@
+{
+  "name": "type_text",
+  "description": "Simulates typing literal text on the keyboard. Do not include key shortcuts or special formatting.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string" }
+    },
+    "required": ["text"]
+  }
+}

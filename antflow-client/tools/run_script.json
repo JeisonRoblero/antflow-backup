@@ -1,0 +1,12 @@
+{
+  "name": "run_script",
+  "description": "Windows: runs in PowerShell. Linux/macOS: runs in bash. Use for all PowerShell cmdlets/scripts, variables, loops, etc.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "script": { "type": "string" },
+      "capture_output": { "type": "boolean" }
+    },
+    "required": ["script"]
+  }
+}

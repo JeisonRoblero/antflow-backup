@@ -1,0 +1,11 @@
+{
+  "name": "clipboard_set",
+  "description": "Sets the system clipboard to a specified text string.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string" }
+    },
+    "required": ["text"]
+  }
+}

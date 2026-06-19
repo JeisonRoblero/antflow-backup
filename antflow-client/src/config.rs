@@ -114,6 +114,14 @@ impl Default for SchedulerConfig {
 // Top-level config struct
 // ---------------------------------------------------------------------------
 
+fn default_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_num_parallel() -> usize {
+    4
+}
+
 // AppConfig is the single source of truth for all user settings.
 // It maps 1-to-1 with the TOML file on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +145,14 @@ pub struct AppConfig {
     // Whether to keep running in the background when the main window is closed.
     #[serde(default)]
     pub run_in_background: bool,
+
+    // Active operation mode: "auto", "chat", "task"
+    #[serde(default = "default_mode")]
+    pub mode: String,
+
+    // Concurrency / Parallel execution limit
+    #[serde(default = "default_num_parallel")]
+    pub num_parallel: usize,
 }
 
 impl Default for AppConfig {
@@ -148,6 +164,8 @@ impl Default for AppConfig {
             scheduler: SchedulerConfig::default(),
             setup_complete: false,
             run_in_background: false,
+            mode: "auto".to_string(),
+            num_parallel: 4,
         }
     }
 }

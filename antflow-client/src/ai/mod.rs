@@ -9,6 +9,8 @@
 pub mod ollama;
 pub mod openai;
 pub mod generic; // covers Anthropic, Gemini, Groq, Mistral, Together, OpenRouter, Nvidia, custom
+pub mod embeddings;
+pub mod router;
 
 use anyhow::Result;
 use async_trait::async_trait;

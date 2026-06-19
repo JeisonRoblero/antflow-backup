@@ -1,0 +1,11 @@
+{
+  "name": "open_url",
+  "description": "Opens a given URL in the default web browser on the host system.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "url": { "type": "string" }
+    },
+    "required": ["url"]
+  }
+}

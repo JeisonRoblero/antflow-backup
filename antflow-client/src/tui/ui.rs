@@ -476,7 +476,7 @@ fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
                     ]));
                 } else {
                     let bubble_max = (width * 4 / 5).max(30).min(width.saturating_sub(4));
-                    let rendered = render_markdown(&msg.content);
+                    let rendered = render_markdown(&msg.content, bubble_max);
 
                     lines.push(Line::from(vec![
                         Span::styled(" ", Style::default().bg(AI_ACCENT)),
@@ -548,14 +548,293 @@ fn draw_messages(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn preprocess_search_widgets_for_tui(text: &str) -> String {
+    if !text.contains("web-search-box") {
+        return text.to_string();
+    }
+
+    let mut result = String::new();
+    let mut lines_iter = text.lines().peekable();
+
+    while let Some(line) = lines_iter.next() {
+        let trimmed = line.trim();
+        if trimmed.contains("web-search-box") {
+            let mut query = String::new();
+            let mut count = String::new();
+            let mut items = Vec::new();
+
+            let mut current_item_title = String::new();
+            let mut current_item_url = String::new();
+            let mut current_item_domain = String::new();
+
+            let mut open_divs = 1;
+            while let Some(next_line) = lines_iter.peek() {
+                let next_trimmed = next_line.trim();
+
+                if next_trimmed.starts_with("<div") {
+                    open_divs += 1;
+                }
+                if next_trimmed.starts_with("</div") || next_trimmed == "</div>" {
+                    open_divs -= 1;
+                }
+
+                let next_line_val = lines_iter.next().unwrap();
+                let next_trimmed_val = next_line_val.trim();
+
+                if next_trimmed_val.contains("Searched the web for") {
+                    if let Some(start) = next_trimmed_val.find("class=\"web-search-q\">\"") {
+                        if let Some(end) = next_trimmed_val[start + 22..].find('"') {
+                            query = next_trimmed_val[start + 22..start + 22 + end].to_string();
+                        }
+                    }
+                    if query.is_empty() {
+                        if let Some(start) = next_trimmed_val.find("Searched the web for") {
+                            query = next_trimmed_val[start..].to_string();
+                        }
+                    }
+                }
+                if next_trimmed_val.contains("results</span>") {
+                    if let Some(idx) = next_trimmed_val.find(" results</span>") {
+                        let start = next_trimmed_val[..idx].rfind('>').map(|i| i + 1).unwrap_or(0);
+                        count = next_trimmed_val[start..idx].to_string();
+                    }
+                }
+                if next_trimmed_val.contains("class=\"web-search-link\"") {
+                    if let Some(h_start) = next_trimmed_val.find("href=\"") {
+                        if let Some(h_end) = next_trimmed_val[h_start + 6..].find('"') {
+                            current_item_url = next_trimmed_val[h_start + 6..h_start + 6 + h_end].to_string();
+                        }
+                    }
+                    if let Some(t_start) = next_trimmed_val.find("target=\"_blank\">") {
+                        if let Some(t_end) = next_trimmed_val[t_start + 16..].find("</a>") {
+                            current_item_title = next_trimmed_val[t_start + 16..t_start + 16 + t_end].to_string();
+                        }
+                    }
+                }
+                if next_trimmed_val.contains("class=\"web-search-domain\"") {
+                    if let Some(d_start) = next_trimmed_val.find(">") {
+                        if let Some(d_end) = next_trimmed_val[d_start + 1..].find("<") {
+                            current_item_domain = next_trimmed_val[d_start + 1..d_start + 1 + d_end].to_string();
+                        }
+                    }
+                    if !current_item_title.is_empty() {
+                        items.push((current_item_title.clone(), current_item_url.clone(), current_item_domain.clone()));
+                        current_item_title.clear();
+                        current_item_url.clear();
+                        current_item_domain.clear();
+                    }
+                }
+
+                if open_divs == 0 {
+                    break;
+                }
+            }
+
+            result.push_str(&format!("🔍 Searched the web for \"**{}**\" ({} results)\n", query, count));
+            for (title, url, domain) in items {
+                result.push_str(&format!("  * {} ({}) - {}\n", title, domain, url));
+            }
+            result.push_str("\n");
+        } else {
+            result.push_str(line);
+            result.push_str("\n");
+        }
+    }
+
+    result
+}
+
+fn format_markdown_table(lines: &[&str], max_width: usize) -> Vec<String> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut raw_rows = Vec::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.chars().all(|c| c == '|' || c == '-' || c == ':' || c == ' ' || c == '+') {
+            continue;
+        }
+        let mut cells: Vec<String> = trimmed
+            .split('|')
+            .map(|s| s.trim().to_string())
+            .collect();
+        if !cells.is_empty() && cells[0].is_empty() {
+            cells.remove(0);
+        }
+        if !cells.is_empty() && cells[cells.len() - 1].is_empty() {
+            cells.pop();
+        }
+        if !cells.is_empty() {
+            raw_rows.push(cells);
+        }
+    }
+
+    if raw_rows.is_empty() {
+        return Vec::new();
+    }
+
+    let num_cols = raw_rows[0].len();
+    if num_cols == 0 {
+        return Vec::new();
+    }
+
+    for row in &mut raw_rows {
+        while row.len() < num_cols {
+            row.push(String::new());
+        }
+        row.truncate(num_cols);
+    }
+
+    let mut col_max_widths = vec![0; num_cols];
+    for row in &raw_rows {
+        for (i, cell) in row.iter().enumerate() {
+            col_max_widths[i] = col_max_widths[i].max(cell.chars().count());
+        }
+    }
+
+    let border_overhead = num_cols + 1;
+    let available_width = max_width.saturating_sub(border_overhead).max(5 * num_cols);
+
+    let mut col_widths = vec![0; num_cols];
+    let total_max_width: usize = col_max_widths.iter().sum();
+
+    if total_max_width <= available_width {
+        col_widths.copy_from_slice(&col_max_widths);
+    } else {
+        let mut allocated = 0;
+        for i in 0..num_cols {
+            let width = (col_max_widths[i] * available_width) / total_max_width;
+            let width = width.max(5);
+            col_widths[i] = width;
+            allocated += width;
+        }
+        if allocated > available_width {
+            let mut diff = allocated - available_width;
+            for i in (0..num_cols).cycle() {
+                if col_widths[i] > 5 {
+                    col_widths[i] -= 1;
+                    diff -= 1;
+                }
+                if diff == 0 {
+                    break;
+                }
+            }
+        } else if allocated < available_width {
+            let mut diff = available_width - allocated;
+            for i in (0..num_cols).cycle() {
+                col_widths[i] += 1;
+                diff -= 1;
+                if diff == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+
+    let draw_border = |left: char, _mid: char, right: char, cross: char, widths: &[usize]| -> String {
+        let mut s = String::new();
+        s.push(left);
+        for (i, &w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w));
+            if i < widths.len() - 1 {
+                s.push(cross);
+            }
+        }
+        s.push(right);
+        s
+    };
+
+    let format_cell = |text: &str, width: usize| -> String {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.len() <= width {
+            let pad = width - chars.len();
+            format!("{}{}", text, " ".repeat(pad))
+        } else {
+            let truncate_len = width.saturating_sub(3);
+            if truncate_len > 0 {
+                let truncated: String = chars[..truncate_len].iter().collect();
+                format!("{}...", truncated)
+            } else {
+                let truncated: String = chars[..width].iter().collect();
+                truncated
+            }
+        }
+    };
+
+    result.push(draw_border('┌', '─', '┐', '┬', &col_widths));
+
+    let mut header_line = String::new();
+    header_line.push('│');
+    for (i, cell) in raw_rows[0].iter().enumerate() {
+        header_line.push_str(&format_cell(cell, col_widths[i]));
+        header_line.push('│');
+    }
+    result.push(header_line);
+
+    result.push(draw_border('├', '─', '┤', '┼', &col_widths));
+
+    for row in &raw_rows[1..] {
+        let mut row_line = String::new();
+        row_line.push('│');
+        for (i, cell) in row.iter().enumerate() {
+            row_line.push_str(&format_cell(cell, col_widths[i]));
+            row_line.push('│');
+        }
+        result.push(row_line);
+    }
+
+    result.push(draw_border('└', '─', '┘', '┴', &col_widths));
+
+    result
+}
+
 /// Lightweight markdown renderer
-fn render_markdown(text: &str) -> Vec<Line<'static>> {
+fn render_markdown(text: &str, max_width: usize) -> Vec<Line<'static>> {
+    let preprocessed = preprocess_search_widgets_for_tui(text);
     let mut lines = Vec::new();
     let mut in_code_block = false;
+    let mut code_line_count = 0;
 
-    for raw_line in text.lines() {
+    let mut in_table = false;
+    let mut table_lines = Vec::new();
+
+    let flush_table = |table_lines: &mut Vec<&str>, lines: &mut Vec<Line<'static>>, max_width: usize| {
+        if table_lines.is_empty() {
+            return;
+        }
+        let formatted = format_markdown_table(table_lines, max_width);
+        for fline in formatted {
+            lines.push(Line::from(Span::styled(
+                fline,
+                Style::default().fg(Color::Rgb(160, 200, 220)).bg(AI_BG),
+            )));
+        }
+        table_lines.clear();
+    };
+
+    for raw_line in preprocessed.lines() {
+        let trimmed = raw_line.trim();
+
+        let is_table_row = trimmed.starts_with('|');
+        if is_table_row && !in_code_block {
+            if !in_table {
+                in_table = true;
+            }
+            table_lines.push(raw_line);
+            continue;
+        } else if in_table {
+            in_table = false;
+            flush_table(&mut table_lines, &mut lines, max_width);
+        }
+
         if raw_line.starts_with("```") {
             in_code_block = !in_code_block;
+            if in_code_block {
+                code_line_count = 0;
+            }
             lines.push(Line::from(Span::styled(
                 raw_line.to_string(),
                 Style::default().fg(Color::Rgb(180, 180, 100)).bg(Color::Rgb(30, 30, 30)),
@@ -563,10 +842,22 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
         if in_code_block {
-            lines.push(Line::from(Span::styled(
-                raw_line.to_string(),
-                Style::default().fg(Color::Rgb(200, 200, 120)).bg(Color::Rgb(30, 30, 30)),
-            )));
+            code_line_count += 1;
+            let line_num_str = format!("{:>3} │ ", code_line_count);
+            let mut spans = vec![
+                Span::styled(line_num_str, Style::default().fg(Color::Rgb(100, 100, 100)).bg(Color::Rgb(30, 30, 30)))
+            ];
+
+            let line_style = if raw_line.starts_with('+') && !raw_line.starts_with("+++") {
+                Style::default().fg(Color::Rgb(120, 255, 120)).bg(Color::Rgb(30, 30, 30))
+            } else if raw_line.starts_with('-') && !raw_line.starts_with("---") {
+                Style::default().fg(Color::Rgb(255, 120, 120)).bg(Color::Rgb(30, 30, 30))
+            } else {
+                Style::default().fg(Color::Rgb(200, 200, 120)).bg(Color::Rgb(30, 30, 30))
+            };
+
+            spans.push(Span::styled(raw_line.to_string(), line_style));
+            lines.push(Line::from(spans));
             continue;
         }
         if raw_line.starts_with("### ") {
@@ -619,6 +910,9 @@ fn render_markdown(text: &str) -> Vec<Line<'static>> {
             continue;
         }
         lines.push(parse_inline(raw_line));
+    }
+    if in_table {
+        flush_table(&mut table_lines, &mut lines, max_width);
     }
     lines
 }
@@ -1588,6 +1882,7 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(Span::styled("  /new            New conversation", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /conversations  Browse all sessions", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /model          Switch AI model", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  /mode           Switch agent mode (auto/chat/task)", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /tasks          Manage scheduled tasks", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /clear          Clear current chat", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /info           System info", Style::default().fg(Color::White))),

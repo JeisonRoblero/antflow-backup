@@ -78,9 +78,12 @@
   <div class="sidebar-section" id="sidebar-convs" style="flex: 1; display: flex; flex-direction: column; overflow: hidden;">
     <div class="sidebar-section-header">
       <span>Conversations</span>
-      <button class="sidebar-action-btn" onclick="newConversationSidebar()" title="New conversation">
+      <button class="sidebar-action-btn new-conversation-btn" onclick="newConversationSidebar()" title="New conversation">
         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
       </button>
+    </div>
+    <div class="sidebar-search-wrap" style="padding: 4px 8px 8px 8px;">
+      <input type="text" id="sidebar-conv-search" class="conv-search-input" placeholder="Search conversations..." />
     </div>
     <div id="sidebar-conv-list" class="sidebar-list" style="flex: 1; overflow-y: auto;"></div>
   </div>
@@ -172,6 +175,9 @@
       <button class="panel-close" onclick="closeOverlay('conv')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
     <div class="panel-body" style="flex:1;overflow-y:auto">
+      <div class="panel-search-wrap" style="padding-bottom: 8px;">
+        <input type="text" id="conv-search" class="conv-search-input" placeholder="Search conversations..." />
+      </div>
       <button class="new-conv-btn" id="new-conv-btn">
         <svg viewBox="0 0 24 24"><path d="M19 11H13V5h-2v6H5v2h6v6h2v-6h6z"/></svg>
         New conversation
