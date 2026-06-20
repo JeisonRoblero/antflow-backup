@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 use crate::ai::embeddings::LocalEmbedder;
 
 #[derive(RustEmbed)]
-#[folder = "skills/"]
-struct SkillsAsset;
+#[folder = "internal_skills/"]
+struct InternalSkillsAsset;
 
 #[derive(RustEmbed)]
 #[folder = "tools/"]
@@ -18,6 +18,7 @@ pub struct SkillInfo {
     pub description: String,
     pub full_content: String,
     pub embedding: Vec<f32>,
+    pub file_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -29,7 +30,7 @@ pub struct ToolInfo {
 }
 
 pub struct RouterCache {
-    pub skills: Vec<SkillInfo>,
+    pub internal_skills: Vec<SkillInfo>,
     pub tools: Vec<ToolInfo>,
 }
 
@@ -56,7 +57,7 @@ pub fn get_router_cache() -> &'static RouterCache {
             Err(e) => {
                 eprintln!("[ROUTER ERROR] Failed to initialize router cache: {:?}", e);
                 RouterCache {
-                    skills: Vec::new(),
+                    internal_skills: Vec::new(),
                     tools: Vec::new(),
                 }
             }
@@ -69,7 +70,8 @@ fn parse_skill_md(content: &str) -> Option<(String, String, String)> {
         return None;
     }
     let after_dash = &content[3..];
-    let end_dash = after_dash.find("---")?;
+    let end_dash = after_dash.find("\n---")
+        .or_else(|| after_dash.find("\r\n---"))?;
     let yaml = &after_dash[..end_dash];
     
     let mut id = String::new();
@@ -101,21 +103,22 @@ fn parse_skill_md(content: &str) -> Option<(String, String, String)> {
 
 fn init_router_cache() -> anyhow::Result<RouterCache> {
     let embedder = get_embedder().map_err(|e| anyhow::anyhow!("Failed to initialize embedder: {}", e))?;
-    let mut skills = Vec::new();
+    let mut internal_skills = Vec::new();
     let mut tools = Vec::new();
 
-    // Load skills
-    for file in SkillsAsset::iter() {
-        if let Some(file_data) = SkillsAsset::get(&file) {
+    // Load internal skills
+    for file in InternalSkillsAsset::iter() {
+        if let Some(file_data) = InternalSkillsAsset::get(&file) {
             if let Ok(content_str) = std::str::from_utf8(&file_data.data) {
                 if let Some((id, friendly_name, description)) = parse_skill_md(content_str) {
                     if let Ok(emb) = embedder.encode(&description) {
-                        skills.push(SkillInfo {
+                        internal_skills.push(SkillInfo {
                             id,
                             friendly_name,
                             description,
                             full_content: content_str.to_string(),
                             embedding: emb,
+                            file_path: file.to_string(),
                         });
                     }
                 }
@@ -142,7 +145,7 @@ fn init_router_cache() -> anyhow::Result<RouterCache> {
         }
     }
 
-    Ok(RouterCache { skills, tools })
+    Ok(RouterCache { internal_skills, tools })
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -163,9 +166,46 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot_product / (norm_a.sqrt() * norm_b.sqrt())
 }
 
+/// Returns true if the prompt is a conversational / meta / UI-navigation request
+/// that should NOT be enriched with task-specific tokens.
+fn is_meta_or_chat_query(lower: &str) -> bool {
+    let trimmed = lower.trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
+
+    // Exact short greetings / meta phrases
+    let exact = [
+        "hello", "hi", "hey", "hola", "yo", "sup", "bye", "goodbye",
+        "thanks", "thank you", "gracias", "buenos dias", "buenas noches", "buenas tardes",
+    ];
+    if exact.iter().any(|p| trimmed == *p) {
+        return true;
+    }
+
+    // Substring patterns that indicate UI / meta requests, NOT real tasks
+    let meta_phrases = [
+        "show me options", "show options", "give me options", "give me choices",
+        "what can you do", "what are you", "who are you",
+        "que puedes hacer", "qué puedes hacer", "que sabes hacer", "qué sabes hacer",
+        "muestrame opciones", "muéstrame opciones", "dame opciones",
+        "not a task", "no es una tarea", "just chat", "solo responde",
+        "don't search", "dont search", "no busques", "no searches",
+    ];
+    if meta_phrases.iter().any(|p| trimmed.contains(p)) {
+        return true;
+    }
+
+    false
+}
+
 fn enrich_routing_query(prompt: &str) -> String {
-    let mut query = prompt.to_string();
     let lower = prompt.to_lowercase();
+
+    // Early exit: conversational / meta queries must NOT be enriched
+    if is_meta_or_chat_query(&lower) {
+        return prompt.to_string();
+    }
+
+    let mut query = prompt.to_string();
     
     if lower.contains("escribe") || lower.contains("teclea") || lower.contains("digita") || lower.contains("escribir")
         || lower.contains("write") || lower.contains("type") || lower.contains("keyboard") || lower.contains("text") {
@@ -195,8 +235,10 @@ fn enrich_routing_query(prompt: &str) -> String {
         || lower.contains("open") || lower.contains("launch") {
         query.push_str(" open launch start winword excel notepad open_url");
     }
+    // "find" removed — too broad (matches "find out", "find me options", etc.)
+    // Only trigger on explicit search verbs
     if lower.contains("busca") || lower.contains("buscar") || lower.contains("googlea")
-        || lower.contains("search") || lower.contains("find") || lower.contains("google") {
+        || lower.contains("search") || lower.contains("google") || lower.contains("lookup") || lower.contains("look up") {
         query.push_str(" web search find query google web_search");
     }
     if lower.contains("portapapeles") || lower.contains("copia") || lower.contains("pega") || lower.contains("copiar") || lower.contains("pegar")
@@ -211,43 +253,72 @@ fn enrich_routing_query(prompt: &str) -> String {
         || lower.contains("sketch") || lower.contains("doodle") || lower.contains("mspaint") {
         query.push_str(" mouse_click mouse_drag mouse_move screenshot mspaint paint draw");
     }
+    if lower.contains("map") || lower.contains("mapa") || lower.contains("location") || lower.contains("ubicacion")
+        || lower.contains("route") || lower.contains("ruta") || lower.contains("pin") || lower.contains("place") || lower.contains("lugar") {
+        query.push_str(" map location route pin place show display render draw");
+    }
     
     query
 }
 
-pub fn route_prompt(prompt: &str, threshold: f32) -> (Option<(SkillInfo, f32)>, Vec<(ToolInfo, f32)>) {
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        {
+            let log_path = std::env::temp_dir().join("antflow_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
+pub fn route_prompt(prompt: &str, threshold: f32) -> (Vec<(SkillInfo, f32)>, Vec<(ToolInfo, f32)>) {
     let cache = get_router_cache();
     let embedder = match get_embedder() {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("[ROUTER ERROR] Failed to instantiate LocalEmbedder: {:?}", e);
-            return (None, Vec::new());
+            let err_msg = format!("Failed to instantiate LocalEmbedder: {:?}", e);
+            eprintln!("[ROUTER ERROR] {}", err_msg);
+            trace_log!("[ROUTER ERROR] {}", err_msg);
+            return (Vec::new(), Vec::new());
         }
     };
 
     let enriched = enrich_routing_query(prompt);
+    trace_log!("[ROUTER] Enriched query: '{}'", enriched);
+
     let prompt_emb = match embedder.encode(&enriched) {
         Ok(emb) => emb,
         Err(e) => {
-            eprintln!("[ROUTER ERROR] Failed to encode prompt: {:?}", e);
-            return (None, Vec::new());
+            let err_msg = format!("Failed to encode prompt: {:?}", e);
+            eprintln!("[ROUTER ERROR] {}", err_msg);
+            trace_log!("[ROUTER ERROR] {}", err_msg);
+            return (Vec::new(), Vec::new());
         }
     };
 
-    // Score skills
-    let mut matched_skill: Option<(SkillInfo, f32)> = None;
-    for skill in &cache.skills {
+    // Score internal skills
+    let mut matched_skills = Vec::new();
+    for skill in &cache.internal_skills {
         let score = cosine_similarity(&prompt_emb, &skill.embedding);
         if score >= threshold {
-            if matched_skill.is_none() || score > matched_skill.as_ref().unwrap().1 {
-                matched_skill = Some((skill.clone(), score));
-            }
+            matched_skills.push((skill.clone(), score));
         }
     }
+    // Sort skills by score descending
+    matched_skills.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Score tools
     let mut matched_tools = Vec::new();
     for tool in &cache.tools {
+        if tool.id == "task_complete" || tool.id == "screenshot" || tool.id == "run_command" || tool.id == "run_script" {
+            continue; // Exclude execution and utility tools from routing entry points
+        }
         let score = cosine_similarity(&prompt_emb, &tool.embedding);
         if score >= threshold {
             matched_tools.push((tool.clone(), score));
@@ -257,5 +328,9 @@ pub fn route_prompt(prompt: &str, threshold: f32) -> (Option<(SkillInfo, f32)>, 
     // Sort tools by score descending
     matched_tools.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    (matched_skill, matched_tools)
+    // Log only final matched results (not every individual cosine similarity)
+    trace_log!("[ROUTER] Matched internal skills: {:?}", matched_skills.iter().map(|(s, score)| format!("{} ({:.4})", s.id, score)).collect::<Vec<_>>());
+    trace_log!("[ROUTER] Matched tools: {:?}", matched_tools.iter().map(|(t, score)| format!("{} ({:.4})", t.id, score)).collect::<Vec<_>>());
+
+    (matched_skills, matched_tools)
 }

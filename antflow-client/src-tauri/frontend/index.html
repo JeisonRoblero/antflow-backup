@@ -337,6 +337,8 @@
   <div id="bar-shell">
     <!-- Attachments Preview -->
     <div id="attachments-preview" class="hidden"></div>
+    <!-- Clarification Popover -->
+    <div id="clarification-popover" class="hidden"></div>
     <!-- Hover controls (appear on hover) -->
     <div id="hover-controls">
       <div id="hover-controls-left">
@@ -378,13 +380,16 @@
 
       <!-- Input -->
       <div id="input-wrap">
-        <textarea id="input" rows="1" placeholder="Ask anything..." autocomplete="off" spellcheck="false"></textarea>
-        <!-- Model Selector Pill -->
-        <div id="talkbar-model-select" onclick="toggleOverlay('model')" title="Click to switch model">
-          <span id="talkbar-model-name">Loading...</span>
-          <svg class="chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="6 9 12 15 18 9"></polyline>
-          </svg>
+        <div id="input-chips" class="hidden"></div>
+        <div id="input-row" style="display: flex; align-items: center; gap: 12px; width: 100%;">
+          <textarea id="input" rows="1" placeholder="Ask anything..." autocomplete="off" spellcheck="false"></textarea>
+          <!-- Model Selector Pill -->
+          <div id="talkbar-model-select" onclick="toggleOverlay('model')" title="Click to switch model">
+            <span id="talkbar-model-name">Loading...</span>
+            <svg class="chevron-down" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="6 9 12 15 18 9"></polyline>
+            </svg>
+          </div>
         </div>
       </div>
 
@@ -397,6 +402,15 @@
           <path d="M12 2v20M17 5v14M7 5v14M22 9v6M2 9v6"/>
         </svg>
       </button>
+    </div>
+
+    <!-- Keyboard Navigation Hint -->
+    <div id="clarification-key-hint" class="hidden">
+      <span>&uarr;&darr; to navigate</span>
+      <span>&middot;</span>
+      <span>Enter to select</span>
+      <span>&middot;</span>
+      <span>or type below</span>
     </div>
   </div>
 </div>

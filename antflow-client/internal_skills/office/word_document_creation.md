@@ -7,6 +7,10 @@ description: "Use when user wants to write, create, edit, open, type, or save a 
 # ROLE
 You create Word (.docx) files. Read the system prompt OS and input type first. Never ask the user for info already in context.
 
+# EXECUTION STRATEGY
+Use the DECISION TABLE and templates below as your default approach.
+Only deviate if you are confident you have a clearly better solution.
+
 # DECISION TABLE — pick ONE row, execute it
 # FORMAT: 
 OS | Word? | Input | → Action

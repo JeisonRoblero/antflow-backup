@@ -1,14 +1,14 @@
 {
   "name": "mouse_click",
-  "description": "Moves to (x, y) and performs a mouse click (left, right, or middle button).",
+  "description": "Moves to (x, y) or coordinates resolved from element_id and performs a mouse click (left, right, or middle button).",
   "parameters": {
     "type": "object",
     "properties": {
       "x": { "type": "integer" },
       "y": { "type": "integer" },
+      "element_id": { "type": "string" },
       "button": { "type": "string", "enum": ["left", "right", "middle"] },
       "delay_ms": { "type": "integer" }
-    },
-    "required": ["x", "y"]
+    }
   }
 }

@@ -5,7 +5,7 @@ use crate::json_utils::{strip_fences, extract_json, extract_best_json, clean_if_
 use crate::redact::RedactPatterns;
 use crate::search;
 use crate::ui::console;
-use crate::screenshot::{capture_redacted, to_base64};
+use crate::screenshot::{capture_redacted, to_base64, Element, capture_redacted_with_elements};
 
 use anyhow::{Context, Result};
 
@@ -17,6 +17,21 @@ use std::sync::Arc;
 pub type StopFlag = Arc<std::sync::atomic::AtomicBool>;
 
 macro_rules! dbg_log {
+    ($($arg:tt)*) => {
+        {
+            let log_path = std::env::temp_dir().join("antflow_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
+macro_rules! trace_log {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
         {
@@ -79,36 +94,94 @@ fn extract_chat_search_query(response: &str) -> Option<String> {
     None
 }
 
+/// Extract clarification question and options from a chat-mode response containing
+/// a JSON block like `{"ask_clarification": {"question": "...", "options": [...]}}`.
+fn extract_chat_clarification(reply: &str) -> Option<(String, Vec<String>)> {
+    if let Some(clean_json) = crate::json_utils::extract_best_json(reply) {
+        if let Ok(val) = serde_json::from_str::<Value>(&clean_json) {
+            if let Some(clarif) = val.get("ask_clarification") {
+                let question = clarif.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let options: Vec<String> = clarif.get("options")
+                    .and_then(|v| v.as_array())
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                if !question.is_empty() && !options.is_empty() {
+                    return Some((question, options));
+                }
+            }
+        }
+    }
+    None
+}
+
 fn detect_search_intent(prompt: &str) -> bool {
     let prompt_lower = prompt.to_lowercase();
-    
-    // Check if the prompt contains words indicative of searching/researching/real-time info
-    let search_keywords = [
-        "search", "find", "google", "lookup", "look up", "research", "investigate",
-        "weather", "news", "current", "latest", "recent", "today", "yesterday",
-        "busca", "buscar", "encuentra", "encontrar", "investiga", "investigar",
-        "averigua", "averiguar", "noticias", "clima", "tiempo", "reciente", "actual",
-        "partido", "mundial", "resultado", "marcador", "goleador", "campeon", "quien gano",
-        "who won", "winner", "score", "versus", "vs", "pelicula", "movie", "show",
-        "dolar", "euro", "precio", "price", "stock", "quien es", "quién es",
-        "quien fue", "quién fue", "que es", "qué es", "que paso", "qué pasó",
-        "tell me about", "dime sobre", "hablame de", "háblame de", "saber sobre"
-    ];
-    
-    // Clean prompt to check for exact greetings
-    let cleaned = prompt_lower.trim()
+    let trimmed = prompt_lower.trim()
         .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
-        
-    let exact_greetings = [
-        "hello", "hi", "hey", "hola", "buenos dias", "buenas noches", "buenas tardes",
-        "how are you", "como estas", "cómo estás", "thank you", "thanks", "gracias"
+
+    // ── Anti-search: phrases that explicitly reject search or are meta/UI requests ──
+    let anti_search = [
+        "show me options", "show options", "give me options", "give me choices",
+        "what can you do", "what are you", "who are you",
+        "don't search", "dont search", "no busques", "no searches",
+        "not a task", "just chat", "just answer", "just tell me",
+        "solo responde", "solo dime", "no es una tarea",
+        "que puedes hacer", "qué puedes hacer", "dame opciones",
+        "muestrame opciones", "muéstrame opciones",
     ];
-    
-    if exact_greetings.iter().any(|g| cleaned == *g) {
+    if anti_search.iter().any(|p| trimmed.contains(p)) {
         return false;
     }
-    
-    search_keywords.iter().any(|kw| prompt_lower.contains(kw))
+
+    // ── Exact greetings — never search ──
+    let exact_greetings = [
+        "hello", "hi", "hey", "hola", "buenos dias", "buenas noches", "buenas tardes",
+        "how are you", "como estas", "cómo estás", "thank you", "thanks", "gracias",
+    ];
+    if exact_greetings.iter().any(|g| trimmed == *g) {
+        return false;
+    }
+
+    // ── Strong search intent: multi-word phrases (high confidence) ──
+    let strong_phrases = [
+        "search for", "search about", "look up", "look for",
+        "tell me about", "dime sobre", "hablame de", "háblame de", "saber sobre",
+        "who won", "who is", "what is the", "what was the",
+        "quien gano", "quién ganó", "quien es", "quién es",
+        "quien fue", "quién fue", "que es", "qué es", "que paso", "qué pasó",
+        "busca sobre", "buscar sobre", "investiga sobre",
+    ];
+    if strong_phrases.iter().any(|p| prompt_lower.contains(p)) {
+        return true;
+    }
+
+    // ── Single-word search verbs (must be whole words to avoid false positives) ──
+    let search_verbs = [
+        "search", "google", "lookup", "research", "investigate",
+        "busca", "buscar", "googlea", "investiga", "investigar",
+        "averigua", "averiguar",
+    ];
+    let words: Vec<&str> = prompt_lower.split(|c: char| !c.is_alphanumeric() && c != '_' && c != 'á' && c != 'é' && c != 'í' && c != 'ó' && c != 'ú' && c != 'ñ')
+        .filter(|w| !w.is_empty())
+        .collect();
+    if search_verbs.iter().any(|kw| words.iter().any(|w| *w == *kw)) {
+        return true;
+    }
+
+    // ── Topic keywords that imply real-time information need ──
+    let topic_keywords = [
+        "weather", "news", "latest", "recent", "noticias", "clima",
+        "partido", "mundial", "resultado", "marcador", "goleador", "campeon",
+        "score", "versus", "vs",
+        "dolar", "euro", "precio", "price", "stock",
+    ];
+    if topic_keywords.iter().any(|kw| words.iter().any(|w| *w == *kw)) {
+        return true;
+    }
+
+    false
 }
 
 async fn extract_search_query(prompt: &str, provider: &dyn AiProvider) -> String {
@@ -196,6 +269,33 @@ fn screenshot_hash(b64: &str) -> u64 {
     let mut h = DefaultHasher::new();
     b64.hash(&mut h);
     h.finish()
+}
+
+fn format_tool_attempt(_tool: &str, params: &Value) -> String {
+    if let Some(obj) = params.as_object() {
+        if let Some(q) = obj.get("query").and_then(|v| v.as_str()) {
+            return format!("\"{}\"", q);
+        }
+        if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
+            return format!("\"{}\"", cmd);
+        }
+        if let Some(script) = obj.get("script").and_then(|v| v.as_str()) {
+            let first_line = script.lines().next().unwrap_or("").trim();
+            let truncated = if first_line.len() > 60 {
+                format!("{}...", &first_line[..60])
+            } else {
+                first_line.to_string()
+            };
+            return format!("\"{}\"", truncated);
+        }
+        if let Some(url) = obj.get("url").and_then(|v| v.as_str()) {
+            return format!("\"{}\"", url);
+        }
+        if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+            return format!("\"{}\"", text);
+        }
+    }
+    params.to_string()
 }
 
 fn is_app_launch(tool_name: &str, params: &Value) -> bool {
@@ -436,6 +536,47 @@ fn summarise_cycle(cycle_msgs: &[ChatMessage]) -> String {
         .filter(|m| m.role == "user" && m.content.as_str().map(|s| s.starts_with("Command output:")).unwrap_or(false))
         .count();
     format!("[cycle] {} tool outputs kept in context", step_count)
+}
+
+fn slice_skill_instructions(content: &str, file_path: &str) -> String {
+    let mut slice_idx = None;
+    let boundaries = [
+        "\n# SCRIPTS",
+        "\n## A",
+        "\n## 1",
+        "\n## A —",
+        "\n# A —",
+        "\r\n# SCRIPTS",
+        "\r\n## A",
+        "\r\n## 1",
+        "\r\n## A —",
+        "\r\n# A —",
+    ];
+    
+    for boundary in &boundaries {
+        if let Some(idx) = content.find(boundary) {
+            match slice_idx {
+                None => slice_idx = Some(idx),
+                Some(current_min) => {
+                    if idx < current_min {
+                        slice_idx = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(idx) = slice_idx {
+        let sliced = &content[..idx];
+        let mut sliced_str = sliced.trim().to_string();
+        sliced_str.push_str("\n\n> [!IMPORTANT]\n");
+        sliced_str.push_str("> Detailed code templates and scripts for this skill are omitted to save tokens.\n");
+        sliced_str.push_str(&format!("> The complete skill file is located at: `{}`\n", file_path));
+        sliced_str.push_str("> You MUST use the `read_file` tool to inspect specific lines or scripts in this file when needed.\n");
+        sliced_str
+    } else {
+        content.to_string()
+    }
 }
 
 const KEEP_RECENT: usize = 6;
@@ -794,9 +935,435 @@ pub async fn run_task(
     let mut clarification_rx = clarification_rx;
     let conn = db::open(storage_dir)?;
     let mut messages = history;
+    let user_msg = if prompt.trim_start().starts_with('[') {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(prompt) {
+            ChatMessage {
+                role: "user".to_string(),
+                content: val,
+            }
+        } else {
+            ChatMessage::text("user", prompt)
+        }
+    } else {
+        ChatMessage::text("user", prompt)
+    };
+    messages.push(user_msg.clone());
+
     let mut search_widgets: Vec<String> = Vec::new();
     let mut performed_searches: Vec<(String, Vec<crate::search::SearchResult>)> = Vec::new();
     let mut all_search_images: Vec<crate::search::SearchImage> = Vec::new();
+    let mut screen_elements: Vec<Element> = Vec::new();
+
+    // ── Pre-emptive CHAT vs TASK check ─────────────────────────────────────
+    let mut is_chat_mode = false;
+    let mut is_obvious_chat = false;
+    {
+        let prompt_lower = prompt.to_lowercase();
+        
+        let anti_task_phrases: &[&str] = &[
+            "no action", "just chat", "just answer", "just tell me", "just respond",
+            "solo responde", "solo dime", "solo contesta", "ninguna accion", "sin accion",
+            "no ejecutes", "no hagas nada", "solo por aqui", "en el chat", "por el chat",
+            "don't do anything", "no need to do", "no action required", "no action needed",
+            "just here", "chat only", "conversational", "no task",
+            "damelo aqui", "responde aqui", "dime aqui",
+        ];
+        let is_anti_task = anti_task_phrases.iter().any(|p| prompt_lower.contains(p));
+
+        let task_keywords: &[&str] = &[
+            "screenshot", "captura de pantalla", "pantallazo", "take a screenshot", "take screenshot",
+            "click", "clic", "double click", "doble clic", "right click", "clic derecho",
+            "drag", "arrastra", "drag and drop",
+            "mouse", "raton", "cursor",
+            "scroll up", "scroll down", "desplazar arriba", "desplazar abajo",
+            "maximize window", "minimize window", "maximizar ventana", "minimizar ventana",
+        ];
+
+        let is_obvious_task = if cfg.mode == "chat" {
+            false
+        } else if cfg.mode == "task" {
+            true
+        } else if is_anti_task {
+            false
+        } else {
+            task_keywords.iter().any(|kw| {
+                let kw_lower = kw.to_lowercase();
+                if kw_lower.contains(' ') {
+                    prompt_lower.contains(&kw_lower)
+                } else {
+                    prompt_lower.split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|word| word == kw_lower)
+                }
+            })
+        };
+
+        let exact_chat_patterns: &[&str] = &[
+            // English
+            "hello", "hi there", "good morning", "good evening", "good night",
+            "how are you", "what's up", "whats up", "thank you", "thanks", "thx",
+            "hi", "hey", "yo", "sup", "wassup", "bye", "goodbye",
+            // Spanish
+            "hola", "buenos dias", "buenas noches", "buenas tardes", "adios", "gracias",
+            // French
+            "bonjour", "salut", "bonsoir", "merci", "au revoir",
+            // German
+            "hallo", "guten morgen", "guten tag", "guten abend", "danke", "tschüss",
+            // Italian
+            "ciao", "buongiorno", "grazie", "arrivederci",
+            // Portuguese
+            "olá", "oi", "bom dia", "boa tarde", "boa noite", "obrigado", "obrigada", "tchau",
+            // Chinese
+            "你好", "早上好", "下午好", "晚上好", "谢谢", "再见",
+        ];
+        let starts_with_chat_patterns: &[&str] = &[
+            "what is your name", "who are you", "what can you do",
+        ];
+
+        is_obvious_chat = if cfg.mode == "chat" {
+            true
+        } else if cfg.mode == "task" {
+            false
+        } else {
+            if is_obvious_task {
+                false
+            } else {
+                let trimmed = prompt_lower.trim()
+                    .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
+                exact_chat_patterns.iter().any(|p| trimmed == *p) ||
+                starts_with_chat_patterns.iter().any(|p| trimmed.starts_with(p)) ||
+                trimmed.contains("show me options") ||
+                trimmed.contains("show me some options") ||
+                trimmed.contains("give me choices") ||
+                trimmed.contains("give me some choices") ||
+                trimmed.contains("what can you do")
+            }
+        };
+
+        if is_obvious_chat {
+            is_chat_mode = true;
+            dbg_log!("[gate] Pre-emptive keyword match → CHAT: '{}'", prompt);
+        } else if !is_obvious_task {
+            dbg_log!("[gate] Pre-emptive Running AI gate classifier for: '{}'", prompt);
+            let mut history_str = String::new();
+            if messages.len() > 1 {
+                let start_idx = if messages.len() > 4 { messages.len() - 4 } else { 0 };
+                for msg in &messages[start_idx..messages.len() - 1] {
+                    if msg.role == "system" {
+                        continue;
+                    }
+                    if let Some(content_str) = msg.content.as_str() {
+                        let truncated = if content_str.len() > 300 {
+                            format!("{}...", &content_str[..300])
+                        } else {
+                            content_str.to_string()
+                        };
+                        history_str.push_str(&format!("{}: {}\n", msg.role.to_uppercase(), truncated));
+                    }
+                }
+            }
+
+            let gate_prompt = if history_str.is_empty() {
+                format!(
+                    "Classify this user message as either TASK or CHAT.\n\
+                     TASK = Specifically requires visual desktop GUI automation (clicks, drags, taking screenshots to see window states, controlling graphical user interface windows on the screen).\n\
+                     CHAT = Anything else. This includes general conversation, greetings, writing/running background terminal commands, executing scripts, compiling code, searching the web, or retrieving information, as long as it does NOT need screen captures or visual mouse/keyboard automation of desktop GUI applications.\n\
+                     User message: \"{}\"\n\
+                     Reply with ONLY one word: TASK or CHAT",
+                    prompt
+                )
+            } else {
+                format!(
+                    "Classify this user message as either TASK or CHAT.\n\
+                     TASK = Specifically requires visual desktop GUI automation (clicks, drags, taking screenshots to see window states, controlling graphical user interface windows on the screen).\n\
+                     CHAT = Anything else. This includes general conversation, greetings, writing/running background terminal commands, executing scripts, compiling code, searching the web, or retrieving information, as long as it does NOT need screen captures or visual mouse/keyboard automation of desktop GUI applications.\n\n\
+                     Recent conversation history:\n\
+                     {}\n\
+                     User message: \"{}\"\n\
+                     Reply with ONLY one word: TASK or CHAT",
+                     history_str, prompt
+                )
+            };
+
+            let ai_says_task = match provider.chat(
+                vec![
+                    ChatMessage::text("system", "You are a classifier. You must reply with either TASK or CHAT based on the user's message."),
+                    ChatMessage::text("user", &gate_prompt)
+                ],
+                Some(50),
+            ).await {
+                Ok(resp) => {
+                    let content = resp.content.trim();
+                    if content.is_empty() {
+                        true
+                    } else {
+                        content.to_uppercase().contains("TASK")
+                    }
+                }
+                Err(_) => true,
+            };
+
+            if !ai_says_task {
+                is_chat_mode = true;
+                dbg_log!("[gate] Pre-emptive AI gate → CHAT: '{}'", prompt);
+            } else {
+                dbg_log!("[gate] Pre-emptive AI gate → TASK: '{}'", prompt);
+            }
+        }
+    }
+
+    if is_chat_mode {
+        dbg_log!("[chat_mode] Pre-emptive chat mode triggered");
+        let mut chat_history = messages.clone();
+        let mut search_context = String::new();
+
+        // Only attempt pre-flight search if detect_search_intent says so.
+        // This prevents meta/options requests from triggering a web search.
+        let has_search_intent = detect_search_intent(prompt);
+        if has_search_intent {
+            let query = extract_search_query(prompt, provider).await;
+            dbg_log!("[chat_mode] Pre-flight search detected search intent. Query: '{}'", query);
+            let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
+
+            let mut is_net_err = false;
+            let (result, results_list, images_list) = match search::search_detailed(&query).await {
+                Ok((text, list, imgs)) => (text, list, imgs),
+                Err(e) => {
+                    let msg = handle_search_error(&e);
+                    if msg.contains("No internet connection") {
+                        is_net_err = true;
+                    }
+                    (msg, vec![], vec![])
+                }
+            };
+
+            if !is_net_err {
+                let html = format_search_widget(&query, &results_list, &images_list);
+                if let Some(ref tx) = token_tx {
+                    let _ = tx.send(html.clone()).await;
+                }
+                performed_searches.push((query.clone(), results_list.clone()));
+                for img in &images_list {
+                    if !all_search_images.iter().any(|existing| existing.url == img.url) {
+                        all_search_images.push(img.clone());
+                    }
+                }
+            }
+
+            let mut search_info = format!("Search results for '{}':\n{}\n\nFound web pages:\n", query, result);
+            for res in &results_list {
+                search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
+            }
+            if !images_list.is_empty() {
+                search_info.push_str("\nFound images:\n");
+                for img in &images_list {
+                    search_info.push_str(&format!("- Image URL: {}\n", img.url));
+                }
+            }
+            search_info.push_str("\n(Use the above search results to reply to the user. Always include relevant links and images using markdown.)");
+            search_context = search_info;
+        } else {
+            dbg_log!("[chat_mode] No search intent detected, skipping pre-flight search");
+        }
+
+        let chat_system = if search_context.is_empty() {
+            format!(
+                "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
+                 You have access to web_search and ask_clarification.\n\
+                 - Web Search: To look up current information, include a JSON block like:\n\
+                   ```json\n{{\"web_search\": \"your search query\"}}\n```\n\
+                 - Ask Clarification (Options Menu): To present a list of choices/options for the user to select from (e.g., when they ask for options, or when you need clarification/more details), include a JSON block like:\n\
+                   ```json\n{{\"ask_clarification\": {{\"question\": \"What would you like to do?\", \"options\": [\"Option 1\", \"Option 2\"]}}}}\n```\n\
+                   in your response. The system will display these options as a premium, selectable popover menu directly above the user's input.\n\
+                 When showing options to the user, always use the ask_clarification tool. Never list options as plain text.\n\
+                 Current date/time: {}\n\
+                 Be concise, accurate, and helpful. Never output raw JSON as your entire response.\n\
+                 When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
+                 - **Option A**: Description here.\n\
+                 Or:\n\
+                 - **Option A**\n\
+                   Description indented here.\n\
+                 Do NOT leave empty lines between a bullet point and its indented description.",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
+            )
+        } else {
+            format!(
+                "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
+                 You have access to ask_clarification to present options menus if needed.\n\
+                 - Ask Clarification (Options Menu): To present a list of choices/options for the user to select from (e.g., when they ask for options, or when you need clarification/more details), include a JSON block like:\n\
+                   ```json\n{{\"ask_clarification\": {{\"question\": \"What would you like to do?\", \"options\": [\"Option 1\", \"Option 2\"]}}}}\n```\n\
+                   in your response. The system will display these options as a premium, selectable popover menu directly above the user's input.\n\
+                 When showing options to the user, always use the ask_clarification tool. Never list options as plain text.\n\
+                 Current date/time: {}\n\
+                 Use the following search results to answer the user's query. You must include the relevant search links and markdown images from the context in your response:\n\
+                 {}\n\n\
+                 Be detailed, accurate, and helpful.\n\
+                 When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
+                 - **Option A**: Description here.\n\
+                 Or:\n\
+                 - **Option A**\n\
+                   Description indented here.\n\
+                 Do NOT leave empty lines between a bullet point and its indented description.",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
+                search_context
+            )
+        };
+
+        let mut lang_instruction = String::new();
+        for msg in &chat_history {
+            if msg.role == "system" {
+                if let Some(text) = msg.content.as_str() {
+                    if !text.starts_with("You are antflow") && !text.contains("You are a precise, cross-platform spatial automation agent") {
+                        lang_instruction = text.to_string();
+                    }
+                }
+            }
+        }
+
+        chat_history.retain(|msg| msg.role != "system");
+        let mut final_chat_system = chat_system.clone();
+        if !lang_instruction.is_empty() {
+            final_chat_system = format!("{}\n\nImportant Instruction: {}", final_chat_system, lang_instruction);
+        }
+        chat_history.insert(0, ChatMessage::text("system", &final_chat_system));
+
+        if let Some(last_msg) = chat_history.last_mut() {
+            let chat_prompt = if search_context.is_empty() {
+                format!(
+                    "{}\n\n(System note: Respond conversationally. Reply in the user's language. Be brief and helpful. No other tools or JSON, except for the allowed web_search or ask_clarification JSON blocks if required.)",
+                    prompt
+                )
+            } else {
+                format!(
+                    "User query: {}\n\nSearch context:\n{}\n\n(System note: Respond conversationally based on the search context. Reply in the user's language. Be detailed yet concise. No other tools or JSON, except for the allowed ask_clarification JSON block if required. You must include the relevant search links and markdown images from the context in your response.)",
+                    prompt, search_context
+                )
+            };
+            last_msg.content = serde_json::Value::String(chat_prompt);
+        }
+
+        let chat_res = if let Some(tx) = token_tx.clone() {
+            provider.chat_stream(chat_history.clone(), Some(1000), tx).await
+        } else {
+            provider.chat(chat_history.clone(), Some(1000)).await
+        };
+
+        if let Ok(resp) = chat_res {
+            let raw_reply = resp.content.trim().to_string();
+
+            let clarification_pattern = "\"ask_clarification\"";
+            if raw_reply.contains(clarification_pattern) {
+                if let Some((question, options)) = extract_chat_clarification(&raw_reply) {
+                    dbg_log!("[chat_mode] Model requested clarification: '{}', options: {:?}", question, options);
+                    let _ = clarification_tx.send((question.clone(), options)).await;
+                    
+                    let answer = loop {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok("Task stopped by user.".to_string());
+                        }
+                        if let Ok(ans) = clarification_rx.try_recv() {
+                            break ans;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    };
+                    
+                    dbg_log!("[chat_mode] Received user answer to clarification: '{}'", answer);
+                    
+                    chat_history.push(ChatMessage::text("assistant", &raw_reply));
+                    chat_history.push(ChatMessage::text("user", &answer));
+                    
+                    let final_res = if let Some(tx) = token_tx.clone() {
+                        provider.chat_stream(chat_history.clone(), Some(1000), tx).await
+                    } else {
+                        provider.chat(chat_history.clone(), Some(1000)).await
+                    };
+                    
+                    if let Ok(final_resp) = final_res {
+                        let final_reply = clean_if_json(&final_resp.content);
+                        return Ok(prepend_search_context(&final_reply, &performed_searches, &all_search_images));
+                    }
+                }
+            }
+
+            let search_pattern = "\"web_search\"";
+            if raw_reply.contains(search_pattern) && search_context.is_empty() {
+                if let Some(query) = extract_chat_search_query(&raw_reply) {
+                    dbg_log!("[chat_mode] Model requested web search: '{}'", query);
+                    let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
+
+                    let mut is_net_err = false;
+                    let (result, results_list, images_list) = match search::search_detailed(&query).await {
+                        Ok((text, list, imgs)) => (text, list, imgs),
+                        Err(e) => {
+                            let msg = handle_search_error(&e);
+                            if msg.contains("No internet connection") {
+                                is_net_err = true;
+                            }
+                            (msg, vec![], vec![])
+                        }
+                    };
+
+                    if !is_net_err {
+                        let html = format_search_widget(&query, &results_list, &images_list);
+                        if let Some(ref tx) = token_tx {
+                            let _ = tx.send(html.clone()).await;
+                        }
+                        performed_searches.push((query.clone(), results_list.clone()));
+                        for img in &images_list {
+                            if !all_search_images.iter().any(|existing| existing.url == img.url) {
+                                all_search_images.push(img.clone());
+                            }
+                        }
+                    }
+
+                    let mut search_info = format!("Search results for '{}':\n{}\n\nFound web pages:\n", query, result);
+                    for res in &results_list {
+                        search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
+                    }
+                    if !images_list.is_empty() {
+                        search_info.push_str("\nFound images:\n");
+                        for img in &images_list {
+                            search_info.push_str(&format!("- Image URL: {}\n", img.url));
+                        }
+                    }
+                    search_info.push_str("\n(Now provide a natural conversational answer based on these search results. Include relevant links and images using markdown.)");
+
+                    chat_history.push(ChatMessage::text("assistant", &raw_reply));
+                    chat_history.push(ChatMessage::text("user", &search_info));
+
+                    let final_res = if let Some(tx) = token_tx.clone() {
+                        provider.chat_stream(chat_history, Some(1000), tx).await
+                    } else {
+                        provider.chat(chat_history, Some(1000)).await
+                    };
+
+                    if let Ok(final_resp) = final_res {
+                        let final_reply = clean_if_json(&final_resp.content);
+                        return Ok(prepend_search_context(&final_reply, &performed_searches, &all_search_images));
+                    }
+                }
+            }
+
+            if !raw_reply.is_empty() && !raw_reply.eq_ignore_ascii_case("TASK") {
+                let reply = clean_if_json(&raw_reply);
+                return Ok(prepend_search_context(&reply, &performed_searches, &all_search_images));
+            }
+        }
+
+        // If the gate already classified this as obvious chat (keyword match),
+        // do NOT fall back to TASK mode — return a graceful fallback instead.
+        // This prevents wasting 4+ API calls on acknowledgment/translation/CGAE
+        // for a request that was never a task.
+        if is_obvious_chat {
+            dbg_log!("[chat_mode] Chat response failed but gate was obvious CHAT — returning fallback instead of TASK");
+            return Ok("I'm here to help! Could you tell me more about what you'd like me to do? I can automate desktop tasks, search the web, run commands, draw images, and much more.".to_string());
+        }
+
+        dbg_log!("[chat_mode] Pre-emptive chat response failed or matched TASK, falling back to TASK execution mode");
+    }
+
+    let mut messages = messages;
+    let mut performed_searches = performed_searches;
+    let mut all_search_images = all_search_images;
 
     let vision_capable = if cfg.ai.provider == "ollama" {
         crate::ai::ollama::is_vision_model(&cfg.ai.model)
@@ -812,20 +1379,26 @@ pub async fn run_task(
     let mut ack = String::new();
 
     let _ = msg_tx.send("Analyzing request...".to_string()).await;
+    dbg_log!("[run_task] Received user query: '{}'", prompt);
 
-    // Fast dynamic conversational acknowledgment & progress steps query!
+    let mut english_prompt = prompt.to_string();
+
+    // Fast dynamic conversational acknowledgment, progress steps, and translation query combined!
     let ack_prompt = format!(
         "You are a computer automation assistant. The user wants you to do: \"{}\".\n\
          Generate a friendly, concise, conversational acknowledgment in the user's language (e.g. Spanish if the user query is in Spanish) stating that you will perform the task.\n\
          Also, list 3 to 4 high-level, user-friendly progress steps for this task (e.g. 'Opening Microsoft Word', 'Typing text', 'Saving document'). Do not include technical agent architecture words like 'routing', 'translation', 'LLM', or 'cycles'.\n\
+         Finally, translate the user's query into English.\n\
          Reply with ONLY a JSON object in this format:\n\
-         {{\n  \"acknowledgment\": \"<concise acknowledgment>\",\n  \"steps\": [\"Step 1\", \"Step 2\", \"Step 3\"]\n}}",
+         {{\n  \"acknowledgment\": \"<concise acknowledgment>\",\n  \"steps\": [\"Step 1\", \"Step 2\", \"Step 3\"],\n  \"english_translation\": \"<English translation of user's query>\"\n}}",
         prompt
     );
 
-    if let Ok(resp) = provider.chat(vec![ChatMessage::text("user", &ack_prompt)], Some(250)).await {
+    if let Ok(resp) = provider.chat(vec![ChatMessage::text("user", &ack_prompt)], Some(350)).await {
+        dbg_log!("[run_task] Combined AI response content: {}", resp.content);
         if let Some(clean_json) = crate::json_utils::extract_best_json(&resp.content) {
             if let Ok(val) = serde_json::from_str::<Value>(&clean_json) {
+                dbg_log!("[run_task] Parsed combined response JSON: {}", clean_json);
                 if let Some(a) = val["acknowledgment"].as_str() {
                     ack = a.to_string();
                 }
@@ -835,6 +1408,13 @@ pub async fn run_task(
                         .collect();
                     if !parsed.is_empty() {
                         user_steps = parsed;
+                    }
+                }
+                if let Some(t) = val["english_translation"].as_str() {
+                    let clean = t.trim().trim_matches('"').trim().to_string();
+                    if !clean.is_empty() {
+                        english_prompt = clean.clone();
+                        dbg_log!("[run_task] English Translation of query: '{}'", english_prompt);
                     }
                 }
             }
@@ -860,38 +1440,31 @@ pub async fn run_task(
         let _ = msg_tx.send(format!("{}...", user_steps[0])).await;
     }
 
-    let mut english_prompt = prompt.to_string();
-    if !prompt.is_empty() {
-        let translate_prompt = format!(
-            "Translate the following user query to English. Return ONLY the English translation, no other text or explanation:\n\"{}\"",
-            prompt
-        );
-        let msg = ChatMessage::text("user", &translate_prompt);
-        if let Ok(resp) = provider.chat(vec![msg], Some(100)).await {
-            let clean = resp.content.trim().trim_matches('"').trim().to_string();
-            if !clean.is_empty() {
-                english_prompt = clean;
-            }
-        }
-    }
-
     let prompt_lower = english_prompt.to_lowercase();
     let is_drawing = prompt_lower.contains("draw") || prompt_lower.contains("paint")
         || prompt_lower.contains("sketch") || prompt_lower.contains("doodle")
         || prompt_lower.contains("heart");
 
     // --- SEMANTIC ROUTER ---
-    let threshold = 0.45;
-    let (matched_skill, mut matched_tools) = crate::ai::router::route_prompt(&english_prompt, threshold);
+    let threshold = 0.35;
+    let (mut matched_skills, mut matched_tools) = crate::ai::router::route_prompt(&english_prompt, threshold);
+    if matched_skills.len() > 1 {
+        matched_skills.truncate(1);
+    }
 
-    if let Some((ref skill, _)) = matched_skill {
-        let cache = crate::ai::router::get_router_cache();
-        let needed_tools = match skill.id.as_str() {
+    let cache = crate::ai::router::get_router_cache();
+    let mut needed_tool_ids = std::collections::HashSet::new();
+
+    for (skill, _) in &matched_skills {
+        let mut needed = match skill.id.as_str() {
             "creative_image_editing" | "ui_spatial_drag_and_drop" => {
                 vec!["mouse_click", "mouse_drag", "mouse_move", "key_press", "type_text", "screenshot", "task_complete"]
             }
-            "misc_web_search" => {
+            "misc_web_search" | "misc_youtube" => {
                 vec!["open_url", "web_search", "screenshot", "mouse_click", "type_text", "task_complete"]
+            }
+            "misc_map_render" => {
+                vec!["web_search", "screenshot", "task_complete"]
             }
             "office_word_document_creation" | "business_financial_reporting" => {
                 vec!["run_script", "run_command", "type_text", "key_press", "screenshot", "task_complete"]
@@ -900,17 +1473,21 @@ pub async fn run_task(
                 vec!["run_script", "run_command", "screenshot", "task_complete"]
             }
         };
-        for tool_id in needed_tools {
-            if !matched_tools.iter().any(|(t, _)| t.id == tool_id) {
-                if let Some(tool) = cache.tools.iter().find(|t| t.id == tool_id) {
-                    matched_tools.push((tool.clone(), 0.1));
-                }
+        needed.push("read_file");
+        for t_id in needed {
+            needed_tool_ids.insert(t_id);
+        }
+    }
+
+    for tool_id in needed_tool_ids {
+        if !matched_tools.iter().any(|(t, _)| t.id == tool_id) {
+            if let Some(tool) = cache.tools.iter().find(|t| t.id == tool_id) {
+                matched_tools.push((tool.clone(), 0.1));
             }
         }
     }
 
     if matched_tools.is_empty() {
-        let cache = crate::ai::router::get_router_cache();
         let prompt_lower = prompt.to_lowercase();
         let is_gui_task = prompt_lower.contains("click") || prompt_lower.contains("clic")
             || prompt_lower.contains("drag") || prompt_lower.contains("arrastra")
@@ -931,12 +1508,16 @@ pub async fn run_task(
                     || tool.id == "mouse_move"
                     || tool.id == "key_press"
                     || tool.id == "type_text"
+                    || tool.id == "read_file"
+                    || tool.id == "str_replace"
             } else {
                 tool.id == "run_script"
                     || tool.id == "run_command"
                     || tool.id == "screenshot"
                     || tool.id == "task_complete"
                     || tool.id == "ask_clarification"
+                    || tool.id == "read_file"
+                    || tool.id == "str_replace"
             };
             if is_fallback {
                 matched_tools.push((tool.clone(), 0.0));
@@ -944,7 +1525,7 @@ pub async fn run_task(
         }
     }
 
-    if let Some((ref skill, score)) = matched_skill {
+    for (skill, score) in &matched_skills {
         dbg_log!("[ROUTER] Matched skill/tool '{}' with score {}", skill.id, score);
     }
     for (tool, score) in &matched_tools {
@@ -990,18 +1571,36 @@ pub async fn run_task(
             }
         }
 
-        // Prepend skill instructions if matched
-        if let Some((ref skill, _)) = matched_skill {
-            let skill_instructions = if skill.full_content.starts_with("---") {
-                if let Some(end_idx) = skill.full_content[3..].find("---") {
-                    skill.full_content[3 + end_idx + 3..].trim().to_string()
+        // Prepend skill instructions for all matched skills
+        let mut skill_instructions_combined = String::new();
+        for (skill, _) in &matched_skills {
+            let skill_instructions_raw = if skill.full_content.starts_with("---") {
+                if let Some(end_idx) = skill.full_content[3..].find("\n---") {
+                    skill.full_content[3 + end_idx + 4..].trim().to_string()
+                } else if let Some(end_idx) = skill.full_content[3..].find("\r\n---") {
+                    skill.full_content[3 + end_idx + 5..].trim().to_string()
                 } else {
                     skill.full_content.clone()
                 }
             } else {
                 skill.full_content.clone()
             };
-            corrected_system_prompt = format!("{}\n\n{}", skill_instructions, corrected_system_prompt);
+
+            let abs_path = std::env::current_dir()
+                .unwrap_or_default()
+                .join("internal_skills")
+                .join(&skill.file_path);
+            let path_str = abs_path.to_string_lossy().replace("\\", "/");
+            let skill_instructions = slice_skill_instructions(&skill_instructions_raw, &path_str);
+
+            dbg_log!("[run_task] Prepending skill instructions from skill '{}'", skill.id);
+            if !skill_instructions_combined.is_empty() {
+                skill_instructions_combined.push_str("\n\n");
+            }
+            skill_instructions_combined.push_str(&skill_instructions);
+        }
+        if !skill_instructions_combined.is_empty() {
+            corrected_system_prompt = format!("{}\n\n{}", skill_instructions_combined, corrected_system_prompt);
         }
 
         let mut found_system = false;
@@ -1022,527 +1621,21 @@ pub async fn run_task(
         }
     }
 
+    let used_tokens_initial = estimate_tokens(&messages);
     if token_limit > 0 {
-        let used = estimate_tokens(&messages);
-        if used > (token_limit * 85 / 100) {
-            dbg_log!("[compress] triggering: used≈{} limit={}", used, token_limit);
+        let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_initial, "limit": token_limit }))).await;
+        if used_tokens_initial > (token_limit * 85 / 100) {
+            dbg_log!("[compress] triggering: used≈{} limit={}", used_tokens_initial, token_limit);
             messages = compress_context(&messages, provider, prompt, &msg_tx).await;
-        }
-    }
-
-    let user_msg = if prompt.trim_start().starts_with('[') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(prompt) {
-            ChatMessage {
-                role: "user".to_string(),
-                content: val,
-            }
-        } else {
-            ChatMessage::text("user", prompt)
+            let used_tokens_after = estimate_tokens(&messages);
+            let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_after, "limit": token_limit }))).await;
         }
     } else {
-        ChatMessage::text("user", prompt)
-    };
-    messages.push(user_msg);
-    let mut is_chat_mode = false;
-    {
-        let prompt_lower = prompt.to_lowercase();
-
-        // Anti-task patterns: if the user explicitly says they want a chat response,
-        // override task keywords. Checked BEFORE task keywords.
-        let anti_task_phrases: &[&str] = &[
-            "no action", "just chat", "just answer", "just tell me", "just respond",
-            "solo responde", "solo dime", "solo contesta", "ninguna accion", "sin accion",
-            "no ejecutes", "no hagas nada", "solo por aqui", "en el chat", "por el chat",
-            "don't do anything", "no need to do", "no action required", "no action needed",
-            "just here", "chat only", "conversational", "no task",
-            "damelo aqui", "responde aqui", "dime aqui",
-        ];
-        let is_anti_task = anti_task_phrases.iter().any(|p| prompt_lower.contains(p));
-
-        let task_keywords: &[&str] = &[
-            "draw", "paint", "sketch", "doodle",
-            "dibuja", "dibujar", "pinta", "pintar",
-            "open", "launch", "start",
-            "abre", "abrir", "lanza", "lanzar",
-            "close", "quit", "exit", "kill",
-            "cierra", "cerrar", "quita", "quitar", "sale", "salir", "mata", "matar",
-            "save", "delete", "remove", "rename",
-            "guarda", "guardar", "borra", "borrar", "elimina", "eliminar", "renombra", "renombrar",
-            "install", "execute", "command", "script", "terminal", "powershell", "bash", "cmd",
-            "instala", "instalar", "ejecuta", "ejecutar", "comando", "consola",
-            "click", "press", "drag", "scroll",
-            "clic", "presiona", "arrastra", "arrastrar",
-            "take a screenshot", "screenshot", "captura de pantalla", "pantallazo",
-            "play", "pause", "mute",
-            "reproduce", "reproducir", "pausa", "pausar", "silencia", "silenciar",
-            "resize", "crop", "rotate",
-            "redimensiona", "redimensionar", "recorta", "recortar", "rota", "rotar",
-            "zip", "unzip", "compress", "extract",
-            "comprime", "comprimir", "descomprime", "descomprimir", "extrae", "extraer",
-            "notepad", "bloc de notas", "wordpad",
-            "excel", "powerpoint",
-        ];
-
-        let is_obvious_task = if cfg.mode == "chat" {
-            false
-        } else if cfg.mode == "task" {
-            true
-        } else if is_anti_task {
-            false
-        } else {
-            task_keywords.iter().any(|kw| {
-                // Use word boundary matching to avoid false positives
-                let kw_lower = kw.to_lowercase();
-                if kw_lower.contains(' ') {
-                    // Multi-word keywords: use simple contains
-                    prompt_lower.contains(&kw_lower)
-                } else {
-                    // Single-word keywords: check word boundaries
-                    prompt_lower.split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|word| word == kw_lower)
-                }
-            })
-        };
-
-        let exact_chat_patterns: &[&str] = &[
-            "hello", "hi there", "good morning", "good evening", "good night",
-            "how are you", "what's up", "whats up",
-            "thank you", "thanks", "thx",
-            "hi", "hey", "hola", "buenos dias", "buenas noches", "buenas tardes", "yo", "sup", "wassup",
-            "bye", "goodbye", "adios", "ciao",
-        ];
-        let starts_with_chat_patterns: &[&str] = &[
-            "what is your name", "who are you", "what can you do",
-        ];
-        let is_obvious_chat = if cfg.mode == "chat" {
-            true
-        } else if cfg.mode == "task" {
-            false
-        } else {
-            if is_obvious_task {
-                false
-            } else {
-                let trimmed = prompt_lower.trim()
-                    .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
-                exact_chat_patterns.iter().any(|p| trimmed == *p) ||
-                starts_with_chat_patterns.iter().any(|p| trimmed.starts_with(p))
-            }
-        };
-
-        if is_obvious_task {
-            dbg_log!("[gate] keyword match → TASK (skipping AI gate): '{}'", prompt);
-        } else if is_obvious_chat {
-            let _ = msg_tx.send("Preparing response...".to_string()).await;
-            dbg_log!("[gate] keyword match → CHAT: '{}'", prompt);
-            let mut chat_history = messages.clone();
-
-            let mut search_context = String::new();
-            if detect_search_intent(prompt) {
-                let query = extract_search_query(prompt, provider).await;
-                dbg_log!("[chat_mode] Pre-flight search detected search intent. Query: '{}'", query);
-                let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
-
-                // Perform search
-                let mut is_net_err = false;
-                let (result, results_list, images_list) = match search::search_detailed(&query).await {
-                    Ok((text, list, imgs)) => (text, list, imgs),
-                    Err(e) => {
-                        let msg = handle_search_error(&e);
-                        if msg.contains("No internet connection") {
-                            is_net_err = true;
-                        }
-                        (msg, vec![], vec![])
-                    }
-                };
-
-                if !is_net_err {
-                    // Send search widget to UI
-                    let html = format_search_widget(&query, &results_list, &images_list);
-                    if let Some(ref tx) = token_tx {
-                        let _ = tx.send(html.clone()).await;
-                    }
-                    performed_searches.push((query.clone(), results_list.clone()));
-                    for img in &images_list {
-                        if !all_search_images.iter().any(|existing| existing.url == img.url) {
-                            all_search_images.push(img.clone());
-                        }
-                    }
-                }
-
-                // Format search context
-                let mut search_info = format!("Search results for '{}':\n{}\n\nFound web pages:\n", query, result);
-                for res in &results_list {
-                    search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
-                }
-                if !images_list.is_empty() {
-                    search_info.push_str("\nFound images:\n");
-                    for img in &images_list {
-                        search_info.push_str(&format!("- Image URL: {}\n", img.url));
-                    }
-                }
-                search_info.push_str("\n(Use the above search results to reply to the user. Always include relevant links and images using markdown.)");
-                search_context = search_info;
-            }
-
-            // Build a chat-oriented system prompt to overwrite any task system prompt instructions!
-            let chat_system = if search_context.is_empty() {
-                format!(
-                    "You are antflow, a helpful conversational AI assistant. Respond in the user's language using rich Markdown.\n\
-                     Current date/time: {}\n\
-                     Be concise, accurate, and helpful. Do NOT output JSON.\n\
-                     When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
-                     - **Option A**: Description here.\n\
-                     Or:\n\
-                     - **Option A**\n\
-                       Description indented here.\n\
-                     Do NOT leave empty lines between a bullet point and its indented description.",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
-                )
-            } else {
-                format!(
-                    "You are antflow, a helpful conversational AI assistant. Respond in the user's language using rich Markdown.\n\
-                     Current date/time: {}\n\
-                     Use the following search results to answer the user's query. You must include the relevant search links and markdown images from the context in your response:\n\
-                     {}\n\n\
-                     Be detailed, accurate, and helpful. Do NOT output JSON.\n\
-                     When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
-                     - **Option A**: Description here.\n\
-                     Or:\n\
-                     - **Option A**\n\
-                       Description indented here.\n\
-                     Do NOT leave empty lines between a bullet point and its indented description.",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
-                    search_context
-                )
-            };
-
-            // Extract language instruction if present in any system message
-            let mut lang_instruction = String::new();
-            for msg in &chat_history {
-                if msg.role == "system" {
-                    if let Some(text) = msg.content.as_str() {
-                        if !text.starts_with("You are antflow") && !text.contains("You are a precise, cross-platform spatial automation agent") {
-                            lang_instruction = text.to_string();
-                        }
-                    }
-                }
-            }
-
-            // Remove all system messages from chat_history to purge spatial agent rules in Chat mode
-            chat_history.retain(|msg| msg.role != "system");
-
-            // Build final unified chat system prompt with language instruction
-            let mut final_chat_system = chat_system.clone();
-            if !lang_instruction.is_empty() {
-                final_chat_system = format!("{}\n\nImportant Instruction: {}", final_chat_system, lang_instruction);
-            }
-
-            // Insert single clean chat system prompt at index 0
-            chat_history.insert(0, ChatMessage::text("system", &final_chat_system));
-
-            if let Some(last_msg) = chat_history.last_mut() {
-                let chat_prompt = if search_context.is_empty() {
-                    format!(
-                        "{}\n\n(System note: Respond conversationally. Reply in the user's language. Be brief and helpful. No JSON, no tools.)",
-                        prompt
-                    )
-                } else {
-                    format!(
-                        "User query: {}\n\nSearch context:\n{}\n\n(System note: Respond conversationally based on the search context. Reply in the user's language. Be detailed yet concise. No JSON, no tools. You must include the relevant search links and markdown images from the context in your response.)",
-                        prompt, search_context
-                    )
-                };
-                last_msg.content = serde_json::Value::String(chat_prompt);
-            }
-
-            let chat_res = if let Some(tx) = token_tx.clone() {
-                provider.chat_stream(chat_history, Some(1000), tx).await
-            } else {
-                provider.chat(chat_history, Some(1000)).await
-            };
-
-            if let Ok(resp) = chat_res {
-                let raw_reply = resp.content.trim().to_string();
-                if !raw_reply.is_empty() && !raw_reply.eq_ignore_ascii_case("TASK") {
-                    let reply = clean_if_json(&raw_reply);
-                    return Ok(prepend_search_context(&reply, &performed_searches, &all_search_images));
-                }
-            }
-        } else {
-            dbg_log!("[gate] Running AI gate classifier for: '{}'", prompt);
-            let mut history_str = String::new();
-            if messages.len() > 1 {
-                let start_idx = if messages.len() > 4 { messages.len() - 4 } else { 0 };
-                for msg in &messages[start_idx..messages.len() - 1] {
-                    if msg.role == "system" {
-                        continue;
-                    }
-                    if let Some(content_str) = msg.content.as_str() {
-                        let truncated = if content_str.len() > 300 {
-                            format!("{}...", &content_str[..300])
-                        } else {
-                            content_str.to_string()
-                        };
-                        history_str.push_str(&format!("{}: {}\n", msg.role.to_uppercase(), truncated));
-                    }
-                }
-            }
-
-            let gate_prompt = if history_str.is_empty() {
-                format!(
-                    "Classify this user message as either TASK or CHAT.\n\
-                     TASK = Requires GUI/desktop automation (clicks, drags, keyboard key presses, taking screenshots, controlling windows outside this application).\n\
-                     CHAT = Anything else that runs internally or in the background, including conversation, greetings, web searches, internet research, and executing background commands/scripts/programs that do not require GUI interaction or taking screenshots.\n\
-                     User message: \"{}\"\n\
-                     Reply with ONLY one word: TASK or CHAT",
-                    prompt
-                )
-            } else {
-                format!(
-                    "Classify this user message as either TASK or CHAT.\n\
-                     TASK = Requires GUI/desktop automation (clicks, drags, keyboard key presses, taking screenshots, controlling windows outside this application).\n\
-                     CHAT = Anything else that runs internally or in the background, including conversation, greetings, web searches, internet research, and executing background commands/scripts/programs that do not require GUI interaction or taking screenshots.\n\n\
-                     Recent conversation history:\n\
-                     {}\n\
-                     User message: \"{}\"\n\
-                     Reply with ONLY one word: TASK or CHAT",
-                    history_str, prompt
-                )
-            };
-            let ai_says_task = if cfg.mode == "chat" {
-                false
-            } else if cfg.mode == "task" {
-                true
-            } else {
-                match provider.chat(
-                    vec![
-                        ChatMessage::text("system", "You are a classifier. You must reply with either TASK or CHAT based on the user's message."),
-                        ChatMessage::text("user", &gate_prompt)
-                    ],
-                    Some(50),
-                ).await {
-                    Ok(resp) => {
-                        let content = resp.content.trim();
-                        if content.is_empty() {
-                            dbg_log!("[gate] AI gate returned empty content. Defaulting to TASK.");
-                            true
-                        } else {
-                            let res = content.to_uppercase().contains("TASK");
-                            dbg_log!("[gate] AI gate classification result: '{}' -> classified as: {}", content, if res { "TASK" } else { "CHAT" });
-                            res
-                        }
-                    }
-                    Err(e) => {
-                        dbg_log!("[gate] AI gate failed: {:?}. Defaulting to TASK.", e);
-                        true
-                    }
-                }
-            };
-
-            if !ai_says_task {
-                dbg_log!("[gate] AI gate → CHAT: '{}'", prompt);
-                is_chat_mode = true;
-            } else {
-                dbg_log!("[gate] AI gate → TASK: '{}'", prompt);
-            }
-        }
+        let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_initial, "limit": 0 }))).await;
     }
 
-    if is_chat_mode {
-        dbg_log!("[chat_mode] Handling as chat with optional web search");
-        let _ = msg_tx.send("Preparing response...".to_string()).await;
-
-        let mut chat_history = messages.clone();
-
-        let mut search_context = String::new();
-        if detect_search_intent(prompt) {
-            let query = extract_search_query(prompt, provider).await;
-            dbg_log!("[chat_mode] Pre-flight search detected search intent. Query: '{}'", query);
-            let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
-
-            // Perform search
-            let mut is_net_err = false;
-            let (result, results_list, images_list) = match search::search_detailed(&query).await {
-                Ok((text, list, imgs)) => (text, list, imgs),
-                Err(e) => {
-                    let msg = handle_search_error(&e);
-                    if msg.contains("No internet connection") {
-                        is_net_err = true;
-                    }
-                    (msg, vec![], vec![])
-                }
-            };
-
-            if !is_net_err {
-                // Send search widget to UI
-                let html = format_search_widget(&query, &results_list, &images_list);
-                if let Some(ref tx) = token_tx {
-                    let _ = tx.send(html.clone()).await;
-                }
-                performed_searches.push((query.clone(), results_list.clone()));
-                for img in &images_list {
-                    if !all_search_images.iter().any(|existing| existing.url == img.url) {
-                        all_search_images.push(img.clone());
-                    }
-                }
-            }
-
-            let mut search_info = format!("Search results for '{}':\n{}\n\nFound web pages:\n", query, result);
-            for res in &results_list {
-                search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
-            }
-            if !images_list.is_empty() {
-                search_info.push_str("\nFound images:\n");
-                for img in &images_list {
-                    search_info.push_str(&format!("- Image URL: {}\n", img.url));
-                }
-            }
-            search_info.push_str("\n(Use the above search results to reply to the user. Always include relevant links and images using markdown.)");
-            search_context = search_info;
-        }
-
-        // Build a chat-oriented system prompt
-        let chat_system = if search_context.is_empty() {
-            format!(
-                "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
-                 You have access to web_search to look up current information. If you need to search, include a JSON block like:\n\
-                 ```json\n{{\"web_search\": \"your search query\"}}\n```\n\
-                 in your response, and the system will perform the search and ask you to provide a final answer.\n\
-                 Current date/time: {}\n\
-                 Be concise, accurate, and helpful. Never output raw JSON as your entire response.\n\
-                 When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
-                 - **Option A**: Description here.\n\
-                 Or:\n\
-                 - **Option A**\n\
-                   Description indented here.\n\
-                 Do NOT leave empty lines between a bullet point and its indented description.",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
-            )
-        } else {
-            format!(
-                "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
-                 Current date/time: {}\n\
-                 Use the following search results to answer the user's query. You must include the relevant search links and markdown images from the context in your response:\n\
-                 {}\n\n\
-                 Be detailed, accurate, and helpful.\n\
-                 When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
-                 - **Option A**: Description here.\n\
-                 Or:\n\
-                 - **Option A**\n\
-                   Description indented here.\n\
-                 Do NOT leave empty lines between a bullet point and its indented description.",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
-                search_context
-            )
-        };
-
-        // Extract language instruction if present in any system message
-        let mut lang_instruction = String::new();
-        for msg in &chat_history {
-            if msg.role == "system" {
-                if let Some(text) = msg.content.as_str() {
-                    if !text.starts_with("You are antflow") && !text.contains("You are a precise, cross-platform spatial automation agent") {
-                        lang_instruction = text.to_string();
-                    }
-                }
-            }
-        }
-
-        // Remove all system messages from chat_history to purge spatial agent rules in Chat mode
-        chat_history.retain(|msg| msg.role != "system");
-
-        // Build final unified chat system prompt with language instruction
-        let mut final_chat_system = chat_system.clone();
-        if !lang_instruction.is_empty() {
-            final_chat_system = format!("{}\n\nImportant Instruction: {}", final_chat_system, lang_instruction);
-        }
-
-        // Insert single clean chat system prompt at index 0
-        chat_history.insert(0, ChatMessage::text("system", &final_chat_system));
-
-        // First attempt: get a conversational response
-        let chat_res = if let Some(tx) = token_tx.clone() {
-            provider.chat_stream(chat_history.clone(), Some(1000), tx).await
-        } else {
-            provider.chat(chat_history.clone(), Some(1000)).await
-        };
-
-        if let Ok(resp) = chat_res {
-            let raw_reply = resp.content.trim().to_string();
-
-            // Check if the model requested a web search (as fallback)
-            let search_pattern = "\"web_search\"";
-            if raw_reply.contains(search_pattern) && search_context.is_empty() {
-                // Try to extract the search query
-                if let Some(query) = extract_chat_search_query(&raw_reply) {
-                    dbg_log!("[chat_mode] Model requested web search: '{}'", query);
-                    let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
-
-                    // Perform search
-                    let mut is_net_err = false;
-                    let (result, results_list, images_list) = match search::search_detailed(&query).await {
-                        Ok((text, list, imgs)) => (text, list, imgs),
-                        Err(e) => {
-                            let msg = handle_search_error(&e);
-                            if msg.contains("No internet connection") {
-                                is_net_err = true;
-                            }
-                            (msg, vec![], vec![])
-                        }
-                    };
-
-                    if !is_net_err {
-                        // Send search widget to UI
-                        let html = format_search_widget(&query, &results_list, &images_list);
-                        if let Some(ref tx) = token_tx {
-                            let _ = tx.send(html.clone()).await;
-                        }
-                        performed_searches.push((query.clone(), results_list.clone()));
-                        for img in &images_list {
-                            if !all_search_images.iter().any(|existing| existing.url == img.url) {
-                                all_search_images.push(img.clone());
-                            }
-                        }
-                    }
-
-                    // Feed search results back to get final answer
-                    let mut search_info = format!("Search results for '{}':\n{}\n\nFound web pages:\n", query, result);
-                    for res in &results_list {
-                        search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
-                    }
-                    if !images_list.is_empty() {
-                        search_info.push_str("\nFound images:\n");
-                        for img in &images_list {
-                            search_info.push_str(&format!("- Image URL: {}\n", img.url));
-                        }
-                    }
-                    search_info.push_str("\n(Now provide a natural conversational answer based on these search results. Include relevant links and images using markdown.)");
-
-                    chat_history.push(ChatMessage::text("assistant", &raw_reply));
-                    chat_history.push(ChatMessage::text("user", &search_info));
-
-                    let final_res = if let Some(tx) = token_tx.clone() {
-                        provider.chat_stream(chat_history, Some(1000), tx).await
-                    } else {
-                        provider.chat(chat_history, Some(1000)).await
-                    };
-
-                    if let Ok(final_resp) = final_res {
-                        let final_reply = clean_if_json(&final_resp.content);
-                        return Ok(prepend_search_context(&final_reply, &performed_searches, &all_search_images));
-                    }
-                }
-            }
-
-            // No search needed or search extraction failed — return direct response
-            if !raw_reply.is_empty() && !raw_reply.eq_ignore_ascii_case("TASK") {
-                let reply = clean_if_json(&raw_reply);
-                return Ok(prepend_search_context(&reply, &performed_searches, &all_search_images));
-            }
-        }
-        // If chat response failed, fall through to CGAE as fallback
-        dbg_log!("[chat_mode] Chat response failed, falling through to CGAE");
-    }
+    // Chat vs Task matching has been handled pre-emptively at the start of run_task.
+    // Proceed directly to the CGAE execution loop.
 
     // Drawing fast-path removed — CGAE handles all tasks including drawing.
 
@@ -1560,10 +1653,21 @@ pub async fn run_task(
     let mut noop_script_count: usize = 0;
     let mut last_screenshot_hash: Option<u64> = None;
     let mut no_screen_change_count: usize = 0;
+    let mut failed_attempts: Vec<String> = Vec::new();
+    let mut executed_attempts: Vec<(String, Value)> = Vec::new();
 
     'cgae: loop {
         if stop.load(Ordering::Relaxed) {
             return Ok("Task stopped by user.".to_string());
+        }
+        if cycles >= 5 {
+            let failure_summary = format!(
+                "Task failed: reached maximum limit of 5 cycles without completion. Failed attempts: {}",
+                failed_attempts.join("; ")
+            );
+            dbg_log!("[run_task] Hard stop at cycle 5. Calling task_complete with failure summary.");
+            let _ = db::log_action(&conn, session_id, "task_complete", &serde_json::json!({ "summary": failure_summary }).to_string(), None);
+            return Ok(prepend_search_context(&failure_summary, &performed_searches, &all_search_images));
         }
         if cycles >= MAX_CYCLES {
             return Ok(prepend_search_context(&format!("Reached maximum cycles ({MAX_CYCLES}). Last known state saved."), &performed_searches, &all_search_images));
@@ -1596,16 +1700,16 @@ pub async fn run_task(
             if last_two_screenshot_only {
                 dbg_log!("[cycle {}] SCREENSHOT LOOP DETECTED — injecting screenshot + forced act", cycles);
                 if vision_capable {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                                // Focus the most recently launched window before screenshot
-                                if cfg!(target_os = "windows") {
-                                    let _ = execute_tool_async("run_script".to_string(), serde_json::json!({
-                                        "script": "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate((Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Sort-Object StartTime -Descending | Select-Object -First 1).Id) | Out-Null",
-                                        "capture_output": false
-                                    })).await;
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                }
-                                if let Ok(img) = take_screenshot(patterns, prompt).await {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    if cfg!(target_os = "windows") {
+                        let _ = execute_tool_async("run_script".to_string(), serde_json::json!({
+                            "script": "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate((Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Sort-Object StartTime -Descending | Select-Object -First 1).Id) | Out-Null",
+                            "capture_output": false
+                        }), storage_dir, &[], stop.clone()).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                    if let Ok((img, elements)) = take_screenshot_with_elements(patterns, prompt).await {
+                        screen_elements = elements;
                         messages.push(ChatMessage::with_image(
                             &format!(
                                 "[SCREEN] Task: \"{}\". Pick ONE element, get its x/y from this image, output JSON action NOW. \
@@ -1635,15 +1739,56 @@ pub async fn run_task(
         } else {
             ""
         };
+        let failed_attempts_text = if failed_attempts.is_empty() {
+            "".to_string()
+        } else {
+            let mut text = "\nFAILED ATTEMPTS (do not repeat these identical calls/commands):\n".to_string();
+            for attempt in &failed_attempts {
+                text.push_str(&format!("- {}\n", attempt));
+            }
+            text
+        };
+        let already_tried_text = if executed_attempts.is_empty() {
+            "".to_string()
+        } else {
+            let mut counts: Vec<((String, String), usize)> = Vec::new();
+            for (tool, params) in &executed_attempts {
+                let formatted = format_tool_attempt(tool, params);
+                let key = (tool.clone(), formatted);
+                if let Some(pos) = counts.iter().position(|(k, _)| k == &key) {
+                    counts[pos].1 += 1;
+                } else {
+                    counts.push((key, 1));
+                }
+            }
+            let mut text = "\nALREADY TRIED (do not repeat):\n".to_string();
+            for ((tool, formatted), count) in counts {
+                text.push_str(&format!("- {}: {} x{} -> no progress\n", tool, formatted, count));
+            }
+            text
+        };
+
+        let elements_text = if screen_elements.is_empty() {
+            "".to_string()
+        } else {
+            let mut s = "\n\nVISIBLE UI ELEMENTS (OCR DETECTED):\n".to_string();
+            s.push_str("You can click on these elements by passing the 'element_id' parameter to mouse_click (e.g. \"element_id\": \"el_1\").\n");
+            for el in &screen_elements {
+                s.push_str(&format!("- ID: {}, Text: \"{}\" at center ({}, {}) [width={}, height={}]\n", el.id, el.label, el.x, el.y, el.w, el.h));
+            }
+            s
+        };
         messages.push(ChatMessage::text("system", &format!(
-            "[TODO] Original task: \"{}\". Cycles used: {}/{}. Steps used: {}/{}. \
-             GROUNDING RULE: Take screenshot → describe UI elements with pixel coords → act with those coords. \
-             type_text is ONLY for typing real text into text fields. \
-             run_script must contain ONLY executable PowerShell/bash code, never English descriptions. \
-             {} \
-             Never guess coordinates. Never narrate instead of acting. \
-             If stuck: take a fresh screenshot, read the UI, pick exact pixel coords, then act.",
-            prompt, cycles, MAX_CYCLES, total_steps, MAX_STEPS, drawing_tip
+            "[TODO] Original task: \"{}\". Cycles used: {}/{}. Steps used: {}/{}.{}{}\n\
+             GROUNDING RULE: Take screenshot → describe UI elements with pixel coords → act with those coords.\n\
+             TOOL CHOICE RULE: Prefer the simplest tool for the task. If you want to open a URL/website, use the open_url tool directly rather than launching a browser manually.\n\
+             Available execution tools: open_url, web_search, run_command, run_script, screenshot, mouse_click, mouse_move, mouse_drag, mouse_scroll, key_press, type_text, clipboard_set, task_complete.\n\
+             type_text is ONLY for typing real text into text fields.\n\
+             run_script must contain ONLY executable PowerShell/bash code, never English descriptions.\n\
+             {}\n\
+             Never guess coordinates. Never narrate instead of acting.\n\
+             If stuck: take a fresh screenshot, read the UI, pick exact pixel coords, then act.{}",
+            prompt, cycles, MAX_CYCLES, total_steps, MAX_STEPS, failed_attempts_text, already_tried_text, drawing_tip, elements_text
         )));
 
         // Keep only the last 2 screenshots in context — older ones bloat
@@ -1668,10 +1813,11 @@ pub async fn run_task(
             cleaned
         };
 
+        let used_tokens_before = estimate_tokens(&messages_for_ai);
         if token_limit > 0 {
-            let used = estimate_tokens(&messages_for_ai);
-            if used > (token_limit * 85 / 100) {
-                dbg_log!("[compress] triggering inside loop: used≈{} limit={}", used, token_limit);
+            let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_before, "limit": token_limit }))).await;
+            if used_tokens_before > (token_limit * 85 / 100) {
+                dbg_log!("[compress] triggering inside loop: used≈{} limit={}", used_tokens_before, token_limit);
                 messages = compress_context(&messages_for_ai, provider, prompt, &msg_tx).await;
                 // Re-build messages_for_ai from compressed history
                 messages_for_ai = {
@@ -1693,7 +1839,11 @@ pub async fn run_task(
                     }
                     cleaned
                 };
+                let used_tokens_after = estimate_tokens(&messages_for_ai);
+                let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_after, "limit": token_limit }))).await;
             }
+        } else {
+            let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_before, "limit": 0 }))).await;
         }
 
         let default_step = "Executing action".to_string();
@@ -1798,8 +1948,10 @@ pub async fn run_task(
             continue 'cgae;
         }
 
+        messages.push(ChatMessage::text("assistant", &response.content));
+
         let mut failed: Option<(usize, String)> = None;
-        let mut early_done: Option<String> = None;
+        let early_done: Option<String> = None;
         let mut plan_summary = val["summary"].as_str().unwrap_or("Plan executed.").to_string();
         let mut steps: Vec<Value> = Vec::new();
         let mut has_task_complete = false;
@@ -1886,6 +2038,8 @@ pub async fn run_task(
 
         // Handle single-shot tools (no plan array)
         if let Some(tool_name) = val["tool"].as_str() {
+            total_steps += 1;
+            executed_attempts.push((tool_name.to_string(), val["params"].clone()));
             match tool_name {
                 "task_complete" => {
                     let summary = val["params"]["summary"].as_str().unwrap_or(&plan_summary).to_string();
@@ -1920,7 +2074,7 @@ pub async fn run_task(
                         Err(e) => {
                             let msg = handle_search_error(&e);
                             if msg.contains("No internet connection") {
-                                is_net_err = true;
+                                  is_net_err = true;
                             }
                             (msg, vec![], vec![])
                         }
@@ -1959,7 +2113,6 @@ pub async fn run_task(
                         search_info.push_str(&format!("- Title: \"{}\", URL: {}\n", res.title, res.url));
                     }
                     if !images_list.is_empty() {
-                        search_info.push_str("\nFound images:\n");
                         for img in &images_list {
                             search_info.push_str(&format!("- Image URL: {}\n", img.url));
                         }
@@ -1974,17 +2127,18 @@ pub async fn run_task(
                             "Screenshot requested but this model has no vision capability."));
                         continue 'cgae;
                     }
-                    let img = take_screenshot(patterns, prompt).await?;
+                    let (img, elements) = take_screenshot_with_elements(patterns, prompt).await?;
+                    screen_elements = elements;
                     messages.push(ChatMessage::with_image("Current screen:", &img));
                     continue 'cgae;
                 }
                 other => {
                     dbg_log!("[cycle {}] single tool: {}", cycles, other);
-                    let out = execute_tool_async(other.to_string(), val["params"].clone()).await;
+                    notify_media_generation_if_needed(other, &val["params"], &msg_tx).await;
+                    let out = execute_tool_async(other.to_string(), val["params"].clone(), storage_dir, &screen_elements, stop.clone()).await;
                     let _ = db::log_action(&conn, session_id, other, &val["params"].to_string(), None);
                     match out {
                         Ok(o) => {
-                            total_steps += 1;
                             // Fingerprint: for mouse actions, hash tool only (coords vary but mean no progress)
                             // For other tools, hash tool+args
                             same_action_count = track_action_repetition(other, &val["params"], &mut recent_action_hashes);
@@ -1993,6 +2147,7 @@ pub async fn run_task(
                             messages.push(ChatMessage::text("user", &fb));
                         }
                         Err(e) => {
+                            failed_attempts.push(format!("{} with params {} -> error: {}", other, val["params"], e));
                             messages.push(ChatMessage::text("user",
                                 &format!("Tool '{other}' failed: {e}.")));
                         }
@@ -2013,10 +2168,14 @@ pub async fn run_task(
                     return Ok(prepend_search_context(&format!("Reached maximum steps ({MAX_STEPS})."), &performed_searches, &all_search_images));
                 }
 
+                total_steps += 1;
+
                 let step = &steps[i];
                 let tool_name = step["tool"].as_str().unwrap_or("");
                 let mut params = step["params"].clone();
                 let delay_ms = step["delay_ms"].as_u64().unwrap_or(0) as u64;
+
+                executed_attempts.push((tool_name.to_string(), params.clone()));
 
                 if tool_name == "mouse_move" {
                     if let (Some(x), Some(y)) = (params["x"].as_i64(), params["y"].as_i64()) {
@@ -2210,12 +2369,12 @@ public class Win32 {{
                             execute_tool_async("run_script".to_string(), serde_json::json!({
                                 "script": format!("if (Get-Process -Name '{}' -ErrorAction SilentlyContinue) {{ 'is_active' }} else {{ 'inactive' }}", exe_clean),
                                 "capture_output": true
-                            })).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
+                            }), storage_dir, &[], stop.clone()).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
                         } else {
                             execute_tool_async("run_command".to_string(), serde_json::json!({
                                 "command": format!("pgrep -x '{}' > /dev/null 2>&1 && echo is_active || echo inactive", exe_clean),
                                 "capture_output": true
-                            })).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
+                            }), storage_dir, &[], stop.clone()).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
                         };
                         if already_running {
                             dbg_log!("[cycle {} step {}] {} already running — focusing", cycles, i+1, exe_clean);
@@ -2241,7 +2400,7 @@ public class WinFocus {{
                                 let focus_result = execute_tool_async("run_script".to_string(), serde_json::json!({
                                     "script": focus_script,
                                     "capture_output": true
-                                })).await;
+                                }), storage_dir, &[], stop.clone()).await;
                                 let focused = focus_result.ok().flatten()
                                     .map(|o| o.contains("focused")).unwrap_or(false);
                                 if focused {
@@ -2277,6 +2436,9 @@ public class WinFocus {{
                             let check_result = execute_tool_async(
                                 "run_command".to_string(),
                                 verify["params"].clone(),
+                                storage_dir,
+                                &[],
+                                stop.clone(),
                             ).await;
                             if let Ok(Some(out)) = check_result {
                                 let out_lower = out.to_lowercase();
@@ -2296,11 +2458,11 @@ public class WinFocus {{
                             }
                         }
                     }
-                    let result = execute_tool_async(tool_name.to_string(), params.clone()).await;
+                    notify_media_generation_if_needed(tool_name, &params, &msg_tx).await;
+                    let result = execute_tool_async(tool_name.to_string(), params.clone(), storage_dir, &screen_elements, stop.clone()).await;
                     let _ = db::log_action(&conn, session_id, tool_name, &params.to_string(), None);
                     match result {
                         Ok(out) => {
-                            total_steps += 1;
                             // Fingerprint this action
                             same_action_count = track_action_repetition(tool_name, &params, &mut recent_action_hashes);
                             if let Some(ref o) = out {
@@ -2370,8 +2532,8 @@ public class WinFocus {{
                         ));
                         continue;
                     }
-                    let img = take_screenshot(patterns, prompt).await?;
-
+                    let (img, elements) = take_screenshot_with_elements(patterns, prompt).await?;
+                    screen_elements = elements;
                     let new_hash = screenshot_hash(&img);
                     let screen_changed = last_screenshot_hash
                         .map(|old| old != new_hash)
@@ -2586,11 +2748,11 @@ public class WinFocus {{
                         }
                     }
 
-                    let result = execute_tool_async(tool_name.to_string(), final_params.clone()).await;
+                    notify_media_generation_if_needed(tool_name, &final_params, &msg_tx).await;
+                    let result = execute_tool_async(tool_name.to_string(), final_params.clone(), storage_dir, &screen_elements, stop.clone()).await;
                     let _ = db::log_action(&conn, session_id, tool_name, &final_params.to_string(), None);
                     match result {
                         Ok(out) => {
-                            total_steps += 1;
                             // Fingerprint this action
                             same_action_count = track_action_repetition(tool_name, &params, &mut recent_action_hashes);
                             if let Some(ref o) = out {
@@ -2658,17 +2820,17 @@ $hwnd = [Win32]::GetForegroundWindow()
 [Win32]::ShowWindow($hwnd, 3) | Out-Null
 "#,
                                         "capture_output": false
-                                    })).await
+                                    }), storage_dir, &[], stop.clone()).await
                                 } else if cfg!(target_os = "macos") {
                                     execute_tool_async("run_script".to_string(), serde_json::json!({
                                         "script": "osascript -e 'tell application \"System Events\" to set frontmost of first process whose frontmost is true to true'",
                                         "capture_output": false
-                                    })).await
+                                    }), storage_dir, &[], stop.clone()).await
                                 } else {
                                     execute_tool_async("run_script".to_string(), serde_json::json!({
                                         "script": "wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true",
                                         "capture_output": false
-                                    })).await
+                                    }), storage_dir, &[], stop.clone()).await
                                 };
                                 let _ = maximize_result;
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2692,6 +2854,13 @@ $hwnd = [Win32]::GetForegroundWindow()
             dbg_log!("[cycle {}] plan failed at step {}/{}: {}", cycles, fi+1, steps.len(), err);
             let _ = msg_tx.try_send("Adjusting actions...".to_string());
             let msg = format!("Step {}/{} failed: {err}. Reply with a corrected plan.", fi + 1, steps.len());
+            
+            // Add failed attempt memory
+            let step = &steps[fi];
+            let tool_name = step["tool"].as_str().unwrap_or("");
+            let params = &step["params"];
+            failed_attempts.push(format!("{} with params {} -> {}", tool_name, params, err));
+
             db::insert_message(&conn, session_id, "user", &msg)?;
             messages.push(ChatMessage::text("user", &msg));
             continue 'cgae;
@@ -2762,12 +2931,11 @@ $hwnd = [Win32]::GetForegroundWindow()
                 continue 'cgae;
             }
         }
-
         // After plan completes, take one screenshot and re-enter loop so AI sees real state
         if vision_capable && failed.is_none() && early_done.is_none() {
-            if let Ok(img) = take_screenshot(patterns, prompt).await {
+            if let Ok((img, elements)) = take_screenshot_with_elements(patterns, prompt).await {
+                screen_elements = elements;
                 dbg_log!("[cycle {}] post-plan screenshot injected", cycles);
-
                 let new_hash = screenshot_hash(&img);
                 let screen_changed = last_screenshot_hash
                     .map(|old| old != new_hash)
@@ -2824,9 +2992,8 @@ $hwnd = [Win32]::GetForegroundWindow()
             if !vision_capable {
                 return Ok(prepend_search_context(&plan_summary, &performed_searches, &all_search_images));
             }
-
-            let img = take_screenshot(patterns, prompt).await?;
-
+            let (img, elements) = take_screenshot_with_elements(patterns, prompt).await?;
+            screen_elements = elements;
             let new_hash = screenshot_hash(&img);
             last_screenshot_hash = Some(new_hash);
 
@@ -2920,12 +3087,24 @@ fn get_target_app_and_text(prompt: &str) -> (Option<&'static str>, Option<String
 #[cfg(not(windows))]
 fn autofocus_target_app(_prompt: &str) {}
 
+#[allow(dead_code)]
 async fn take_screenshot(patterns: &RedactPatterns, _prompt: &str) -> Result<String> {
     hide_console_window();
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let png = capture_redacted(patterns)?;
     show_console_window();
     Ok(to_base64(&png))
+}
+
+async fn take_screenshot_with_elements(
+    patterns: &RedactPatterns,
+    _prompt: &str,
+) -> Result<(String, Vec<Element>)> {
+    hide_console_window();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let (png, elements) = capture_redacted_with_elements(patterns)?;
+    show_console_window();
+    Ok((to_base64(&png), elements))
 }
 
 // ---------------------------------------------------------------------------
@@ -2948,7 +3127,7 @@ fn show_console_window() {}
 // Tool dispatcher
 // ---------------------------------------------------------------------------
 
-fn execute_tool(tool: &str, params: &Value) -> Result<Option<String>> {
+fn execute_tool(tool: &str, params: &Value, stop: StopFlag) -> Result<Option<String>> {
     use crate::tools;
     match tool {
         "maximize" | "AppActivate" | "app_activate" | "focus_window" => {
@@ -2971,7 +3150,7 @@ public class WinApi {
     Write-Output "Focused: $($proc.MainWindowTitle)"
 } else { Write-Output "No window found" }
 "#;
-            tools::run_script(&serde_json::json!({"script": script, "capture_output": true}))
+            tools::run_script(&serde_json::json!({"script": script, "capture_output": true}), stop)
         }
         "mouse_move" => tools::mouse_move(params),
         "mouse_click" => tools::mouse_click(params),
@@ -2980,8 +3159,10 @@ public class WinApi {
         "mouse_scroll" => tools::mouse_scroll(params),
         "key_press" => tools::key_press(params),
         "type_text" => tools::type_text(params),
-        "run_command" => tools::run_command(params),
-        "run_script" => tools::run_script(params),
+        "run_command" => tools::run_command(params, stop),
+        "run_script" => tools::run_script(params, stop),
+        "read_file" => tools::read_file(params),
+        "str_replace" => tools::str_replace(params),
         "send_keys_to_app" => tools::send_keys_to_app(params),
         "clipboard_set" => tools::clipboard_set(params),
         "clipboard_get" => tools::clipboard_get(params),
@@ -3043,15 +3224,212 @@ fn resolve_app_command(script: &str) -> Option<String> {
     None
 }
 
-async fn execute_tool_async(tool: String, mut params: Value) -> Result<Option<String>> {
+async fn generate_image_async(prompt: &str, storage_dir: &Path) -> Result<String> {
+    let cfg = crate::config::load(storage_dir)?;
+    if cfg.localai_models.images.is_empty() {
+        anyhow::bail!("No active LocalAI model configured for image generation. Please set this up in settings -> models.");
+    }
+    if !crate::ai::localai::is_running().await {
+        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured model is installed.");
+    }
+    let model = cfg.localai_models.images.clone();
+
+    let active_port = crate::ai::localai::get_active_port();
+    let base_url = format!("http://127.0.0.1:{}", active_port);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let payload = serde_json::json!({
+        "prompt": prompt,
+        "model": model
+    });
+
+    let res = client.post(format!("{}/v1/images/generations", base_url))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        anyhow::bail!("Image generation failed with HTTP status {}", res.status());
+    }
+
+    let json_res: serde_json::Value = res.json().await?;
+    let url_val = json_res["data"][0]["url"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("No image URL found in response"))?;
+
+    let full_url = if url_val.starts_with("http://") || url_val.starts_with("https://") {
+        url_val.to_string()
+    } else {
+        format!("{}{}{}", base_url, if url_val.starts_with('/') { "" } else { "/" }, url_val)
+    };
+
+    let img_res = client.get(&full_url).send().await?;
+    let bytes = img_res.bytes().await?;
+
+    let filename = format!("localai_gen_{}.png", uuid::Uuid::new_v4());
+    let temp_path = std::env::temp_dir().join(filename);
+    tokio::fs::write(&temp_path, bytes).await?;
+
+    let path_str = temp_path.to_string_lossy().replace('\\', "/");
+    let markdown = format!("![Image](file:///{})", path_str);
+    Ok(markdown)
+}
+
+async fn generate_video_async(prompt: &str, storage_dir: &Path) -> Result<String> {
+    let cfg = crate::config::load(storage_dir)?;
+    if cfg.localai_models.video.is_empty() {
+        anyhow::bail!("No active LocalAI model configured for video generation. Please set this up in settings -> models.");
+    }
+    if !crate::ai::localai::is_running().await {
+        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured model is installed.");
+    }
+    let model = cfg.localai_models.video.clone();
+
+    let active_port = crate::ai::localai::get_active_port();
+    let base_url = format!("http://127.0.0.1:{}", active_port);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let payload = serde_json::json!({
+        "prompt": prompt,
+        "model": model
+    });
+
+    let res = client.post(format!("{}/video", base_url))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        anyhow::bail!("Video generation failed with HTTP status {}", res.status());
+    }
+
+    let json_res: serde_json::Value = res.json().await?;
+    let url_val = json_res["data"][0]["url"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("No video URL found in response"))?;
+
+    let full_url = if url_val.starts_with("http://") || url_val.starts_with("https://") {
+        url_val.to_string()
+    } else {
+        format!("{}{}{}", base_url, if url_val.starts_with('/') { "" } else { "/" }, url_val)
+    };
+
+    let video_res = client.get(&full_url).send().await?;
+    let bytes = video_res.bytes().await?;
+
+    let filename = format!("localai_gen_{}.mp4", uuid::Uuid::new_v4());
+    let temp_path = std::env::temp_dir().join(filename);
+    tokio::fs::write(&temp_path, bytes).await?;
+
+    let path_str = temp_path.to_string_lossy().replace('\\', "/");
+    let html = format!("<video src=\"file:///{}\" controls autoplay style=\"max-width:100%; border-radius:8px;\"></video>", path_str);
+    Ok(html)
+}
+
+async fn generate_music_async(prompt: &str, storage_dir: &Path) -> Result<String> {
+    let cfg = crate::config::load(storage_dir)?;
+    if cfg.localai_models.music.is_empty() {
+        anyhow::bail!("No active LocalAI model configured for music/sound generation. Please set this up in settings -> models.");
+    }
+    if !crate::ai::localai::is_running().await {
+        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured model is installed.");
+    }
+    let model = cfg.localai_models.music.clone();
+
+    let active_port = crate::ai::localai::get_active_port();
+    let base_url = format!("http://127.0.0.1:{}", active_port);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+    let payload = serde_json::json!({
+        "prompt": prompt,
+        "model": model
+    });
+
+    let res = client.post(format!("{}/v1/sound-generation", base_url))
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !res.status().is_success() {
+        anyhow::bail!("Sound generation failed with HTTP status {}", res.status());
+    }
+
+    let bytes = res.bytes().await?;
+
+    let filename = format!("localai_gen_{}.wav", uuid::Uuid::new_v4());
+    let temp_path = std::env::temp_dir().join(filename);
+    tokio::fs::write(&temp_path, bytes).await?;
+
+    let path_str = temp_path.to_string_lossy().replace('\\', "/");
+    let html = format!("<audio src=\"file:///{}\" controls autoplay style=\"width:100%; margin-top:8px;\"></audio>", path_str);
+    Ok(html)
+}
+
+async fn notify_media_generation_if_needed(tool_name: &str, params: &serde_json::Value, msg_tx: &tokio::sync::mpsc::Sender<String>) {
+    if tool_name == "generate_image" || tool_name == "generate_video" || tool_name == "generate_music" {
+        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+        let media_type = match tool_name {
+            "generate_image" => "image",
+            "generate_video" => "video",
+            "generate_music" => "music",
+            _ => "unknown",
+        };
+        let _ = msg_tx.send(format!("JSON_MEDIA_GEN:{}", serde_json::json!({
+            "type": media_type,
+            "prompt": prompt,
+            "status": "generating"
+        }))).await;
+    }
+}
+
+async fn execute_tool_async(
+    tool: String,
+    mut params: Value,
+    storage_dir: &Path,
+    screen_elements: &[Element],
+    stop: StopFlag,
+) -> Result<Option<String>> {
     match tool.as_str() {
+        "generate_image" => {
+            let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+            let res = generate_image_async(&prompt, storage_dir).await.unwrap_or_else(|e| {
+                format!("Error generating image: {e}")
+            });
+            return Ok(Some(res));
+        }
+        "generate_video" => {
+            let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+            let res = generate_video_async(&prompt, storage_dir).await.unwrap_or_else(|e| {
+                format!("Error generating video: {e}")
+            });
+            return Ok(Some(res));
+        }
+        "generate_music" => {
+            let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+            let res = generate_music_async(&prompt, storage_dir).await.unwrap_or_else(|e| {
+                format!("Error generating music/sound: {e}")
+            });
+            return Ok(Some(res));
+        }
         "mouse_click" | "mouse_move" | "mouse_double_click" => {
+            if let Some(el_id) = params.get("element_id").and_then(|v| v.as_str()) {
+                if let Some(el) = screen_elements.iter().find(|e| e.id == el_id) {
+                    if let Some(obj) = params.as_object_mut() {
+                        obj.insert("x".to_string(), serde_json::json!(el.x));
+                        obj.insert("y".to_string(), serde_json::json!(el.y));
+                    }
+                }
+            }
             let has_x = params.get("x").and_then(|v| v.as_i64()).is_some();
             let has_y = params.get("y").and_then(|v| v.as_i64()).is_some();
             if !has_x || !has_y {
                 anyhow::bail!(
-                    "mouse action '{}' rejected: missing x/y coordinates. \
-                     Take a screenshot first, then use exact pixel coords from it.",
+                    "mouse action '{}' rejected: missing x/y coordinates or invalid element_id. \
+                     Take a screenshot first, then use exact pixel coords or element_id from it.",
                     tool
                 );
             }
@@ -3105,8 +3483,9 @@ async fn execute_tool_async(tool: String, mut params: Value) -> Result<Option<St
 
     let tool_clone = tool.clone();
     let params_clone = params.clone();
+    let stop_clone = stop.clone();
     tokio::task::spawn_blocking(move || {
-        execute_tool(&tool_clone, &params_clone)
+        execute_tool(&tool_clone, &params_clone, stop_clone)
     }).await.context("Tool thread panicked")?
 }
 
@@ -3413,13 +3792,7 @@ pub fn format_master_search_widget(
     }
 
     html.push_str("  </div>\n"); // Close web-search-results
-    
-    html.push_str(
-        "  <div class=\"web-search-done\">\n\
-             <svg class=\"web-search-done-icon\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M22 11.08V12a10 10 0 1 1-5.93-9.14\"></path><polyline points=\"22 4 12 14.01 9 11.01\"></polyline></svg>\n\
-             <span class=\"web-search-done-text\">Search Completed</span>\n\
-           </div>\n"
-    );
+
 
     if !images.is_empty() {
         html.push_str("  <div class=\"web-search-images-gallery\">\n");

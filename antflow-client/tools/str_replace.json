@@ -1,0 +1,13 @@
+{
+  "name": "str_replace",
+  "description": "Finds a unique exact string and replaces it with another string in a file.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string" },
+      "find": { "type": "string" },
+      "replace": { "type": "string" }
+    },
+    "required": ["path", "find", "replace"]
+  }
+}

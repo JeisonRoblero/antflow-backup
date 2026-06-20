@@ -7,6 +7,37 @@ use serde_json::Value;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+macro_rules! dbg_log {
+    ($($arg:tt)*) => {
+        {
+            let log_path = std::env::temp_dir().join("antflow_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
+macro_rules! trace_log {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        {
+            let log_path = std::env::temp_dir().join("antflow_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -38,6 +69,7 @@ use enigo::{
 pub fn mouse_move(params: &Value) -> Result<Option<String>> {
     let x = json_int(params, "x")?;
     let y = json_int(params, "y")?;
+    trace_log!("[mouse_move] Coordinates: x={}, y={}", x, y);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.move_mouse(x, y, Coordinate::Abs).context("Mouse move failed")?;
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -48,6 +80,9 @@ pub fn mouse_move(params: &Value) -> Result<Option<String>> {
 pub fn mouse_click(params: &Value) -> Result<Option<String>> {
     let button_str = json_str(params, "button").unwrap_or("left");
     let button = parse_button(button_str)?;
+    let x = params.get("x").and_then(|v| v.as_i64());
+    let y = params.get("y").and_then(|v| v.as_i64());
+    trace_log!("[mouse_click] Button: {}, Coordinates: {:?}", button_str, x.zip(y));
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
         e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
@@ -59,6 +94,9 @@ pub fn mouse_click(params: &Value) -> Result<Option<String>> {
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn mouse_double_click(params: &Value) -> Result<Option<String>> {
+    let x = params.get("x").and_then(|v| v.as_i64());
+    let y = params.get("y").and_then(|v| v.as_i64());
+    trace_log!("[mouse_double_click] Coordinates: {:?}", x.zip(y));
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
         e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
@@ -78,6 +116,7 @@ pub fn mouse_drag(params: &Value) -> Result<Option<String>> {
     let to_y = json_int(params, "to_y")?;
     let button_str = json_str(params, "button").unwrap_or("left");
     let button = parse_button(button_str)?;
+    trace_log!("[mouse_drag] Button: {}, From: ({},{}), To: ({},{})", button_str, from_x, from_y, to_x, to_y);
 
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.move_mouse(from_x, from_y, Coordinate::Abs)?;
@@ -92,6 +131,7 @@ pub fn mouse_drag(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn mouse_scroll(params: &Value) -> Result<Option<String>> {
     let amount = json_int(params, "amount")?;
+    trace_log!("[mouse_scroll] Amount: {}", amount);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.scroll(amount, enigo::Axis::Vertical).context("Scroll failed")?;
     Ok(None)
@@ -101,6 +141,7 @@ pub fn mouse_scroll(params: &Value) -> Result<Option<String>> {
 pub fn key_press(params: &Value) -> Result<Option<String>> {
     let key_name = json_str(params, "key").context("key_press requires a 'key' param")?;
     let modifiers = params.get("modifiers").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    trace_log!("[key_press] Key: {}, Modifiers: {:?}", key_name, modifiers);
 
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
 
@@ -126,6 +167,7 @@ pub fn key_press(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn type_text(params: &Value) -> Result<Option<String>> {
     let text = json_str(params, "text").context("type_text requires a 'text' param")?;
+    trace_log!("[type_text] Typing text: '{}'", text);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.text(text).context("Type text failed")?;
     Ok(None)
@@ -134,6 +176,7 @@ pub fn type_text(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn clipboard_set(params: &Value) -> Result<Option<String>> {
     let text = json_str(params, "text").context("clipboard_set requires a 'text' param")?.to_string();
+    trace_log!("[clipboard_set] Writing text to clipboard: '{}'", text);
     let mut cb = Clipboard::new().context("Failed to open clipboard")?;
     cb.set_text(text).context("Failed to write to clipboard")?;
     Ok(None)
@@ -143,12 +186,14 @@ pub fn clipboard_set(params: &Value) -> Result<Option<String>> {
 pub fn clipboard_get(_params: &Value) -> Result<Option<String>> {
     let mut cb = Clipboard::new().context("Failed to open clipboard")?;
     let text = cb.get_text().context("Failed to read clipboard")?;
+    trace_log!("[clipboard_get] Read text from clipboard: '{}'", text);
     Ok(Some(text))
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn open_url(params: &Value) -> Result<Option<String>> {
     let url = json_str(params, "url").context("open_url requires a 'url' param")?;
+    dbg_log!("[open_url] Launching URL: '{}'", url);
     open::that(url).context("Failed to open URL")?;
     Ok(None)
 }
@@ -453,9 +498,10 @@ pub fn voice_input(_params: &Value) -> Result<Option<String>> { anyhow::bail!("V
 // ===========================================================================
 
 // Runs a shell command and optionally returns its stdout.
-pub fn run_command(params: &Value) -> Result<Option<String>> {
+pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<String>> {
     let command = json_str(params, "command").context("run_command requires a 'command' param")?;
     let capture = params.get("capture_output").and_then(|v| v.as_bool()).unwrap_or(false);
+    trace_log!("[run_command] executing command='{}' (capture={})", command, capture);
 
     let (shell, flag) = if cfg!(target_os = "windows") {
         ("cmd", "/C")
@@ -489,11 +535,17 @@ pub fn run_command(params: &Value) -> Result<Option<String>> {
         cmd.creation_flags(0x08000000);
         cmd.spawn()
             .context("Failed to launch app")?;
+        dbg_log!("[run_command] command treated as background launch, returned immediately");
         return Ok(None);
     } else {
         let mut cmd = std::process::Command::new(shell);
+        let run_cmd = if cfg!(target_os = "windows") {
+            format!("chcp 65001 > nul && {}", command)
+        } else {
+            command.to_string()
+        };
         cmd.arg(flag)
-            .arg(command)
+            .arg(&run_cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         #[cfg(windows)]
@@ -504,12 +556,18 @@ pub fn run_command(params: &Value) -> Result<Option<String>> {
         let timeout = std::time::Duration::from_secs(10);
         let start = std::time::Instant::now();
         loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = child.kill();
+                dbg_log!("[run_command] process terminated via StopFlag");
+                anyhow::bail!("Command execution cancelled by user.");
+            }
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if start.elapsed() >= timeout {
                         let _ = child.stdout.take();
                         let _ = child.stderr.take();
+                        dbg_log!("[run_command] command timed out after 10s");
                         if capture {
                             return Ok(Some("[process still running after 10s — treated as background app]".to_string()));
                         }
@@ -526,24 +584,83 @@ pub fn run_command(params: &Value) -> Result<Option<String>> {
     if capture {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = if stderr.is_empty() {
-            stdout
-        } else {
-            format!("{}\n[stderr]: {}", stdout, stderr)
-        };
+        let combined = format!(
+            "exit_code: {}\nstdout: {}\nstderr: {}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            if stderr.is_empty() { "none".to_string() } else { stderr.trim().to_string() }
+        );
+        trace_log!("[run_command] command output: {}", combined);
         Ok(Some(combined))
     } else {
+        dbg_log!("[run_command] command success (output not captured)");
         Ok(None)
     }
 }
 
-pub fn run_script(params: &Value) -> Result<Option<String>> {
+fn escape_powershell_double_quoted(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '`' => {
+                escaped.push('`');
+                escaped.push('`');
+            }
+            '$' => {
+                escaped.push('`');
+                escaped.push('$');
+            }
+            '"' => {
+                escaped.push('`');
+                escaped.push('"');
+            }
+            _ => {
+                escaped.push(c);
+            }
+        }
+    }
+    escaped
+}
+
+fn sanitize_powershell_script(script: &str) -> String {
+    let mut result = script.to_string();
+
+    // Regex for $data = "..." followed by either $rows = $data or $data -replace
+    if let Ok(re1) = regex::Regex::new(r#"(?is)(^\s*|\;\s*|\r?\n\s*)(\$data\s*=\s*")([\s\S]*?)("\s*(?:\r?\n|;)\s*(?:\$rows|\$data\s*-replace))"#) {
+        result = re1.replace_all(&result, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let var_assign = &caps[2];
+            let content = &caps[3];
+            let suffix = &caps[4];
+            let escaped = escape_powershell_double_quoted(content);
+            format!("{}{}{}{}", prefix, var_assign, escaped, suffix)
+        }).to_string();
+    }
+
+    // Regex for $d.Content.Text = "..." followed by $d.SaveAs2
+    if let Ok(re2) = regex::Regex::new(r#"(?is)(^\s*|\;\s*|\r?\n\s*)(\$d\.Content\.Text\s*=\s*")([\s\S]*?)("\s*(?:\r?\n|;)\s*\$d\.SaveAs2)"#) {
+        result = re2.replace_all(&result, |caps: &regex::Captures| {
+            let prefix = &caps[1];
+            let var_assign = &caps[2];
+            let content = &caps[3];
+            let suffix = &caps[4];
+            let escaped = escape_powershell_double_quoted(content);
+            format!("{}{}{}{}", prefix, var_assign, escaped, suffix)
+        }).to_string();
+    }
+
+    result
+}
+
+pub fn run_script(params: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<String>> {
     let script = json_str(params, "script").context("run_script requires a 'script' param")?;
     let capture = params.get("capture_output").and_then(|v| v.as_bool()).unwrap_or(true);
+    trace_log!("[run_script] executing script (capture={}):\n--- SCRIPT START ---\n{}\n--- SCRIPT END ---", capture, script);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("powershell");
-        let full_script = format!("$ErrorActionPreference = 'Stop'; {}", script);
+        let sanitized_script = sanitize_powershell_script(script);
+        let full_script = format!("$ErrorActionPreference = 'Stop'; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8; {}", sanitized_script);
         c.args(["-NoProfile", "-NonInteractive", "-Command", &full_script]);
         c
     } else {
@@ -565,6 +682,11 @@ pub fn run_script(params: &Value) -> Result<Option<String>> {
     let mut timed_out = false;
 
     loop {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = child.kill();
+            dbg_log!("[run_script] script terminated via StopFlag");
+            anyhow::bail!("Script execution cancelled by user.");
+        }
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
@@ -580,6 +702,7 @@ pub fn run_script(params: &Value) -> Result<Option<String>> {
     }
 
     if timed_out {
+        dbg_log!("[run_script] script execution timed out after 12s");
         if capture {
             return Ok(Some("exit_code: 1\nstdout: \nstderr: Error: Script execution timed out after 12 seconds. Do NOT use blocking operations (like -Wait or synchronous loops) unless they exit quickly. If starting a GUI application, run it in the background and do not wait for it to close.".to_string()));
         } else {
@@ -598,8 +721,10 @@ pub fn run_script(params: &Value) -> Result<Option<String>> {
             stdout.trim(),
             if stderr.is_empty() { "none".to_string() } else { stderr.trim().to_string() }
         );
+        trace_log!("[run_script] script result:\n{}", combined);
         Ok(Some(combined))
     } else {
+        dbg_log!("[run_script] script success (output not captured)");
         Ok(None)
     }
 }
@@ -658,4 +783,67 @@ fn parse_modifier(s: &str) -> Result<Key> {
         "meta" | "super" | "cmd" | "win" => Ok(Key::Meta),
         other => anyhow::bail!("Unknown modifier key: '{}'", other),
     }
+}
+
+pub fn read_file(params: &Value) -> Result<Option<String>> {
+    let path_str = params.get("path")
+        .and_then(|x| x.as_str())
+        .with_context(|| "Missing parameter 'path'")?;
+    
+    let start_line = params.get("start_line").and_then(|v| v.as_i64());
+    let end_line = params.get("end_line").and_then(|v| v.as_i64());
+
+    let content = std::fs::read_to_string(path_str)
+        .with_context(|| format!("Failed to read file: {}", path_str))?;
+
+    if start_line.is_none() && end_line.is_none() {
+        return Ok(Some(content));
+    }
+
+    let start = start_line.unwrap_or(1).max(1) as usize;
+    let end = end_line.unwrap_or(i64::MAX).max(1) as usize;
+
+    let lines: Vec<&str> = content.lines().collect();
+    if start > lines.len() {
+        return Ok(Some(format!("[Range starting line {} exceeds total lines {}]", start, lines.len())));
+    }
+
+    let end_limit = end.min(lines.len());
+    if start > end_limit {
+        return Ok(Some(format!("[Invalid range: start_line {} is greater than end_line {}]", start, end_limit)));
+    }
+
+    let sliced = &lines[start - 1..end_limit];
+    Ok(Some(sliced.join("\n")))
+}
+
+pub fn str_replace(params: &Value) -> Result<Option<String>> {
+    let path_str = params.get("path")
+        .and_then(|x| x.as_str())
+        .with_context(|| "Missing parameter 'path'")?;
+    
+    let find_str = params.get("find")
+        .and_then(|x| x.as_str())
+        .with_context(|| "Missing parameter 'find'")?;
+
+    let replace_str = params.get("replace")
+        .and_then(|x| x.as_str())
+        .with_context(|| "Missing parameter 'replace'")?;
+
+    let content = std::fs::read_to_string(path_str)
+        .with_context(|| format!("Failed to read file: {}", path_str))?;
+
+    let count = content.matches(find_str).count();
+    if count == 0 {
+        anyhow::bail!("Target string to replace not found in the file: '{}'", find_str);
+    }
+    if count > 1 {
+        anyhow::bail!("Target string to replace is not unique (found {} occurrences) in: '{}'", count, find_str);
+    }
+
+    let new_content = content.replace(find_str, replace_str);
+    std::fs::write(path_str, new_content)
+        .with_context(|| format!("Failed to write updated contents back to: {}", path_str))?;
+
+    Ok(Some("String replaced successfully.".to_string()))
 }

@@ -504,74 +504,337 @@ function stripTtsFeedback(transcript, spokenText) {
   return transWords.slice(startIndex).join(' ');
 }
 
+let currentGalleryIndex = -1;
+let galleryMediaList = [];
+
 function openLightbox(imgUrl) {
-  let lb = document.getElementById('global-lightbox');
-  if (!lb) {
-    lb = document.createElement('div');
-    lb.id = 'global-lightbox';
-    lb.style.position = 'fixed';
-    lb.style.top = '0';
-    lb.style.left = '0';
-    lb.style.width = '100vw';
-    lb.style.height = '100vh';
-    lb.style.background = 'rgba(0, 0, 0, 0.9)';
-    lb.style.display = 'flex';
-    lb.style.alignItems = 'center';
-    lb.style.justifyContent = 'center';
-    lb.style.zIndex = '999999';
-    lb.style.opacity = '0';
-    lb.style.transition = 'opacity 0.25s ease';
-    lb.style.cursor = 'zoom-out';
-    
-    const closeBtn = document.createElement('button');
-    closeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>';
-    closeBtn.style.position = 'absolute';
-    closeBtn.style.top = '20px';
-    closeBtn.style.right = '20px';
-    closeBtn.style.background = 'rgba(255,255,255,0.1)';
-    closeBtn.style.border = 'none';
-    closeBtn.style.color = '#fff';
-    closeBtn.style.borderRadius = '50%';
-    closeBtn.style.width = '40px';
-    closeBtn.style.height = '40px';
-    closeBtn.style.cursor = 'pointer';
-    closeBtn.style.display = 'flex';
-    closeBtn.style.alignItems = 'center';
-    closeBtn.style.justifyContent = 'center';
-    closeBtn.style.transition = 'background 0.2s';
-    
-    closeBtn.addEventListener('mouseenter', () => closeBtn.style.background = 'rgba(255,255,255,0.2)');
-    closeBtn.addEventListener('mouseleave', () => closeBtn.style.background = 'rgba(255,255,255,0.1)');
-    lb.appendChild(closeBtn);
-
-    const img = document.createElement('img');
-    img.id = 'global-lightbox-img';
-    img.style.maxWidth = '90%';
-    img.style.maxHeight = '90%';
-    img.style.borderRadius = '8px';
-    img.style.boxShadow = '0 20px 50px rgba(0,0,0,0.5)';
-    img.style.transform = 'scale(0.95)';
-    img.style.transition = 'transform 0.25s ease';
-    lb.appendChild(img);
-
-    const closeLightbox = () => {
-      lb.style.opacity = '0';
-      img.style.transform = 'scale(0.95)';
-      setTimeout(() => {
-        lb.style.display = 'none';
-      }, 250);
-    };
-
-    lb.addEventListener('click', closeLightbox);
-    document.body.appendChild(lb);
+  buildGalleryMediaList();
+  const idx = galleryMediaList.findIndex(item => item.src === imgUrl);
+  if (idx !== -1) {
+    currentGalleryIndex = idx;
+    openFullscreenGallery();
+  } else {
+    // Fallback: single item gallery
+    galleryMediaList = [{
+      type: 'image',
+      element: null,
+      src: imgUrl,
+      title: 'Image',
+      config: ''
+    }];
+    currentGalleryIndex = 0;
+    openFullscreenGallery();
   }
+}
 
-  const imgEl = document.getElementById('global-lightbox-img');
-  imgEl.src = imgUrl;
-  lb.style.display = 'flex';
-  lb.offsetHeight; // trigger reflow
-  lb.style.opacity = '1';
-  imgEl.style.transform = 'scale(1)';
+function buildGalleryMediaList() {
+  galleryMediaList = [];
+  const chatMessages = document.getElementById('messages');
+  if (!chatMessages) return;
+  
+  // Find all elements that are marked as gallery-wrapped
+  const mediaEls = chatMessages.querySelectorAll('.gallery-wrapped');
+  mediaEls.forEach(el => {
+    let type = '';
+    let src = '';
+    let title = '';
+    let config = '';
+    
+    if (el.tagName === 'IMG') {
+      type = 'image';
+      src = el.src;
+      title = el.alt || 'Image';
+    } else if (el.tagName === 'VIDEO') {
+      type = 'video';
+      src = el.src || el.querySelector('source')?.src || '';
+      title = 'Video';
+    } else if (el.tagName === 'AUDIO') {
+      type = 'audio';
+      src = el.src || el.querySelector('source')?.src || '';
+      title = 'Audio';
+    } else if (el.classList.contains('lazy-map') || el.classList.contains('rendered-map')) {
+      type = 'map';
+      config = el.getAttribute('data-config');
+      title = 'Map';
+    }
+    
+    if (type) {
+      galleryMediaList.push({
+        type,
+        element: el,
+        src,
+        title,
+        config
+      });
+    }
+  });
+}
+
+function openFullscreenGallery() {
+  let gallery = document.getElementById('global-gallery');
+  if (!gallery) {
+    gallery = document.createElement('div');
+    gallery.id = 'global-gallery';
+    gallery.className = 'gallery-overlay';
+    
+    gallery.innerHTML = `
+      <div class="gallery-backdrop"></div>
+      <button class="gallery-close-btn" title="Close Gallery">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+      </button>
+      <button class="gallery-nav-btn prev-btn" title="Previous Media">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"></polyline></svg>
+      </button>
+      <button class="gallery-nav-btn next-btn" title="Next Media">
+        <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+      </button>
+      <div class="gallery-content-area"></div>
+      <div class="gallery-info-bar">
+        <span class="gallery-title">Media Title</span>
+        <span class="gallery-counter">1 / 5</span>
+      </div>
+    `;
+    
+    document.body.appendChild(gallery);
+    
+    gallery.querySelector('.gallery-close-btn').addEventListener('click', closeGallery);
+    gallery.querySelector('.gallery-backdrop').addEventListener('click', closeGallery);
+    gallery.querySelector('.prev-btn').addEventListener('click', navigatePrev);
+    gallery.querySelector('.next-btn').addEventListener('click', navigateNext);
+    
+    document.addEventListener('keydown', handleGalleryKeys);
+  }
+  
+  gallery.style.display = 'flex';
+  gallery.offsetHeight; // trigger reflow
+  gallery.classList.add('visible');
+  
+  renderCurrentGalleryItem();
+}
+
+function renderCurrentGalleryItem() {
+  const gallery = document.getElementById('global-gallery');
+  if (!gallery || currentGalleryIndex < 0 || currentGalleryIndex >= galleryMediaList.length) return;
+  
+  const item = galleryMediaList[currentGalleryIndex];
+  const contentArea = gallery.querySelector('.gallery-content-area');
+  const titleEl = gallery.querySelector('.gallery-title');
+  const counterEl = gallery.querySelector('.gallery-counter');
+  
+  // Pause any playing audio/video from previous item
+  const existingMedia = contentArea.querySelectorAll('video, audio');
+  existingMedia.forEach(el => el.pause());
+  
+  contentArea.innerHTML = '';
+  
+  titleEl.textContent = item.title;
+  counterEl.textContent = `${currentGalleryIndex + 1} / ${galleryMediaList.length}`;
+  
+  const prevBtn = gallery.querySelector('.prev-btn');
+  const nextBtn = gallery.querySelector('.next-btn');
+  prevBtn.style.display = galleryMediaList.length > 1 ? 'flex' : 'none';
+  nextBtn.style.display = galleryMediaList.length > 1 ? 'flex' : 'none';
+  
+  if (item.type === 'image') {
+    const img = document.createElement('img');
+    img.src = item.src;
+    img.className = 'gallery-main-image';
+    contentArea.appendChild(img);
+  } else if (item.type === 'video') {
+    const vid = document.createElement('video');
+    vid.src = item.src;
+    vid.controls = true;
+    vid.autoplay = true;
+    vid.className = 'gallery-main-video';
+    contentArea.appendChild(vid);
+  } else if (item.type === 'audio') {
+    const audioCard = document.createElement('div');
+    audioCard.className = 'gallery-audio-card';
+    audioCard.innerHTML = `
+      <div class="audio-card-icon-wrapper">
+        <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      </div>
+      <div class="audio-card-title">${item.title}</div>
+      <audio src="${item.src}" controls autoplay style="width: 100%; max-width: 400px; margin-top: 20px;"></audio>
+    `;
+    contentArea.appendChild(audioCard);
+  } else if (item.type === 'map') {
+    const mapContainer = document.createElement('div');
+    const mapId = `gallery-map-${Math.random().toString(36).substr(2, 9)}`;
+    mapContainer.id = mapId;
+    mapContainer.className = 'gallery-map-container';
+    contentArea.appendChild(mapContainer);
+    
+    if (window.L) {
+      try {
+        let jsCode = item.config;
+        if (item.config.includes('---')) {
+          jsCode = item.config.split('---')[0].trim();
+        }
+        
+        const map = window.L.map(mapId);
+        window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+        
+        const runConfig = new Function('map', 'L', jsCode);
+        runConfig(map, window.L);
+        
+        setTimeout(() => {
+          map.invalidateSize();
+        }, 300);
+      } catch (err) {
+        console.warn("Fullscreen map rendering failed:", err);
+        renderMapFallback(mapContainer, item.config);
+      }
+    } else {
+      renderMapFallback(mapContainer, item.config);
+    }
+  }
+}
+
+function renderMapFallback(container, config) {
+  const textFallback = extractCleanFallback(config);
+  container.innerHTML = `
+    <div class="map-fallback-card fullscreen-mode">
+      <div class="map-fallback-header">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+        <span>Location Details (Offline Fallback)</span>
+      </div>
+      <div class="map-fallback-body">
+        ${escHtml(textFallback).replace(/\n/g, '<br>')}
+      </div>
+    </div>
+  `;
+}
+
+function closeGallery() {
+  const gallery = document.getElementById('global-gallery');
+  if (gallery) {
+    const mediaElements = gallery.querySelectorAll('video, audio');
+    mediaElements.forEach(el => el.pause());
+    
+    gallery.classList.remove('visible');
+    setTimeout(() => {
+      gallery.style.display = 'none';
+      gallery.querySelector('.gallery-content-area').innerHTML = '';
+    }, 250);
+  }
+}
+
+function navigatePrev() {
+  if (galleryMediaList.length <= 1) return;
+  currentGalleryIndex = (currentGalleryIndex - 1 + galleryMediaList.length) % galleryMediaList.length;
+  renderCurrentGalleryItem();
+}
+
+function navigateNext() {
+  if (galleryMediaList.length <= 1) return;
+  currentGalleryIndex = (currentGalleryIndex + 1) % galleryMediaList.length;
+  renderCurrentGalleryItem();
+}
+
+function handleGalleryKeys(e) {
+  const gallery = document.getElementById('global-gallery');
+  if (!gallery || gallery.style.display === 'none' || !gallery.classList.contains('visible')) return;
+  
+  if (e.key === 'Escape') {
+    closeGallery();
+  } else if (e.key === 'ArrowLeft') {
+    navigatePrev();
+  } else if (e.key === 'ArrowRight') {
+    navigateNext();
+  }
+}
+
+function triggerFullscreenMedia(targetEl) {
+  buildGalleryMediaList();
+  const idx = galleryMediaList.findIndex(item => item.element === targetEl);
+  if (idx !== -1) {
+    currentGalleryIndex = idx;
+    openFullscreenGallery();
+  }
+}
+
+function attachFullscreenButtons(container) {
+  if (!container) return;
+  
+  // 1. Process images
+  const images = container.querySelectorAll('.user-msg-img, .assistant-inline-img, .web-search-img');
+  images.forEach(img => {
+    if (img.classList.contains('gallery-wrapped')) return;
+    img.classList.add('gallery-wrapped');
+    
+    img.style.cursor = 'zoom-in';
+    img.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      triggerFullscreenMedia(img);
+    });
+    
+    const parent = img.parentElement;
+    if (parent) {
+      addExpandButton(parent, () => triggerFullscreenMedia(img));
+    }
+  });
+  
+  // 2. Process video tags
+  const videos = container.querySelectorAll('video');
+  videos.forEach(vid => {
+    if (vid.classList.contains('gallery-wrapped')) return;
+    vid.classList.add('gallery-wrapped');
+    
+    const wrapper = document.createElement('div');
+    wrapper.className = 'media-wrap video-wrap';
+    vid.parentNode.insertBefore(wrapper, vid);
+    wrapper.appendChild(vid);
+    
+    addExpandButton(wrapper, () => triggerFullscreenMedia(vid));
+  });
+  
+  // 3. Process audio tags
+  const audios = container.querySelectorAll('audio');
+  audios.forEach(aud => {
+    if (aud.classList.contains('gallery-wrapped')) return;
+    aud.classList.add('gallery-wrapped');
+    
+    const wrapper = document.createElement('div');
+    wrapper.className = 'media-wrap audio-wrap';
+    aud.parentNode.insertBefore(wrapper, aud);
+    wrapper.appendChild(aud);
+    
+    addExpandButton(wrapper, () => triggerFullscreenMedia(aud));
+  });
+  
+  // 4. Process maps
+  const maps = container.querySelectorAll('.lazy-map, .rendered-map');
+  maps.forEach(mapEl => {
+    if (mapEl.classList.contains('gallery-wrapped')) return;
+    mapEl.classList.add('gallery-wrapped');
+    
+    mapEl.style.position = 'relative';
+    addExpandButton(mapEl, () => triggerFullscreenMedia(mapEl));
+  });
+}
+
+function addExpandButton(parent, onClick) {
+  const btn = document.createElement('button');
+  btn.className = 'media-expand-btn';
+  btn.innerHTML = `
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5">
+      <polyline points="15 3 21 3 21 9"></polyline>
+      <polyline points="9 21 3 21 3 15"></polyline>
+      <line x1="21" y1="3" x2="14" y2="10"></line>
+      <line x1="3" y1="21" x2="10" y2="14"></line>
+    </svg>
+  `;
+  btn.title = 'View fullscreen';
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    e.preventDefault();
+    onClick();
+  });
+  parent.appendChild(btn);
 }
 
 const WELCOME_TRANSLATIONS = {
@@ -790,6 +1053,9 @@ function renderMd(text) {
       codeBlocks.push(html);
     } else if (['lottie', 'animation'].includes(l)) {
       const html = `<div class="lazy-lottie" data-config="${escAttr(raw)}"><pre class="lottie-raw-fallback">${escHtml(raw)}</pre></div>`;
+      codeBlocks.push(html);
+    } else if (['map', 'leaflet', 'location'].includes(l)) {
+      const html = `<div class="lazy-map" data-config="${escAttr(raw)}"><pre class="map-raw-fallback">${escAttr(raw)}</pre></div>`;
       codeBlocks.push(html);
     } else {
       const highlighted = highlightCode(raw, lang);
@@ -1132,10 +1398,6 @@ function renderMd(text) {
 
       masterHtml += `
           </div>
-          <div class="web-search-done">
-            <svg class="web-search-done-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
-            <span class="web-search-done-text">Search Completed</span>
-          </div>
       `;
 
       if (images.length > 0) {
@@ -1169,6 +1431,15 @@ function renderMd(text) {
         finalHtml = finalHtml.split(`\uFFFCZSEARCHBOXZ${i}Z\uFFFC`).join(searchBoxes[i]);
       }
     }
+  }
+
+  // Rewrite file:/// URLs to Tauri asset URLs using convertFileSrc
+  if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.convertFileSrc) {
+    finalHtml = finalHtml.replace(/(src=["'])(file:\/\/\/[^"'\s]+)(["'])/gi, (match, p1, p2, p3) => {
+      let filePath = decodeURIComponent(p2.substring(8));
+      let assetUrl = window.__TAURI__.core.convertFileSrc(filePath);
+      return p1 + assetUrl + p3;
+    });
   }
 
   return finalHtml;
@@ -1272,14 +1543,15 @@ function updateCitationPopupContent(item, index, total) {
   const title = popup.querySelector('.citation-popup-title');
   const snippet = popup.querySelector('.citation-popup-snippet');
   
+  const header = popup.querySelector('.citation-popup-header');
   const navContainer = popup.querySelector('.citation-popup-nav');
   if (total > 1) {
+    header.style.display = 'flex';
     navContainer.style.display = 'flex';
     pageSpan.style.display = 'inline';
     pageSpan.textContent = `${index + 1}/${total}`;
   } else {
-    navContainer.style.display = 'none';
-    pageSpan.style.display = 'none';
+    header.style.display = 'none';
   }
   
   favicon.src = `https://icons.duckduckgo.com/ip3/${item.domain}.ico`;
@@ -1344,6 +1616,53 @@ window.addEventListener('scroll', () => {
     citationPopup.classList.add('hidden');
   }
 }, { passive: true });
+
+function ensureLeafletLoaded() {
+  return new Promise((resolve, reject) => {
+    if (window.L) {
+      return resolve();
+    }
+    
+    let cssLink = document.querySelector('link[href*="leaflet.css"]');
+    if (!cssLink) {
+      cssLink = document.createElement('link');
+      cssLink.rel = 'stylesheet';
+      cssLink.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
+      document.head.appendChild(cssLink);
+    }
+    
+    let scriptTag = document.querySelector('script[src*="leaflet.js"]');
+    if (scriptTag) {
+      const interval = setInterval(() => {
+        if (window.L) {
+          clearInterval(interval);
+          resolve();
+        }
+      }, 50);
+      setTimeout(() => {
+        clearInterval(interval);
+        reject(new Error("Timeout waiting for Leaflet to load"));
+      }, 5000);
+    } else {
+      scriptTag = document.createElement('script');
+      scriptTag.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      scriptTag.onload = () => resolve();
+      scriptTag.onerror = () => reject(new Error("Failed to load Leaflet script"));
+      document.head.appendChild(scriptTag);
+    }
+  });
+}
+
+function extractCleanFallback(configStr, defaultText = "Map details are currently unavailable.") {
+  if (!configStr) return defaultText;
+  if (configStr.includes('---')) {
+    return configStr.split('---').slice(1).join('---').trim();
+  }
+  if (configStr.includes('map.setView') || configStr.includes('L.')) {
+    return defaultText;
+  }
+  return configStr;
+}
 
 function renderRichMediaInElement(container, isStreaming = false) {
   if (!container) return;
@@ -1467,6 +1786,85 @@ function renderRichMediaInElement(container, isStreaming = false) {
         console.warn("Lottie parse/render error:", err);
         el.innerHTML = `<pre class="lottie-raw-fallback">${escHtml(configStr)}</pre>`;
       }
+    });
+  }
+
+  // 5.5. Render Leaflet maps
+  const maps = container.querySelectorAll('.lazy-map');
+  if (maps.length > 0 && !isStreaming) {
+    ensureLeafletLoaded().then(() => {
+      maps.forEach(el => {
+        const configStr = el.getAttribute('data-config');
+        if (!configStr || configStr.trim() === '') {
+          el.style.display = 'none';
+          return;
+        }
+        try {
+          let jsCode = configStr;
+          let textFallback = configStr;
+          if (configStr.includes('---')) {
+            const parts = configStr.split('---');
+            jsCode = parts[0].trim();
+            textFallback = parts.slice(1).join('---').trim();
+          }
+
+          const mapId = `map-render-${Math.random().toString(36).substr(2, 9)}`;
+          const mapDiv = document.createElement('div');
+          mapDiv.id = mapId;
+          mapDiv.className = 'rendered-map-container';
+          
+          el.innerHTML = '';
+          el.appendChild(mapDiv);
+          
+          const map = window.L.map(mapId);
+          window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+          }).addTo(map);
+          
+          const runConfig = new Function('map', 'L', jsCode);
+          runConfig(map, window.L);
+          
+          el.classList.remove('lazy-map');
+          el.classList.add('rendered-map');
+          
+          setTimeout(() => {
+            map.invalidateSize();
+          }, 200);
+          
+          syncWindowSize();
+        } catch (err) {
+          console.warn("Leaflet render error:", err);
+          const textFallback = extractCleanFallback(configStr, "Map rendering failed due to syntax or token truncation error.");
+          el.innerHTML = `
+            <div class="map-fallback-card">
+              <div class="map-fallback-header">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+                <span>Location Details (Offline Fallback)</span>
+              </div>
+              <div class="map-fallback-body">
+                ${escHtml(textFallback).replace(/\n/g, '<br>')}
+              </div>
+            </div>
+          `;
+        }
+      });
+    }).catch(err => {
+      console.warn("Failed to load Leaflet, showing text fallback:", err);
+      maps.forEach(el => {
+        const configStr = el.getAttribute('data-config');
+        const textFallback = extractCleanFallback(configStr, "Map details are currently unavailable (Offline).");
+        el.innerHTML = `
+          <div class="map-fallback-card">
+            <div class="map-fallback-header">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>
+              <span>Location Details (Offline Fallback)</span>
+            </div>
+            <div class="map-fallback-body">
+              ${escHtml(textFallback).replace(/\n/g, '<br>')}
+            </div>
+          </div>
+        `;
+      });
     });
   }
 
@@ -1623,6 +2021,10 @@ function renderRichMediaInElement(container, isStreaming = false) {
       // Add event listeners to the pill
       setupCitationPillEvents(pill);
     });
+  }
+
+  if (typeof attachFullscreenButtons === 'function') {
+    attachFullscreenButtons(container);
   }
 }
 
@@ -1946,12 +2348,10 @@ function speakNextQueueItem() {
       updateAllTtsButtons();
       state.ttsLastSpokeTime = Date.now();
       state.currentSpokenText = '';
-      if (state.listening) {
-        state.voiceState = 'listening';
-        updateVoiceVisuals('listening');
-        if (recognition) {
-          try { recognition.start(); } catch(_) {}
-        }
+      state.voiceState = state.listening ? 'listening' : null;
+      updateVoiceVisuals(state.voiceState || 'listening');
+      if (state.listening && recognition) {
+        try { recognition.start(); } catch(_) {}
       }
     }
     return;
@@ -1964,6 +2364,18 @@ function speakNextQueueItem() {
 
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = detectLanguage(text);
+
+  // Set system voice fallback if selected
+  const selectedSystemVoiceName = localStorage.getItem('systemVoiceName');
+  if (selectedSystemVoiceName && window.speechSynthesis) {
+    const voices = window.speechSynthesis.getVoices();
+    const voice = voices.find(v => v.name === selectedSystemVoiceName);
+    if (voice) {
+      utterance.voice = voice;
+      utterance.lang = voice.lang;
+    }
+  }
+
   state.ttsActiveUtterance = utterance;
 
   updateAllTtsButtons();
@@ -2045,9 +2457,8 @@ function cancelTtsQueue() {
     ttsKeepAliveInterval = null;
   }
 
-  if (state.listening && recognition) {
-    try { recognition.start(); } catch(_) {}
-  }
+  state.voiceState = state.listening ? 'listening' : null;
+  updateVoiceVisuals(state.voiceState || 'listening');
 }
 
 function handleStreamError(stream, accumulatedText, errorMsg) {
@@ -2143,6 +2554,90 @@ function formatSearchWidget(query, results, images) {
   return html;
 }
 
+function createMediaSkeletonLoader(type, prompt) {
+  const el = document.createElement('div');
+  el.className = 'msg assistant media-skeleton-loader';
+  el.dataset.mediaType = type;
+  el.dataset.prompt = prompt;
+
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  let iconSvg = '';
+  let typeLabel = '';
+  let loaderVisual = '';
+
+  if (type === 'image') {
+    typeLabel = 'Image';
+    iconSvg = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--accent)" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`;
+    loaderVisual = `
+      <div class="skeleton-image-grid">
+        <div class="skeleton-pixel-block" style="animation-delay: 0.1s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.3s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.2s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.4s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.5s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.3s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.1s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.2s"></div>
+        <div class="skeleton-pixel-block" style="animation-delay: 0.4s"></div>
+      </div>
+    `;
+  } else if (type === 'video') {
+    typeLabel = 'Video';
+    iconSvg = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--accent)" stroke-width="2"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+    loaderVisual = `
+      <div class="skeleton-video-strip">
+        <div class="skeleton-video-frame"></div>
+        <div class="skeleton-video-sweep"></div>
+      </div>
+    `;
+  } else if (type === 'music') {
+    typeLabel = 'Audio Track';
+    iconSvg = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+    loaderVisual = `
+      <div class="skeleton-audio-waves">
+        <span class="audio-wave-bar" style="height: 40%; animation-delay: 0.1s"></span>
+        <span class="audio-wave-bar" style="height: 80%; animation-delay: 0.3s"></span>
+        <span class="audio-wave-bar" style="height: 55%; animation-delay: 0.2s"></span>
+        <span class="audio-wave-bar" style="height: 70%; animation-delay: 0.4s"></span>
+        <span class="audio-wave-bar" style="height: 30%; animation-delay: 0.1s"></span>
+        <span class="audio-wave-bar" style="height: 60%; animation-delay: 0.3s"></span>
+        <span class="audio-wave-bar" style="height: 85%; animation-delay: 0.5s"></span>
+        <span class="audio-wave-bar" style="height: 40%; animation-delay: 0.2s"></span>
+      </div>
+    `;
+  }
+
+  el.innerHTML = `
+    <div class="msg-bubble" style="padding: 0; background: transparent; max-width: 100%;">
+      <div class="media-skeleton-card">
+        <div class="media-skeleton-header">
+          <div class="media-skeleton-icon-wrapper pulse-glow">
+            ${iconSvg}
+          </div>
+          <div class="media-skeleton-info">
+            <div class="media-skeleton-title">Generating local ${typeLabel}...</div>
+            <div class="media-skeleton-desc">Creating AI synthesis, this may take a moment.</div>
+          </div>
+        </div>
+        <div class="media-skeleton-body">
+          ${loaderVisual}
+          <div class="media-skeleton-prompt">"${escHtml(prompt)}"</div>
+        </div>
+        <div class="media-skeleton-progress-container">
+          <div class="media-skeleton-progress-line"></div>
+        </div>
+      </div>
+    </div>
+    <div class="msg-meta">
+      <span class="msg-time">${timeStr}</span>
+    </div>
+  `;
+
+  return el;
+}
+
 function createThinkingElement(secs, stepsList) {
   const el = document.createElement('div');
   el.className = 'msg thinking completed';
@@ -2174,6 +2669,13 @@ function createThinkingElement(secs, stepsList) {
         } catch(_) {
           chip.textContent = step;
         }
+      } else if (step.startsWith('JSON_MEDIA_GEN:')) {
+        try {
+          const payload = JSON.parse(step.substring(15));
+          chip.innerHTML = `<span style="color:var(--accent); font-weight:600">Generating ${payload.type}:</span> <span style="font-style:italic">"${escHtml(payload.prompt)}"</span>`;
+        } catch(_) {
+          chip.textContent = step;
+        }
       } else {
         chip.textContent = step;
       }
@@ -2192,8 +2694,52 @@ function createThinkingElement(secs, stepsList) {
   return el;
 }
 
+function cleanErrorMessage(txt) {
+  if (typeof txt !== 'string') return txt;
+  
+  const jsonStart = txt.indexOf('{');
+  if (jsonStart !== -1) {
+    const jsonEnd = txt.lastIndexOf('}');
+    if (jsonEnd !== -1 && jsonEnd > jsonStart) {
+      const prefix = txt.substring(0, jsonStart).trim();
+      const jsonStr = txt.substring(jsonStart, jsonEnd + 1);
+      const suffix = txt.substring(jsonEnd + 1).trim();
+      
+      try {
+        const parsed = JSON.parse(jsonStr);
+        let extractedErr = '';
+        if (parsed && typeof parsed === 'object') {
+          if (typeof parsed.error === 'string') {
+            extractedErr = parsed.error;
+          } else if (parsed.error && typeof parsed.error === 'object' && typeof parsed.error.message === 'string') {
+            extractedErr = parsed.error.message;
+          } else if (typeof parsed.message === 'string') {
+            extractedErr = parsed.message;
+          }
+        }
+        
+        if (extractedErr) {
+          let cleanMsg = prefix;
+          if (cleanMsg.endsWith(':')) {
+            cleanMsg = cleanMsg.slice(0, -1).trim();
+          }
+          cleanMsg = cleanMsg ? `${cleanMsg}: ${extractedErr}` : extractedErr;
+          if (suffix) {
+            cleanMsg += ' ' + suffix;
+          }
+          return cleanMsg;
+        }
+      } catch (_) {}
+    }
+  }
+  return txt;
+}
+
 // ── Add message ─────────────────────────────────────────────────────────
 function createMessageElement(text, role = 'assistant') {
+  if (role === 'error') {
+    text = cleanErrorMessage(text);
+  }
   if (role === 'thinking') {
     let secs = 0;
     let stepsList = [];
@@ -3035,6 +3581,13 @@ function updateThinkingLabel(msg) {
   
   if (msg.startsWith('JSON_SEARCH:')) {
     if (lbl) lbl.textContent = 'Searching...';
+  } else if (msg.startsWith('JSON_MEDIA_GEN:')) {
+    try {
+      const payload = JSON.parse(msg.substring(15));
+      if (lbl) lbl.textContent = 'Generating ' + payload.type + '...';
+    } catch (_) {
+      if (lbl) lbl.textContent = 'Generating media...';
+    }
   } else {
     if (lbl) lbl.textContent = msg;
   }
@@ -3053,6 +3606,13 @@ function updateThinkingLabel(msg) {
         const payload = JSON.parse(msg.substring(12));
         chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
         renderRichMediaInElement(chip);
+      } catch(_) {
+        chip.textContent = msg;
+      }
+    } else if (msg.startsWith('JSON_MEDIA_GEN:')) {
+      try {
+        const payload = JSON.parse(msg.substring(15));
+        chip.innerHTML = `<span style="color:var(--accent); font-weight:600">Generating ${payload.type}:</span> <span style="font-style:italic">"${escHtml(payload.prompt)}"</span>`;
       } catch(_) {
         chip.textContent = msg;
       }
@@ -3146,6 +3706,17 @@ function stopThinking() {
 // ── Send message ────────────────────────────────────────────────────────
 // ── Send message ────────────────────────────────────────────────────────
 async function sendMessage(text) {
+  if (state.activeClarification) {
+    const inputPrompt = (text ?? input.value).trim();
+    if (inputPrompt.length > 0) {
+      input.value = '';
+      input.style.height = isMobile ? '28px' : '24px';
+      barShell.classList.remove('has-input-text');
+      updateActionBtn();
+      submitClarificationAnswer(inputPrompt);
+    }
+    return;
+  }
   if (!state.currentConvId) {
     try {
       state.currentConvId = await invoke('get_current_session_id');
@@ -3160,6 +3731,12 @@ async function sendMessage(text) {
   
   if (!inputPrompt && !hasAttachments) return;
   if (state.thinking) return;
+
+  if (!state.cfg?.ai?.model) {
+    toast("Please select a model first before sending a message.");
+    openOverlay('overlay-model');
+    return;
+  }
 
   const images = state.attachments ? state.attachments.filter(att => att.type.startsWith('image/')) : [];
   if (images.length > 0 && !state.cfg.ai?.vision_capable) {
@@ -3438,81 +4015,251 @@ async function sendMessage(text) {
 }
 
 // ── Clarification UI ────────────────────────────────────────────────────
-function showClarification(question, options) {
-  const el = document.createElement('div');
-  el.className = 'msg assistant';
-  const opts = (options || []).map((opt, i) =>
-    `<button class="clarif-opt" data-idx="${i}">${escHtml(opt)}</button>`
-  ).join('');
-  el.innerHTML = `<div style="margin-bottom:8px">${renderMd(question)}</div>
-    <div class="clarif-wrap">${opts}</div>`;
-  msgs.appendChild(el);
-  msgs.scrollTop = msgs.scrollHeight;
+function hideClarificationPopover() {
+  const popover = $('clarification-popover');
+  if (popover) {
+    popover.classList.add('hidden');
+  }
+  const keyHint = $('clarification-key-hint');
+  if (keyHint) {
+    keyHint.classList.add('hidden');
+  }
+  const chipsContainer = $('input-chips');
+  if (chipsContainer) {
+    chipsContainer.innerHTML = '';
+    chipsContainer.classList.add('hidden');
+  }
+  const inputEl = $('input');
+  if (inputEl) {
+    inputEl.placeholder = "Ask anything...";
+  }
+  state.activeClarification = null;
+  syncWindowSize();
+}
 
-  el.querySelectorAll('.clarif-opt').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      el.querySelectorAll('.clarif-opt').forEach(b => b.classList.remove('selected'));
-      btn.classList.add('selected');
-      const chosen = options[+btn.dataset.idx];
-      const activeConvIdAtStart = state.currentConvId;
-      
-      if (!state.runningConvs) state.runningConvs = {};
-      state.runningConvs[activeConvIdAtStart] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant' };
-      if (state.finishedConvs) {
-        state.finishedConvs.delete(activeConvIdAtStart);
+async function submitClarificationAnswer(answerText) {
+  if (!state.activeClarification) return;
+  const { session_id } = state.activeClarification;
+  
+  hideClarificationPopover();
+  
+  if (!state.runningConvs) state.runningConvs = {};
+  state.runningConvs[session_id] = { accumulated: '', thinking: true, label: 'Thinking...', role: 'assistant' };
+  if (state.finishedConvs) {
+    state.finishedConvs.delete(session_id);
+  }
+  renderSidebarConvs();
+  renderConvList();
+
+  await invoke('answer_clarification', { answer: answerText, session_id: session_id });
+  addMsg(answerText, 'user');
+  startThinking();
+  try {
+    currentChatStream = null;
+    accumulatedChatReply = "";
+    const res = await invoke('continue_after_clarification', { session_id: session_id });
+    if (session_id !== state.currentConvId) {
+      if (state.runningConvs) {
+        delete state.runningConvs[session_id];
+        renderSidebarConvs();
+        renderConvList();
       }
+      if (state.finishedConvs) {
+        state.finishedConvs.add(session_id);
+      }
+      return;
+    }
+    const result = typeof res === 'string' ? res : JSON.stringify(res);
+    if (currentChatStream) {
+      currentChatStream.done(result);
+      currentChatStream = null;
+    } else {
+      addMsg(result, 'assistant');
+    }
+    stopThinking();
+  } catch (e) {
+    if (session_id !== state.currentConvId) {
+      return;
+    }
+    if (currentChatStream) {
+      currentChatStream.cancel();
+      currentChatStream = null;
+    }
+    stopThinking();
+    addMsg(e, 'error');
+  } finally {
+    if (state.runningConvs) {
+      delete state.runningConvs[session_id];
       renderSidebarConvs();
       renderConvList();
+    }
+    if (state.finishedConvs) {
+      state.finishedConvs.add(session_id);
+    }
+  }
+}
 
-      await invoke('answer_clarification', { answer: chosen, session_id: activeConvIdAtStart });
-      addMsg(chosen, 'user');
-      startThinking();
-      try {
-        currentChatStream = null;
-        accumulatedChatReply = "";
-        const res = await invoke('continue_after_clarification', { session_id: activeConvIdAtStart });
-        if (activeConvIdAtStart !== state.currentConvId) {
-          if (state.runningConvs) {
-            delete state.runningConvs[activeConvIdAtStart];
-            renderSidebarConvs();
-            renderConvList();
-          }
-          if (state.finishedConvs) {
-            state.finishedConvs.add(activeConvIdAtStart);
-          }
-          return;
-        }
-        const result = typeof res === 'string' ? res : JSON.stringify(res);
-        if (currentChatStream) {
-          currentChatStream.done(result);
-          currentChatStream = null;
-        } else {
-          addMsg(result, 'assistant');
-        }
-        stopThinking();
-      } catch (e) {
-        if (activeConvIdAtStart !== state.currentConvId) {
-          return;
-        }
-        if (currentChatStream) {
-          currentChatStream.cancel();
-          currentChatStream = null;
-        }
-        stopThinking();
-        addMsg(e, 'error');
-      } finally {
-        if (state.runningConvs) {
-          delete state.runningConvs[activeConvIdAtStart];
-          renderSidebarConvs();
-          renderConvList();
-        }
-        if (state.finishedConvs) {
-          state.finishedConvs.add(activeConvIdAtStart);
-        }
+function updateClarificationFocus(idx) {
+  if (!state.activeClarification) return;
+  const opts = state.activeClarification.options;
+  if (!opts) return;
+  
+  const totalItems = opts.length + 1; // Numbered options + 1 for Custom option
+  
+  // Wrap index around
+  if (idx < 0) idx = totalItems - 1;
+  if (idx >= totalItems) idx = 0;
+  
+  state.activeClarification.focusedIdx = idx;
+  
+  const popover = $('clarification-popover');
+  if (popover) {
+    popover.querySelectorAll('.clarif-popover-opt').forEach((btn, i) => {
+      if (i === idx) {
+        btn.classList.add('focused');
+        btn.scrollIntoView({ block: 'nearest' });
+      } else {
+        btn.classList.remove('focused');
       }
     });
-  });
+    
+    // Highlight the custom button if idx === opts.length
+    const customBtn = popover.querySelector('.clarif-popover-opt-custom');
+    if (customBtn) {
+      if (idx === opts.length) {
+        customBtn.classList.add('focused');
+        customBtn.scrollIntoView({ block: 'nearest' });
+      } else {
+        customBtn.classList.remove('focused');
+      }
+    }
+  }
+}
+
+function showClarification(question, options) {
+  const popover = $('clarification-popover');
+  if (!popover) return;
+  
+  const activeConvIdAtStart = state.currentConvId;
+  state.activeClarification = {
+    question,
+    options: options || [],
+    session_id: activeConvIdAtStart,
+    focusedIdx: 0
+  };
+  
+  // Set placeholder on input textarea to prompt user
+  const inputEl = $('input');
+  if (inputEl) {
+    inputEl.placeholder = "Or reply directly...";
+  }
+
+  // Render chips in the input area
+  const chipsContainer = $('input-chips');
+  if (chipsContainer) {
+    if (options && options.length > 0) {
+      chipsContainer.innerHTML = options.map((opt, i) => `
+        <button class="input-chip" data-idx="${i}">
+          ${escHtml(opt)}
+        </button>
+      `).join('');
+      chipsContainer.classList.remove('hidden');
+      
+      // Attach click listeners to chips
+      chipsContainer.querySelectorAll('.input-chip').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const chosen = options[+btn.dataset.idx];
+          submitClarificationAnswer(chosen);
+        });
+      });
+    } else {
+      chipsContainer.innerHTML = '';
+      chipsContainer.classList.add('hidden');
+    }
+  }
+  
+  // Render options list
+  const optsHtml = (options || []).map((opt, i) => `
+    <button class="clarif-popover-opt${i === 0 ? ' focused' : ''}" data-idx="${i}">
+      <span class="clarif-popover-badge">${i + 1}</span>
+      <span class="clarif-popover-text">${escHtml(opt)}</span>
+      <span class="clarif-popover-enter-icon">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="9 10 4 15 9 20"></polyline>
+          <path d="M20 4v7a4 4 0 0 1-4 4H4"></path>
+        </svg>
+      </span>
+    </button>
+  `).join('');
+  
+  popover.innerHTML = `
+    <div id="clarification-popover-header">
+      <div id="clarification-popover-title">${renderMd(question)}</div>
+      <button id="clarification-popover-close" title="Dismiss">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
+      </button>
+    </div>
+    <div id="clarification-popover-options">
+      ${optsHtml}
+    </div>
+    <div id="clarification-popover-footer">
+      <button class="clarif-popover-opt-custom" id="clarif-custom-btn">
+        <span class="clarif-custom-icon">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 20h9M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+          </svg>
+        </span>
+        <span class="clarif-custom-text">Something else</span>
+      </button>
+      <button class="clarif-popover-skip">Skip</button>
+    </div>
+  `;
+  
+  // Remove hidden class to display popover
+  popover.classList.remove('hidden');
+  
+  // Show key navigation hint
+  const keyHint = $('clarification-key-hint');
+  if (keyHint) {
+    keyHint.classList.remove('hidden');
+  }
+  
   syncWindowSize();
+  
+  // Attach button click listeners
+  popover.querySelectorAll('.clarif-popover-opt').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const chosen = options[+btn.dataset.idx];
+      submitClarificationAnswer(chosen);
+    });
+  });
+  
+  const customBtn = popover.querySelector('#clarif-custom-btn');
+  if (customBtn) {
+    customBtn.addEventListener('click', () => {
+      if (inputEl) {
+        inputEl.focus();
+      }
+      updateClarificationFocus((options || []).length);
+    });
+  }
+  
+  const closeBtn = popover.querySelector('#clarification-popover-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => {
+      submitClarificationAnswer("");
+    });
+  }
+  
+  const skipBtn = popover.querySelector('.clarif-popover-skip');
+  if (skipBtn) {
+    skipBtn.addEventListener('click', () => {
+      submitClarificationAnswer("");
+    });
+  }
 }
 
 // ── VAD (Voice Activity Detection) state ───────────────────────────────
@@ -3898,7 +4645,11 @@ function startVisualizer() {
 function updateVoiceVisuals(voiceState) {
   updateActionBtn();
   if (voiceState === 'listening') {
-    input.placeholder = 'Listening...';
+    if (state.listening) {
+      input.placeholder = 'Listening...';
+    } else {
+      input.placeholder = 'Ask anything...';
+    }
   } else if (voiceState === 'thinking') {
     input.placeholder = 'Thinking...';
   } else if (voiceState === 'speaking') {
@@ -4391,6 +5142,59 @@ onDOMContentLoaded(() => {
   }
 
   input.addEventListener('keydown', e => {
+    if (state.activeClarification) {
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        updateClarificationFocus(state.activeClarification.focusedIdx - 1);
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        updateClarificationFocus(state.activeClarification.focusedIdx + 1);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        const typedVal = input.value.trim();
+        if (typedVal.length > 0) {
+          input.value = '';
+          input.style.height = isMobile ? '28px' : '24px';
+          barShell.classList.remove('has-input-text');
+          updateActionBtn();
+          submitClarificationAnswer(typedVal);
+        } else {
+          const focusedIdx = state.activeClarification.focusedIdx;
+          if (focusedIdx < state.activeClarification.options.length) {
+            const focusedOpt = state.activeClarification.options[focusedIdx];
+            if (focusedOpt !== undefined) {
+              submitClarificationAnswer(focusedOpt);
+            } else {
+              submitClarificationAnswer("");
+            }
+          } else {
+            // "Something else" focused: focus the textarea
+            input.focus();
+          }
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        submitClarificationAnswer("");
+        return;
+      }
+      // Check for numeric shortcut keys (1-9) when text area is empty
+      if (/^[1-9]$/.test(e.key) && input.value.trim().length === 0) {
+        const idx = parseInt(e.key) - 1;
+        const opt = state.activeClarification.options[idx];
+        if (opt !== undefined) {
+          e.preventDefault();
+          submitClarificationAnswer(opt);
+          return;
+        }
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -4713,7 +5517,10 @@ function openOverlay(name) {
     el.classList.add('open');
     document.body.classList.add('overlay-open');
     barShell.classList.add('panel-open'); // keeps hover-controls visible
-    if (name === 'model') renderModelList();
+    if (name === 'model') {
+      renderModelList();
+      startModelPolling();
+    }
     if (name === 'conv') renderConvList();
     if (name === 'tasks') renderTasks();
     if (name === 'settings') renderSettings();
@@ -4725,6 +5532,9 @@ function openOverlay(name) {
 function closeOverlay(name) {
   const el = $(`overlay-${name}`);
   if (!el) return;
+  if (name === 'model') {
+    stopModelPolling();
+  }
   el.classList.add('closing');
   setTimeout(() => {
     el.classList.remove('open', 'closing');
@@ -4741,6 +5551,9 @@ function closeOverlay(name) {
 function goBackOverlay(name) {
   const el = $(`overlay-${name}`);
   if (!el) return;
+  if (name === 'model') {
+    stopModelPolling();
+  }
   el.classList.add('closing');
   setTimeout(() => {
     el.classList.remove('open', 'closing');
@@ -4750,7 +5563,10 @@ function goBackOverlay(name) {
       if (prevEl) {
         prevEl.classList.add('open');
         barShell.classList.add('panel-open');
-        if (prev === 'model') renderModelList();
+        if (prev === 'model') {
+          renderModelList();
+          startModelPolling();
+        }
         if (prev === 'conv') renderConvList();
         if (prev === 'tasks') renderTasks();
         if (prev === 'settings') renderSettings();
@@ -4783,6 +5599,7 @@ function toggleOverlay(name) {
 }
 
 function closeAllOverlays() {
+  stopModelPolling();
   overlayHistory.length = 0;
   const openOverlays = Array.from(document.querySelectorAll('.overlay.open'));
   if (openOverlays.length === 0) return;
@@ -5057,34 +5874,147 @@ let isOllamaRunning = false;
 let isOllamaInstalled = false;
 let hasCheckedOllamaOnce = false;
 
-async function checkOllamaConnection() {
-  if (state.connectingToOllama) return;
-  state.connectingToOllama = true;
+let isLocalAiRunning = false;
+let isLocalAiInstalled = false;
+let hasCheckedLocalAiOnce = false;
+let connectingToLocalAi = false;
+let modelPollInterval = null;
+let hasAttemptedLocalAiStart = false;
+let localAiInstallError = null;
+
+function startModelPolling() {
+  if (modelPollInterval) clearInterval(modelPollInterval);
+  checkOllamaConnection().catch(console.warn);
+  checkLocalAiConnection().catch(console.warn);
+  modelPollInterval = setInterval(() => {
+    checkOllamaConnection().catch(console.warn);
+    checkLocalAiConnection().catch(console.warn);
+  }, 2500);
+}
+
+function stopModelPolling() {
+  if (modelPollInterval) {
+    clearInterval(modelPollInterval);
+    modelPollInterval = null;
+  }
+  hasAttemptedLocalAiStart = false;
+}
+
+let currentLocalAiLog = '';
+let logPollInterval = null;
+
+function startLocalAiLogPolling() {
+  if (logPollInterval) return;
   
-  // 1. Query if Ollama is installed first (takes <5ms)
-  try {
-    isOllamaInstalled = await invoke('is_ollama_installed');
-  } catch(_) {
-    isOllamaInstalled = false;
+  async function poll() {
+    if (!connectingToLocalAi) {
+      stopLocalAiLogPolling();
+      return;
+    }
+    try {
+      const log = await invoke('get_localai_log');
+      const cleanLog = stripAnsi(log);
+      const lines = cleanLog.split('\n');
+      const lastLines = lines.slice(-7).join('\n');
+      if (lastLines !== currentLocalAiLog) {
+        currentLocalAiLog = lastLines;
+        const logBox = $('localai-log-terminal');
+        if (logBox) {
+          logBox.textContent = lastLines;
+          logBox.scrollTop = logBox.scrollHeight;
+        } else {
+          renderModelList(true);
+        }
+      }
+    } catch(e) {
+      console.error(e);
+    }
   }
   
-  // 2. Render model list immediately to show the connecting loader or installer card
-  renderModelList(true);
+  poll();
+  logPollInterval = setInterval(poll, 1500);
+}
+
+function stopLocalAiLogPolling() {
+  if (logPollInterval) {
+    clearInterval(logPollInterval);
+    logPollInterval = null;
+  }
+  currentLocalAiLog = '';
+}
+
+let checkingLocalAiConnection = false;
+
+async function checkLocalAiConnection() {
+  if (checkingLocalAiConnection) return;
+  checkingLocalAiConnection = true;
   
-  // 3. Now try to connect and auto-start Ollama in the background (takes up to 3s)
+  let installed = false;
+  try {
+    installed = await invoke('is_localai_installed');
+  } catch(_) {
+    installed = false;
+  }
+  
+  let changed = (installed !== isLocalAiInstalled) || !hasCheckedLocalAiOnce;
+  isLocalAiInstalled = installed;
+  
+  let running = false;
+  try {
+    running = await invoke('is_localai_running');
+    if (running) {
+      _cachedModels = null;
+    } else if (isLocalAiInstalled && !hasAttemptedLocalAiStart) {
+      hasAttemptedLocalAiStart = true;
+      invoke('start_localai').catch(console.warn);
+    }
+  } catch(_) {
+    running = false;
+  }
+  
+  changed = changed || (running !== isLocalAiRunning);
+  isLocalAiRunning = running;
+  
+  hasCheckedLocalAiOnce = true;
+  checkingLocalAiConnection = false;
+  
+  if (changed) {
+    renderModelList(true);
+  }
+}
+
+async function checkOllamaConnection() {
+  if (state.checkingOllamaConnection) return;
+  state.checkingOllamaConnection = true;
+  
+  let installed = false;
+  try {
+    installed = await invoke('is_ollama_installed');
+  } catch(_) {
+    installed = false;
+  }
+  
+  let changed = (installed !== isOllamaInstalled) || !hasCheckedOllamaOnce;
+  isOllamaInstalled = installed;
+  
+  let running = false;
   try {
     await invoke('list_ollama_models');
-    isOllamaRunning = true;
-    _cachedModels = null; // Clear cached models so it re-fetches local downloaded models
+    running = true;
+    _cachedModels = null;
   } catch(_) {
-    isOllamaRunning = false;
+    running = false;
   }
   
-  state.connectingToOllama = false;
-  hasCheckedOllamaOnce = true;
+  changed = changed || (running !== isOllamaRunning);
+  isOllamaRunning = running;
   
-  // 4. Rerender model list to show the final results
-  renderModelList(true);
+  hasCheckedOllamaOnce = true;
+  state.checkingOllamaConnection = false;
+  
+  if (changed) {
+    renderModelList(true);
+  }
 }
 
 function isVisionModelName(name) {
@@ -5110,6 +6040,10 @@ async function renderModelList(skipLoading = false) {
   // Trigger non-blocking Ollama check/connect if it hasn't run yet
   if (!hasCheckedOllamaOnce && !state.connectingToOllama) {
     checkOllamaConnection();
+  }
+  // Trigger non-blocking LocalAI check/connect if it hasn't run yet
+  if (!hasCheckedLocalAiOnce && !connectingToLocalAi) {
+    checkLocalAiConnection();
   }
 
   // Get model data from Tauri (mirrors CLOUD_MODELS + OLLAMA_CATALOG)
@@ -5151,6 +6085,7 @@ async function renderModelList(skipLoading = false) {
     openai:'#10A37F', anthropic:'#CD5C5C', gemini:'#4285F4',
     mistral:'#FF8C00', groq:'#F05078', nvidia:'#76B900',
     openrouter:'#A064FF', together:'#00B4C8', ollama:'#50C878',
+    localai:'#FF5733',
     'window.ai':'#8B5CF6',
   };
 
@@ -5158,8 +6093,10 @@ async function renderModelList(skipLoading = false) {
   
   const recentModels = [];
   const localInstalled = [];
-  const cloudGroups = {};
   const localReadyToDownload = [];
+  const localaiInstalled = [];
+  const localaiReadyToDownload = [];
+  const cloudGroups = {};
 
   filtered.forEach(m => {
     if (state.downloads && state.downloads[m.name]) {
@@ -5173,6 +6110,12 @@ async function renderModelList(skipLoading = false) {
       } else {
         localReadyToDownload.push(m);
       }
+    } else if (m.provider === 'localai') {
+      if (m.installed) {
+        localaiInstalled.push(m);
+      } else {
+        localaiReadyToDownload.push(m);
+      }
     } else {
       const grp = m.provider_name || m.provider;
       if (!cloudGroups[grp]) cloudGroups[grp] = [];
@@ -5185,8 +6128,67 @@ async function renderModelList(skipLoading = false) {
 
   let html = '';
 
+  let activeSummaryHtml = '';
+  if (!search) {
+    const slots = [
+      { label: 'Chat & Reasoning', value: cfg.ai?.model, color: '#34D399' },
+      { label: 'Image Generation', value: cfg.localai_models?.images, color: '#FF8C00' },
+      { label: 'Video Generation', value: cfg.localai_models?.video, color: '#F05078' },
+      { label: 'Music/Sound Gen', value: cfg.localai_models?.music, color: '#EAB308' },
+      { label: 'Speech Synthesis (TTS)', value: cfg.localai_models?.speaking, color: '#4285F4' },
+      { label: 'Speech Recognition (STT)', value: cfg.localai_models?.listening, color: '#8B5CF6' }
+    ];
+    
+    const anyActive = slots.some(s => s.value);
+    if (anyActive) {
+      activeSummaryHtml = `
+        <div class="active-capabilities-dashboard">
+          <div class="active-capabilities-title">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="var(--accent)" stroke-width="2.5" style="display:inline-block;vertical-align:middle"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            Active Capabilities
+          </div>
+          <div class="active-slots-grid">
+      `;
+      
+      slots.forEach(s => {
+        if (s.value) {
+          activeSummaryHtml += `
+            <div class="active-slot-item" title="${escAttr(s.value)}">
+              <div class="active-slot-label">
+                <span class="active-slot-dot" style="width: 6px; height: 6px; border-radius: 50%; background: ${s.color}; filter: drop-shadow(0 0 3px ${s.color}); display: inline-block"></span>
+                ${s.label}
+              </div>
+              <div class="active-slot-value">
+                ${escHtml(s.value)}
+              </div>
+            </div>
+          `;
+        }
+      });
+      
+      activeSummaryHtml += `
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  html += activeSummaryHtml;
+
   function renderRow(m, indent = false) {
-    const isActive = m.name === cfg.ai?.model;
+    const activeSlots = [];
+    if (m.name === cfg.ai?.model) {
+      activeSlots.push('chat');
+    }
+    if (cfg.localai_models) {
+      if (cfg.localai_models.images === m.name) activeSlots.push('images');
+      if (cfg.localai_models.video === m.name) activeSlots.push('video');
+      if (cfg.localai_models.music === m.name) activeSlots.push('music');
+      if (cfg.localai_models.speaking === m.name) activeSlots.push('speaking');
+      if (cfg.localai_models.listening === m.name) activeSlots.push('listening');
+    }
+    
+    const isActive = activeSlots.length > 0;
     const dl = state.downloads && state.downloads[m.name];
     const col = providerColors[m.provider] || '#888';
     
@@ -5197,6 +6199,39 @@ async function renderModelList(skipLoading = false) {
     
     let inlineProgress = '';
     
+    const badgeList = [];
+    if (m.vision) badgeList.push('<span class="badge vision"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>vision</span>');
+    if (m.size_gb && m.size_gb > 0) {
+      badgeList.push(`<span class="badge size">${m.size_gb.toFixed(1)} GB</span>`);
+    }
+    if (m.provider === 'ollama' || m.provider === 'localai') {
+      if (!dl) {
+        if (m.installed) {
+          badgeList.push('<span class="badge local"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" style="display:inline-block;vertical-align:-1px;margin-right:3px"><polyline points="20 6 9 17 4 12"/></svg>Installed</span>');
+        } else {
+          badgeList.push('<span class="badge download-ready"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>Download</span>');
+        }
+      }
+      if (m.provider === 'localai' && m.category) {
+        const capCat = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+        badgeList.push(`<span class="badge cat-${m.category}">${capCat}</span>`);
+      }
+    } else {
+      badgeList.push('<span class="badge cloud"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>cloud</span>');
+    }
+    
+    // Add specific active badges for each slot
+    if (activeSlots.length > 0) {
+      const activeLabels = activeSlots.map(slot => {
+        if (slot === 'speaking') return 'TTS';
+        if (slot === 'listening') return 'STT';
+        return slot.toUpperCase();
+      });
+      badgeList.push(`<span class="badge active-mark" style="background:rgba(91,159,255,0.15);border:1px solid rgba(91,159,255,0.3);color:#93c5fd;font-weight:700;letter-spacing:0.5px">● Active (${activeLabels.join(', ')})</span>`);
+    }
+    
+    badges = badgeList.join('');
+
     if (dl) {
       rowClass += ' disabled';
       const isPaused = dl.status === 'Paused' || dl.status?.toLowerCase().includes('paused');
@@ -5208,7 +6243,7 @@ async function renderModelList(skipLoading = false) {
         <div class="model-download-controls" style="display:flex;align-items:center;gap:10px;width:100%;margin-top:6px">
           <div class="model-progress-container" style="flex:1">
             <div class="model-progress-bar" style="width: ${dl.percent}%"></div>
-            <div class="model-progress-text">${escHtml(dl.status)} (${dl.percent}%)</div>
+            <div class="model-progress-text">${escHtml(dl.status)}${dl.total ? ` (${formatBytes(dl.completed || 0)} of ${formatBytes(dl.total)})` : ''} (${dl.percent}%)</div>
           </div>
           <div class="model-download-actions" style="display:flex;gap:6px">
             <button class="model-dl-btn pause-btn" onclick="event.stopPropagation(); handleDownloadPauseResume('${escAttr(m.name)}', ${isPaused})" title="${isPaused ? 'Resume' : 'Pause'}" style="background:rgba(255,255,255,0.08);border:1px solid var(--glass-border);color:var(--text-secondary);border-radius:6px;padding:5px 12px;font-size:11.5px;cursor:pointer;display:flex;align-items:center;gap:4px;font-weight:600">
@@ -5220,30 +6255,31 @@ async function renderModelList(skipLoading = false) {
           </div>
         </div>
       `;
-    } else {
-      const badgeList = [];
-      if (m.vision) badgeList.push('<span class="badge vision"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>vision</span>');
-      if (m.provider === 'ollama') {
-        if (m.installed) {
-          badgeList.push('<span class="badge local"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" style="display:inline-block;vertical-align:-1px;margin-right:3px"><polyline points="20 6 9 17 4 12"/></svg>Installed</span>');
-        } else {
-          badgeList.push('<span class="badge download-ready"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>Download</span>');
-        }
-      } else {
-        badgeList.push('<span class="badge cloud"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>cloud</span>');
-      }
-      if (isActive) badgeList.push('<span class="badge active-mark">active</span>');
-      badges = badgeList.join('');
     }
     
     const onclickHandler = dl ? '' : `onclick="switchModel('${escAttr(m.name)}','${escAttr(m.provider)}','${escAttr(m.base_url||'')}',${m.vision},${m.installed})"`;
     const styleAttr = indent ? 'style="margin-left:16px"' : '';
+    
+    let deleteBtnHtml = '';
+    if ((m.provider === 'ollama' || m.provider === 'localai') && m.installed && !dl) {
+      deleteBtnHtml = `
+        <button class="model-delete-btn" onclick="event.stopPropagation(); deleteModel('${escAttr(m.name)}', '${escAttr(m.provider)}', '${escAttr(m.base_url||'')}')" title="Delete Model">
+          <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            <line x1="10" y1="11" x2="10" y2="17"></line>
+            <line x1="14" y1="11" x2="14" y2="17"></line>
+          </svg>
+        </button>
+      `;
+    }
     
     return `
       <div class="${rowClass}" data-model="${escAttr(m.name)}" ${onclickHandler} ${styleAttr}>
         <span class="model-provider-dot" style="background:${col}"></span>
         <span class="model-name">${escHtml(m.name)}</span>
         <div class="model-badges">${badges}</div>
+        ${deleteBtnHtml}
         ${inlineProgress}
       </div>
     `;
@@ -5253,6 +6289,9 @@ async function renderModelList(skipLoading = false) {
   const downloadKeys = state.downloads ? Object.keys(state.downloads) : [];
   const activeDownloadsList = [];
   downloadKeys.forEach(name => {
+    if (name === 'LocalAI' || name === 'Ollama') {
+      return;
+    }
     if (search && !name.toLowerCase().includes(search)) {
       return;
     }
@@ -5288,6 +6327,8 @@ async function renderModelList(skipLoading = false) {
   const isMobileLocal = document.body.classList.contains('is-mobile') || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
   let cardHtml = '';
   let showLocalCard = false;
+  let localAiCardHtml = '';
+  let showLocalaiCard = false;
 
   if (isMobileLocal) {
     if (localStorage.getItem('mobileLocalSetupCompleted') !== '1') {
@@ -5327,10 +6368,13 @@ async function renderModelList(skipLoading = false) {
             <div style="font-size:11.5px;color:var(--text-dim);line-height:1.4">
               Ollama is downloading. Please wait until it completes or pause/cancel the process.
             </div>
-            <div class="model-download-controls" style="display:flex;align-items:center;gap:10px;width:100%;margin-top:6px">
+            <div class="installer-status-detail" style="font-size:11px;color:var(--text-secondary);font-weight:600;margin-top:2px;white-space:normal;word-break:break-word">
+              ${escHtml(dl.status)}${dl.total ? ` (${formatBytes(dl.completed || 0)} of ${formatBytes(dl.total)})` : ''}
+            </div>
+            <div class="model-download-controls" style="display:flex;align-items:center;gap:10px;width:100%;margin-top:4px">
               <div class="model-progress-container" style="flex:1">
                 <div class="model-progress-bar" style="width: ${dl.percent}%"></div>
-                <div class="model-progress-text">${escHtml(dl.status)} (${dl.percent}%)</div>
+                <div class="model-progress-text">${dl.percent}%</div>
               </div>
               <div class="model-download-actions" style="display:flex;gap:6px">
                 <button class="model-dl-btn pause-btn" onclick="event.stopPropagation(); handleOllamaPauseResume(${isPaused})" title="${isPaused ? 'Resume' : 'Pause'}" style="background:rgba(255,255,255,0.08);border:1px solid var(--glass-border);color:var(--text-secondary);border-radius:6px;padding:5px 12px;font-size:11.5px;cursor:pointer;display:flex;align-items:center;gap:4px;font-weight:600">
@@ -5361,7 +6405,6 @@ async function renderModelList(skipLoading = false) {
         `;
       }
     } else if (!isOllamaRunning && isOllamaInstalled) {
-      // Show an offline connection notice card instead of the installer card
       const isConnecting = !!state.connectingToOllama;
       const loaderHtml = isConnecting ? `
         <style>
@@ -5399,18 +6442,163 @@ async function renderModelList(skipLoading = false) {
         </div>
       `;
     }
+
+    const isLocalaiActiveOrSearched = cfg.ai?.provider === 'localai'
+      || (cfg.localai_models && Object.values(cfg.localai_models).some(v => v !== ''))
+      || search.includes('localai')
+      || search.includes('image')
+      || search.includes('video')
+      || search.includes('voice')
+      || search.includes('whisper')
+      || search.includes('music')
+      || search.includes('speech');
+
+    if (!isLocalAiRunning && isLocalaiActiveOrSearched) {
+      showLocalaiCard = true;
+      const dl = state.downloads && state.downloads['LocalAI'];
+      if (dl) {
+        const isPaused = dl.status === 'Paused' || dl.status?.toLowerCase().includes('paused');
+        const pauseResumeIcon = isPaused ?
+        `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Resume` :
+        `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Pause`;
+
+        localAiCardHtml = `
+          <div class="localai-installer-card" style="margin-top:12px;padding:16px;background:rgba(255,255,255,0.03);border:1px solid var(--glass-border);border-radius:12px;display:flex;flex-direction:column;gap:12px">
+            <div style="font-size:13px;font-weight:700;color:var(--text-primary);letter-spacing:0.5px;display:flex;align-items:center;gap:6px">
+              <span style="width:8px;height:8px;border-radius:50%;background:#FF5733"></span>
+              LocalAI Engine (Downloading)
+            </div>
+            <div style="font-size:11.5px;color:var(--text-dim);line-height:1.4">
+              LocalAI is downloading. Please wait until it completes or pause/cancel the process.
+            </div>
+            <div class="installer-status-detail" style="font-size:11px;color:var(--text-secondary);font-weight:600;margin-top:2px;white-space:normal;word-break:break-word">
+              ${escHtml(dl.status)}${dl.total ? ` (${formatBytes(dl.completed || 0)} of ${formatBytes(dl.total)})` : ''}
+            </div>
+            <div class="model-download-controls" style="display:flex;align-items:center;gap:10px;width:100%;margin-top:4px">
+              <div class="model-progress-container" style="flex:1">
+                <div class="model-progress-bar" style="width: ${dl.percent}%"></div>
+                <div class="model-progress-text">${dl.percent}%</div>
+              </div>
+              <div class="model-download-actions" style="display:flex;gap:6px">
+                <button class="model-dl-btn pause-btn" onclick="event.stopPropagation(); handleLocalAiPauseResume(${isPaused})" title="${isPaused ? 'Resume' : 'Pause'}" style="background:rgba(255,255,255,0.08);border:1px solid var(--glass-border);color:var(--text-secondary);border-radius:6px;padding:5px 12px;font-size:11.5px;cursor:pointer;display:flex;align-items:center;gap:4px;font-weight:600">
+                  ${pauseResumeIcon}
+                </button>
+                <button class="model-dl-btn cancel-btn" onclick="event.stopPropagation(); handleLocalAiCancel()" title="Cancel" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444;border-radius:6px;padding:5px 12px;font-size:11.5px;cursor:pointer;display:flex;align-items:center;gap:4px;font-weight:600">
+                  <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      } else if (!isLocalAiInstalled) {
+        const isWindows = navigator.userAgent.includes('Windows');
+        const reqText = isWindows ? ' (requires Windows Subsystem for Linux - WSL2)' : '';
+        
+        if (localAiInstallError) {
+          localAiCardHtml = `
+            <div class="localai-installer-card" style="margin-top:12px;padding:16px;background:rgba(239,68,68,0.04);border:1px solid rgba(239,68,68,0.2);border-radius:12px;display:flex;flex-direction:column;gap:10px">
+              <div style="font-size:13px;font-weight:700;color:#ef4444;letter-spacing:0.5px;display:flex;align-items:center;gap:6px">
+                <span style="width:8px;height:8px;border-radius:50%;background:#ef4444"></span>
+                LocalAI Setup Failed
+              </div>
+              <div style="font-size:11.5px;color:var(--text-dim);line-height:1.45;white-space:normal;word-break:break-word">
+                ${escHtml(localAiInstallError)}
+              </div>
+              <button onclick="event.stopPropagation(); localAiInstallError = null; startLocalAiDownloadFlow()" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:10px 16px;font-size:12px;font-weight:700;cursor:pointer;transition:all 0.15s ease;display:flex;align-items:center;justify-content:center;gap:6px;width:100%;line-height:1.4;text-align:center">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px;flex-shrink:0"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+                Retry Configuration / Setup
+              </button>
+            </div>
+          `;
+        } else {
+          localAiCardHtml = `
+            <div class="localai-installer-card" style="margin-top:12px;padding:16px;background:rgba(255,255,255,0.03);border:1px solid var(--glass-border);border-radius:12px;display:flex;flex-direction:column;gap:10px">
+              <div style="font-size:13px;font-weight:700;color:var(--text-primary);letter-spacing:0.5px;display:flex;align-items:center;justify-content:space-between">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span style="width:8px;height:8px;border-radius:50%;background:#FF5733"></span>
+                  Configure LocalAI for Images, Video, and Voice
+                </div>
+                <div class="localai-info-container">
+                  <span class="localai-info-icon" style="color:var(--text-dim);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:color 0.15s ease" onmouseover="this.style.color='var(--text-primary)'" onmouseout="this.style.color='var(--text-dim)'">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                  </span>
+                  <div class="localai-tooltip" style="visibility:hidden;width:240px;background:rgba(20,20,30,0.96);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);color:var(--text-secondary);text-align:left;border:1px solid var(--glass-border);border-radius:8px;padding:12px;position:absolute;z-index:999;right:0;top:24px;font-size:11px;line-height:1.45;box-shadow:0 10px 30px rgba(0,0,0,0.6);opacity:0;transition:opacity 0.2s ease, visibility 0.2s ease;pointer-events:none">
+                    <strong>LocalAI</strong> is a free local AI engine that runs fully offline on your machine. It enables Antflow to generate images, create videos, listen to speech, speak back with high-quality voices, and compose music, completely privately with no API keys required.
+                  </div>
+                </div>
+              </div>
+              <div style="font-size:11.5px;color:var(--text-dim);line-height:1.4">
+                <span style="color:var(--accent);font-weight:600">Download Size: ~1.5 GB</span>${reqText}.
+              </div>
+              <button onclick="event.stopPropagation(); startLocalAiDownloadFlow()" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:10px 16px;font-size:12px;font-weight:700;cursor:pointer;transition:all 0.15s ease;display:flex;align-items:center;justify-content:center;gap:6px;width:100%;line-height:1.4;text-align:center">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px;flex-shrink:0"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>
+                Click here to configure LocalAI
+              </button>
+            </div>
+          `;
+        }
+      } else {
+        const isConnecting = connectingToLocalAi;
+        const loaderHtml = isConnecting ? `
+          <style>
+          @keyframes localaiPulse {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(200%); }
+          }
+          </style>
+          <div class="localai-connecting-progress" style="width:100%;height:4px;background:rgba(255,255,255,0.06);border-radius:2px;overflow:hidden;margin-top:4px">
+            <div style="height:100%;width:50%;background:var(--accent);border-radius:2px;animation: localaiPulse 1s infinite linear"></div>
+          </div>
+          <div style="font-size:11px;color:var(--text-dim);font-style:italic;display:flex;align-items:center;gap:6px;margin-top:2px">
+            <span class="spinner-small" style="width:10px;height:10px;border:2px solid rgba(255,255,255,0.1);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite;"></span>
+            Checking LocalAI connection...
+          </div>
+        ` : '';
+
+        const buttonHtml = isConnecting ? '' : `
+          <button onclick="event.stopPropagation(); window.retryLocalAiConnection()" style="background:var(--accent);color:#fff;border:none;cursor:pointer;border-radius:6px;padding:10px 16px;font-size:12px;font-weight:700;transition:all 0.15s ease;display:flex;align-items:center;justify-content:center;gap:6px;width:100%;line-height:1.4;text-align:center">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px;flex-shrink:0"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+            Connect / Start LocalAI
+          </button>
+        `;
+
+        const logHtml = (isConnecting && currentLocalAiLog) ? `
+          <div id="localai-log-terminal" style="font-family: monospace; font-size: 10.5px; color: #e4e4e7; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.06); padding: 10px; border-radius: 8px; margin-top: 4px; white-space: pre-wrap; max-height: 140px; overflow-y: auto; text-align: left; line-height: 1.45; direction: ltr">
+            ${escHtml(currentLocalAiLog)}
+          </div>
+        ` : '';
+
+        localAiCardHtml = `
+          <div class="localai-installer-card" style="margin-top:12px;padding:16px;background:rgba(239,68,68,0.04);border:1px solid rgba(239,68,68,0.15);border-radius:12px;display:flex;flex-direction:column;gap:12px">
+            <div style="font-size:13px;font-weight:700;color:#ef4444;letter-spacing:0.5px;display:flex;align-items:center;gap:6px">
+              <span style="width:8px;height:8px;border-radius:50%;background:#ef4444"></span>
+              LocalAI Starting or Connecting
+            </div>
+            <div style="font-size:11.5px;color:var(--text-dim);line-height:1.4">
+              LocalAI is configured but currently offline. Click below to start the server or retry connection.
+            </div>
+            ${loaderHtml}
+            ${logHtml}
+            ${buttonHtml}
+          </div>
+        `;
+      }
+    }
   }
 
   // 2. Local Downloaded Models
-  if (showLocalCard) {
-    html += '<div class="model-section-label">Local Models</div>';
-    html += cardHtml;
-  } else if (!isOllamaRunning && isOllamaInstalled) {
-    html += '<div class="model-section-label">Local Models</div>';
-    html += cardHtml;
-  } else if (localInstalled.length > 0) {
+  if (showLocalCard || showLocalaiCard) {
+    html += '<div class="model-section-label">Local Engines Status</div>';
+    if (showLocalCard) html += cardHtml;
+    if (showLocalaiCard) html += localAiCardHtml;
+  }
+  
+  if (localInstalled.length > 0 || localaiInstalled.length > 0) {
     html += '<div class="model-section-label">Local Downloaded Models</div>';
     localInstalled.forEach(m => {
+      html += renderRow(m, false);
+    });
+    localaiInstalled.forEach(m => {
       html += renderRow(m, false);
     });
   }
@@ -5429,12 +6617,12 @@ async function renderModelList(skipLoading = false) {
     });
   }
 
-if (showLocalCard) {
-  html += '<div class="model-section-label">Local Models</div>';
-  html += cardHtml;
-} else if (localReadyToDownload.length > 0) {
+if (localReadyToDownload.length > 0 || localaiReadyToDownload.length > 0) {
   html += '<div class="model-section-label">Recommendations</div>';
   localReadyToDownload.forEach(m => {
+    html += renderRow(m, false);
+  });
+  localaiReadyToDownload.forEach(m => {
     html += renderRow(m, false);
   });
 }
@@ -5533,6 +6721,11 @@ if (showLocalCard) {
 }
 
   list.innerHTML = html;
+
+  const logConsole = document.querySelector('.localai-log-console');
+  if (logConsole) {
+    logConsole.scrollTop = logConsole.scrollHeight;
+  }
 }
 
 onDOMContentLoaded(() => {
@@ -5730,6 +6923,25 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
     return;
   }
 
+  if (provider === 'localai') {
+    let isInstalled = false;
+    try {
+      isInstalled = await invoke('is_localai_installed');
+    } catch (_) {}
+
+    if (!isInstalled) {
+      const ok = await showConfirm(
+        "Install LocalAI Engine",
+        "To run local models you need to download and install the LocalAI engine. Would you like to set it up now?",
+        "Set Up"
+      );
+      if (!ok) return;
+      closeAllOverlays();
+      startLocalAiDownloadFlow();
+      return;
+    }
+  }
+
   if (installed === false) {
     const ok = await showConfirm(
       "Download Model",
@@ -5741,12 +6953,8 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
     toast(`Downloading ${name}...`);
     if (!state.downloads) state.downloads = {};
     state.downloads[name] = { model: name, status: 'Starting...', percent: 0 };
-    renderModelList(true);
-    
-    const body = $('model-panel-body');
-    if (body) {
-      body.scrollTo({ top: 0, behavior: 'smooth' });
-    }
+    await renderModelList(true);
+    scrollModelPanelToTop();
 
     try {
       await invoke('pull_model', { name, base_url: baseUrl });
@@ -5760,10 +6968,32 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
     return;
   }
 
+  let m = (_cachedModels || []).find(x => x.name === name);
+  let category = m ? m.category : 'chat';
+
+  if (provider === 'localai' && category !== 'chat') {
+    dismissToast();
+    _cachedModels = null;
+    try {
+      await invoke('switch_localai_model', { category, model_name: name });
+      closeAllOverlays();
+      toast(`Active LocalAI ${category} model set to: ${name}`);
+      
+      const hasChat = state.cfg?.ai?.model;
+      if (!hasChat) {
+        toast("Warning: No active chat model. Media generation tools will only output files without text replies until a chat model is set up.", 6000);
+      }
+      await loadConfig();
+    } catch(e) {
+      toast('Failed to switch LocalAI model: ' + e);
+    }
+    return;
+  }
+
   toast(`Verifying connection for ${name}...`, 0);
 
   let keyToVerify = '';
-  if (provider !== 'ollama') {
+  if (provider !== 'ollama' && provider !== 'localai') {
     try {
       const key = await invoke('get_provider_key', { provider_id: provider });
       if (key && key.trim()) {
@@ -5780,21 +7010,23 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
   }
 
   try {
-    await invoke('verify_api_key', {
-      provider_id: provider,
-      base_url: baseUrl || getBaseUrl(provider),
-      api_key: keyToVerify,
-      model: name
-    });
+    if (provider !== 'ollama' && provider !== 'localai') {
+      await invoke('verify_api_key', {
+        provider_id: provider,
+        base_url: baseUrl || getBaseUrl(provider),
+        api_key: keyToVerify,
+        model: name
+      });
+    }
     dismissToast();
   } catch (err) {
     dismissToast();
     const msg = String(err);
-    if (provider !== 'ollama') {
+    if (provider !== 'ollama' && provider !== 'localai') {
       state.pendingModelSwitch = { name, provider, baseUrl, vision };
       showApiKeyPrompt(name, provider, formatVerificationError(msg), 'err');
     } else {
-      // Automatic install trigger for Ollama on desktop
+      // Automatic install trigger for Ollama on desktop (only if Ollama is selected)
       toast("Ollama is not running. Attempting to start/install automatically...", 5000);
       try {
         await invoke('install_ollama');
@@ -5836,6 +7068,29 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
     toast('Failed: ' + e);
   }
 }
+
+async function deleteModel(name, provider, baseUrl) {
+  const ok = await showConfirm(
+    "Delete Model",
+    `Are you sure you want to permanently delete the model "${name}"? This action cannot be undone.`,
+    "Delete"
+  );
+  if (!ok) return;
+
+  toast(`Deleting ${name}...`, 0);
+  try {
+    await invoke('delete_model', { name, provider, base_url: baseUrl || '' });
+    _cachedModels = null;
+    await loadConfig();
+    await renderModelList(true);
+    toast(`Successfully deleted ${name}`);
+  } catch(err) {
+    toast(`Failed to delete model: ${err}`, 5000);
+  }
+}
+
+window.deleteModel = deleteModel;
+
 
 function showApiKeyPrompt(name, provider, statusMsg, statusClass) {
   const apiOverlay = $('overlay-apikey');
@@ -6028,6 +7283,7 @@ function appendMessages(messages) {
 }
 
 async function loadConversation(id) {
+  hideClarificationPopover();
   const wrap = $('messages-wrap');
   if (!wrap) return;
   const existingOverlay = wrap.querySelector('.chat-loading-overlay');
@@ -6201,11 +7457,32 @@ function setTheme(theme) {
 }
 
 // ── Settings panel ──────────────────────────────────────────────────────
-// ── Settings panel ──────────────────────────────────────────────────────
+function getSystemVoiceOptions() {
+  if (!window.speechSynthesis) return [];
+  const voices = window.speechSynthesis.getVoices() || [];
+  return voices.map(v => ({
+    value: v.name,
+    label: `${v.name} (${v.lang})`
+  }));
+}
+
 async function renderSettings() {
   let cfg = {};
   try { cfg = await invoke('get_config'); } catch(_) {}
   state.cfg = cfg;
+
+  let isLaInstalled = false;
+  let laModels = [];
+  let laVoices = [];
+  try {
+    isLaInstalled = await invoke('is_localai_installed');
+    if (isLaInstalled) {
+      laModels = await invoke('list_localai_models');
+      laVoices = await invoke('get_localai_voices');
+    }
+  } catch(e) {
+    console.warn("Failed to query LocalAI settings details:", e);
+  }
 
 // Query audio input and output devices
 let devices = [];
@@ -6349,6 +7626,13 @@ if (speakers.length === 0) {
     </div>
     <div class="setting-row has-select">
       <div>
+        <div class="setting-label">Voice / Speaker</div>
+        <div class="setting-sub">${cfg.localai_models?.speaking ? 'Choose speaker voice character for TTS (Kokoro)' : 'Choose browser system voice for TTS'}</div>
+      </div>
+      <div id="voice-select-container"></div>
+    </div>
+    <div class="setting-row has-select">
+      <div>
         <div class="setting-label">Ollama Concurrency</div>
         <div class="setting-sub">Configure max parallel local generation processes</div>
       </div>
@@ -6408,6 +7692,53 @@ if (speakers.length === 0) {
         <div class="setting-sub">${escHtml(cfg.storage || 'Portable')}</div>
       </div>
     </div>
+    ${(!isLaInstalled) ? `
+      <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-top:20px;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Engine</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">LocalAI Engine</div>
+          <div class="setting-sub">${(state.downloads && state.downloads['LocalAI']) ? 'Downloading LocalAI binary...' : 'Install local engine for free offline Images, Video, Speech and Music.'}</div>
+        </div>
+        ${(state.downloads && state.downloads['LocalAI']) ? '' : '<button class="change-model-btn" onclick="startLocalAiDownloadFlow()">Install Engine</button>'}
+      </div>
+    ` : `
+      <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-top:20px;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Media & Voice Settings</div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Local Images Model</div>
+          <div class="setting-sub">Generate pictures locally using Stable Diffusion</div>
+        </div>
+        <div id="localai-images-select-container"></div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Local Video Model</div>
+          <div class="setting-sub">Create short videos locally using AnimateDiff</div>
+        </div>
+        <div id="localai-video-select-container"></div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Local Speaking Model</div>
+          <div class="setting-sub">Text-to-speech voice generation using Kokoro</div>
+        </div>
+        <div id="localai-speaking-select-container"></div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Local Listening Model</div>
+          <div class="setting-sub">Speech-to-text transcription using Whisper</div>
+        </div>
+        <div id="localai-listening-select-container"></div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Local Music Model</div>
+          <div class="setting-sub">Generate music and sounds using MusicGen</div>
+        </div>
+        <div id="localai-music-select-container"></div>
+      </div>
+    `}
     <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
       <div class="setting-label">System Info</div>
       <div style="font-size:11px;font-family:'DM Mono',monospace;color:var(--text-dim);line-height:1.7" id="sys-info">
@@ -6608,6 +7939,47 @@ if (speakers.length === 0) {
     }
   );
 
+  const voiceContainer = $('voice-select-container');
+  if (voiceContainer) {
+    if (cfg.localai_models?.speaking) {
+      createCustomSelect(
+        voiceContainer,
+        laVoices.map(v => ({ value: v, label: v })),
+        cfg.localai_voice || 'af_sky',
+        async (val) => {
+          try {
+            await invoke('save_localai_voice', { voice: val });
+            toast("Voice character updated to: " + val);
+          } catch(e) { toast('Error saving voice: ' + e); }
+        }
+      );
+    } else {
+      let sysVoiceOptions = getSystemVoiceOptions();
+      const currentSysVoice = localStorage.getItem('systemVoiceName') || '';
+      
+      const setupSysSelect = () => {
+        createCustomSelect(
+          voiceContainer,
+          sysVoiceOptions.length > 0 ? sysVoiceOptions : [{ value: '', label: 'Default System Voice' }],
+          currentSysVoice,
+          (val) => {
+            localStorage.setItem('systemVoiceName', val);
+            toast("System voice updated");
+          }
+        );
+      };
+
+      setupSysSelect();
+
+      if (window.speechSynthesis && sysVoiceOptions.length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          sysVoiceOptions = getSystemVoiceOptions();
+          setupSysSelect();
+        };
+      }
+    }
+  }
+
   const bgWake = $('toggle-bg-wake');
   if (bgWake) {
     bgWake.classList.toggle('on', state.cfg.run_in_background || false);
@@ -6641,6 +8013,53 @@ if (isMobile) {
     }
   }, 50);
 }
+
+  if (isLaInstalled) {
+    const imagesModels = laModels.filter(m => m.category === 'images');
+    const videoModels = laModels.filter(m => m.category === 'video');
+    const speakingModels = laModels.filter(m => m.category === 'speaking');
+    const listeningModels = laModels.filter(m => m.category === 'listening');
+    const musicModels = laModels.filter(m => m.category === 'music');
+
+    const wireModelDropdown = (containerId, models, currentActive, category) => {
+      const container = $(containerId);
+      if (!container) return;
+      const options = [
+        { value: '', label: 'None (Disabled)' },
+        ...models.map(m => ({
+          value: m.name,
+          label: `${m.name} (${m.installed ? 'Installed' : 'Download required'})`
+        }))
+      ];
+      createCustomSelect(
+        container,
+        options,
+        currentActive,
+        async (val) => {
+          if (val === '') {
+            try {
+              await invoke('switch_localai_model', { category, model_name: '' });
+              toast(`Disabled local ${category} model`);
+              renderSettings();
+            } catch(e) { toast('Error: ' + e); }
+          } else {
+            const m = models.find(x => x.name === val);
+            if (m) {
+              switchModel(m.name, 'localai', m.base_url || '', m.vision, m.installed);
+            }
+          }
+        }
+      );
+    };
+
+    wireModelDropdown('localai-images-select-container', imagesModels, cfg.localai_models?.images || '', 'images');
+    wireModelDropdown('localai-video-select-container', videoModels, cfg.localai_models?.video || '', 'video');
+    wireModelDropdown('localai-speaking-select-container', speakingModels, cfg.localai_models?.speaking || '', 'speaking');
+    wireModelDropdown('localai-listening-select-container', listeningModels, cfg.localai_models?.listening || '', 'listening');
+    wireModelDropdown('localai-music-select-container', musicModels, cfg.localai_models?.music || '', 'music');
+
+    // Voice select is now handled in the unified voice settings section.
+  }
 }
 
 async function toggleRunInBackground() {
@@ -6780,6 +8199,7 @@ function estimateTokenLimit(model) {
 // ── Onboarding ──────────────────────────────────────────────────────────
 const ONBOARDING_PROVIDERS = [
   { id:'ollama', label:'Ollama (local, free)', color:'#50C878', needsKey:false, defaultModel:'' },
+  { id:'localai', label:'LocalAI (local, free)', color:'#FF5733', needsKey:false, defaultModel:'LocalAI-functioncall-llama3.2-3b-v0.5' },
   { id:'openai', label:'OpenAI', color:'#10A37F', needsKey:true, defaultModel:'gpt-4o' },
   { id:'anthropic', label:'Anthropic', color:'#CD5C5C', needsKey:true, defaultModel:'claude-sonnet-4-6' },
   { id:'gemini', label:'Google Gemini', color:'#4285F4', needsKey:true, defaultModel:'gemini-2.5-flash' },
@@ -6789,6 +8209,7 @@ const ONBOARDING_PROVIDERS = [
 ];
 
 const ONBOARDING_MODELS = {
+  localai: ['LocalAI-functioncall-llama3.2-3b-v0.5'],
   openai: ['gpt-4.1','gpt-4.1-mini','gpt-4o','gpt-4o-mini','o3','o4-mini'],
   anthropic: ['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5-20251001'],
   gemini: ['gemini-2.5-pro','gemini-2.5-flash','gemini-2.5-flash-lite','gemini-2.0-flash'],
@@ -6937,9 +8358,10 @@ function renderOnboarding() {
           </svg>
         </div>
         <div class="ob-title">Do you want to use Local AI?</div>
-        <div class="ob-sub" style="margin-bottom:20px;">To run local models you need to download and install Ollama. Running offline models provides absolute privacy, works with zero server connections, and has no usage fees.</div>
-        <button class="ob-btn" onclick="obChooseLocal(true)" style="margin-bottom: 8px;">Download Ollama</button>
-        <button class="ob-btn" onclick="obChooseLocal(false)" style="background:transparent; border:1px solid var(--glass-border); color:var(--text-primary); margin-bottom: 8px;">Use Cloud models instead</button>
+        <div class="ob-sub" style="margin-bottom:20px;">Choose a local engine to run offline models for complete privacy, zero server connections, and no usage fees.</div>
+        <button class="ob-btn" onclick="obChooseLocal('ollama')" style="margin-bottom: 8px;">Download Ollama (Local Chat)</button>
+        <button class="ob-btn" onclick="obChooseLocal('localai')" style="background:var(--accent); color:#fff; margin-bottom: 8px;">Download LocalAI (Chat, Images, Video, Voice)</button>
+        <button class="ob-btn" onclick="obChooseLocal('cloud')" style="background:transparent; border:1px solid var(--glass-border); color:var(--text-primary); margin-bottom: 8px;">Use Cloud models instead</button>
         <div class="ob-skip" onclick="obSkipNow()">Skip for now (configure later)</div>
       `;
     }
@@ -6961,41 +8383,79 @@ function renderOnboarding() {
     const p = obProvider;
     if (!p) { obStep = 1; renderOnboarding(); return; }
 
-    const dlKey = Object.keys(state.downloads || {}).find(k => k === 'Ollama' || k === obModel);
+    const dlKey = Object.keys(state.downloads || {}).find(k => k === 'Ollama' || k === 'LocalAI' || k === obModel);
     const dl = dlKey ? state.downloads[dlKey] : null;
     let modelSection = '';
-    if (p.id === 'ollama' && dl) {
+    if ((p.id === 'ollama' || p.id === 'localai') && dl) {
       const isPaused = dl.status === 'Paused' || dl.status?.toLowerCase().includes('paused');
       const pauseResumeIcon = isPaused ?
       `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><polygon points="5 3 19 12 5 21 5 3"/></svg>Resume` :
       `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>Pause`;
       
+      const isLocalAi = p.id === 'localai';
+      const pauseResumeFn = isLocalAi ? `handleLocalAiPauseResume(${isPaused})` : `handleOllamaPauseResume(${isPaused})`;
+      const cancelFn = isLocalAi ? `handleLocalAiCancel()` : `handleOllamaCancel()`;
+      const displayName = dlKey === 'Ollama' ? 'Ollama Local AI Server' : (dlKey === 'LocalAI' ? 'LocalAI Engine' : dlKey);
+
       modelSection = `
         <div style="font-size:12px;font-weight:700;color:var(--text-primary);letter-spacing:0.5px;margin-bottom:6px">
-          ${dlKey === 'Ollama' ? 'Ollama Local AI Server' : escHtml(dlKey)} (Downloading)
+          ${escHtml(displayName)} (Downloading)
         </div>
-        <div class="model-download-controls" style="display:flex;flex-direction:column;gap:8px;width:100%;margin-top:6px">
+        <div class="installer-status-detail" style="font-size:11px;color:var(--text-secondary);font-weight:600;margin-top:2px;white-space:normal;word-break:break-word">
+          ${escHtml(dl.status || 'Downloading...')}${dl.total ? ` (${formatBytes(dl.completed || 0)} of ${formatBytes(dl.total)})` : ''}
+        </div>
+        <div class="model-download-controls" style="display:flex;flex-direction:column;gap:8px;width:100%;margin-top:4px">
           <div class="model-progress-container" style="width:100%">
             <div class="model-progress-bar" style="width: ${dl.percent}%"></div>
-            <div class="model-progress-text">${escHtml(dl.status || 'Downloading...')} (${dl.percent}%)</div>
+            <div class="model-progress-text">${dl.percent}%</div>
           </div>
           <div class="model-download-actions" style="display:flex;gap:6px">
-            <button class="model-dl-btn pause-btn" onclick="event.stopPropagation(); handleOllamaPauseResume(${isPaused})" title="${isPaused ? 'Resume' : 'Pause'}" style="flex:1;background:rgba(255,255,255,0.08);border:1px solid var(--glass-border);color:var(--text-secondary);border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;font-weight:600">
+            <button class="model-dl-btn pause-btn" onclick="event.stopPropagation(); ${pauseResumeFn}" title="${isPaused ? 'Resume' : 'Pause'}" style="flex:1;background:rgba(255,255,255,0.08);border:1px solid var(--glass-border);color:var(--text-secondary);border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;font-weight:600">
               ${pauseResumeIcon}
             </button>
-            <button class="model-dl-btn cancel-btn" onclick="event.stopPropagation(); handleOllamaCancel()" title="Cancel" style="flex:1;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;font-weight:600">
+            <button class="model-dl-btn cancel-btn" onclick="event.stopPropagation(); ${cancelFn}" title="Cancel" style="flex:1;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444;border-radius:6px;padding:6px 12px;font-size:11px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:4px;font-weight:600">
               <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:4px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>Cancel
             </button>
           </div>
         </div>
       `;
+    } else if (p.id === 'localai' && !isLocalAiInstalled) {
+      modelSection = `
+        <div class="localai-ob-prompt" style="padding:14px; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:10px; margin-bottom:12px; display:flex; flex-direction:column; gap:10px">
+          <div style="font-size:13px; font-weight:700; color:var(--text-primary); display:flex; align-items:center; gap:6px">
+            <span style="width:8px; height:8px; border-radius:50%; background:#FF5733"></span>
+            LocalAI Engine Required
+          </div>
+          <div style="font-size:11.5px; color:var(--text-dim); line-height:1.4">
+            To generate images, create videos, listen/speak offline, we need to download and install the LocalAI engine (~640 MB).
+          </div>
+          <button class="ob-btn" onclick="startLocalAiDownloadFlow()" style="background:var(--accent); color:#fff; width:100%; padding:10px 16px; font-size:12px; font-weight:700">
+            Install LocalAI Engine Automatically
+          </button>
+        </div>
+      `;
+    } else if (p.id === 'ollama' && !isOllamaInstalled) {
+      modelSection = `
+        <div class="ollama-ob-prompt" style="padding:14px; background:rgba(255,255,255,0.02); border:1px solid var(--glass-border); border-radius:10px; margin-bottom:12px; display:flex; flex-direction:column; gap:10px">
+          <div style="font-size:13px; font-weight:700; color:var(--text-primary); display:flex; align-items:center; gap:6px">
+            <span style="width:8px; height:8px; border-radius:50%; background:#50C878"></span>
+            Ollama Engine Required
+          </div>
+          <div style="font-size:11.5px; color:var(--text-dim); line-height:1.4">
+            Ollama is a local AI engine. To run offline chat models, you need to download and install Ollama.
+          </div>
+          <button class="ob-btn" onclick="startOllamaDownloadFlow()" style="background:var(--accent); color:#fff; width:100%; padding:10px 16px; font-size:12px; font-weight:700">
+            Install Ollama Automatically
+          </button>
+        </div>
+      `;
     } else {
       modelSection = `
-        <div class="ob-label">${p.id === 'ollama' ? 'Ollama ' : ''}Model</div>
+        <div class="ob-label">${p.id === 'ollama' ? 'Ollama ' : (p.id === 'localai' ? 'LocalAI ' : '')}Model</div>
         <div id="ob-model-sel-container"></div>
       `;
     }
-    if (p.id !== 'ollama') {
+    if (p.id !== 'ollama' && p.id !== 'localai') {
       obModel = obModel || p.defaultModel;
     }
 
@@ -7006,13 +8466,17 @@ function renderOnboarding() {
       <a class="ob-key-link" href="#" onclick="event.preventDefault()">Get your key at ${escHtml(KEY_URLS[p.id]||'')}</a>
     ` : `<div style="color:var(--success);font-size:13px;margin:8px 0;display:flex;align-items:center;justify-content:center;gap:4px;"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>No API key needed</div>`;
 
+    let isNextDisabled = !!dl;
+    if (p.id === 'localai' && !isLocalAiInstalled && !dl) isNextDisabled = true;
+    if (p.id === 'ollama' && !isOllamaInstalled && !dl) isNextDisabled = true;
+
     content = `
       <div class="ob-label">Configuring: <span style="color:${p.color}">${escHtml(p.label)}</span></div>
       ${modelSection}
       ${keySection}
       <div class="ob-status" id="ob-status"></div>
-      <button class="ob-btn" id="ob-next-btn" onclick="obNext()" ${dl ? 'disabled' : ''}>
-        ${dl ? 'Downloading model...' : (p.needsKey ? 'Verify & Continue →' : 'Continue →')}
+      <button class="ob-btn" id="ob-next-btn" onclick="obNext()" ${isNextDisabled ? 'disabled' : ''}>
+        ${dl ? 'Downloading...' : (p.needsKey ? 'Verify & Continue →' : 'Continue →')}
       </button>
       <div class="ob-skip" onclick="obSkipNow()">Skip for now (configure later)</div>
     `;
@@ -7029,7 +8493,7 @@ function renderOnboarding() {
     `;
   }
 
-  const dlKey = Object.keys(state.downloads || {}).find(k => k === 'Ollama' || k === obModel);
+  const dlKey = Object.keys(state.downloads || {}).find(k => k === 'Ollama' || k === 'LocalAI' || k === obModel);
   const dl = dlKey ? state.downloads[dlKey] : null;
 
   const backButtonHtml = (obStep > 0 && obStep < 3 && !dl) ? 
@@ -7053,7 +8517,7 @@ function renderOnboarding() {
   if (obStep === 2) {
     const p = obProvider;
     if (p) {
-      if (p.id !== 'ollama') {
+      if (p.id !== 'ollama' && p.id !== 'localai') {
         const mods = ONBOARDING_MODELS[p.id] || [];
         createCustomSelect(
           $('ob-model-sel-container'),
@@ -7061,15 +8525,21 @@ function renderOnboarding() {
           obModel || p.defaultModel,
           (val) => { obModel = val; }
         );
-      } else if (!state.downloads?.['Ollama']) {
+      } else if (p.id === 'ollama' && !state.downloads?.['Ollama']) {
+        $('ob-model-sel-container').innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">Loading installed models...</div>';
+      } else if (p.id === 'localai' && !state.downloads?.['LocalAI']) {
         $('ob-model-sel-container').innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">Loading installed models...</div>';
       }
     }
   }
 
-  // Load Ollama models if needed
-  if (obStep === 2 && obProvider?.id === 'ollama') {
-    loadOllamaModels();
+  // Load Ollama or LocalAI models if needed
+  if (obStep === 2) {
+    if (obProvider?.id === 'ollama') {
+      loadOllamaModels();
+    } else if (obProvider?.id === 'localai') {
+      loadLocalAiModels();
+    }
   }
 }
 
@@ -7146,6 +8616,45 @@ async function loadOllamaModels() {
   }
 }
 
+async function loadLocalAiModels() {
+  try {
+    const models = await invoke('list_localai_models');
+    const container = $('ob-model-sel-container');
+    if (container) {
+      const options = [];
+      models.forEach(m => {
+        const catLabel = m.category.charAt(0).toUpperCase() + m.category.slice(1);
+        options.push({
+          value: m.name,
+          label: `${m.name} [${catLabel}] (${m.installed ? 'Installed' : 'Download required'})`
+        });
+      });
+      if (options.length > 0) {
+        if (!obModel || !options.some(o => o.value === obModel)) {
+          obModel = options[0].value;
+        }
+        createCustomSelect(
+          container,
+          options,
+          obModel,
+          (val) => {
+            obModel = val;
+            renderOnboarding();
+          }
+        );
+      } else {
+        container.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">No models available</div>';
+      }
+    }
+  } catch(e) {
+    console.error("Failed to load LocalAI models:", e);
+    const container = $('ob-model-sel-container');
+    if (container) {
+      container.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px">Could not connect to LocalAI.</div>';
+    }
+  }
+}
+
 function obSelectProvider(id) {
   obProvider = ONBOARDING_PROVIDERS.find(p => p.id === id) || null;
   obModel = obProvider?.defaultModel || '';
@@ -7169,8 +8678,8 @@ window.setStorage = async function(location) {
   }
 };
 
-window.obChooseLocal = async function(useLocal) {
-  if (useLocal) {
+window.obChooseLocal = async function(choice) {
+  if (choice === 'ollama') {
     if (isMobile) {
       try {
         await invoke('switch_model', { name: "Llama-3.2-1B-Instruct-q4f16_1-MLC", provider: "ollama", base_url: "http://127.0.0.1:11434", vision: false });
@@ -7182,7 +8691,20 @@ window.obChooseLocal = async function(useLocal) {
       obStep = 2;
       obProvider = ONBOARDING_PROVIDERS.find(p => p.id === 'ollama');
       renderOnboarding();
-      startOllamaDownloadFlow();
+      if (!isOllamaInstalled) {
+        startOllamaDownloadFlow();
+      } else {
+        window.retryOllamaConnection().catch(console.warn);
+      }
+    }
+  } else if (choice === 'localai') {
+    obStep = 2;
+    obProvider = ONBOARDING_PROVIDERS.find(p => p.id === 'localai');
+    renderOnboarding();
+    if (!isLocalAiInstalled) {
+      startLocalAiDownloadFlow();
+    } else {
+      invoke('start_localai').catch(console.warn);
     }
   } else {
     obStep = 1;
@@ -7221,11 +8743,21 @@ async function obNext() {
     if (!p) return;
     const statusEl = $('ob-status');
 
-    if (p.id === 'ollama') {
-      const isInstalled = installedOllamaModels.includes(obModel);
+    if (p.id === 'ollama' || p.id === 'localai') {
+      let isInstalled = false;
+      if (p.id === 'ollama') {
+        isInstalled = installedOllamaModels.includes(obModel);
+      } else {
+        try {
+          const models = await invoke('list_localai_models');
+          const m = models.find(x => x.name === obModel);
+          if (m) isInstalled = m.installed;
+        } catch(_) {}
+      }
+
       if (!isInstalled && obModel) {
         if (statusEl) {
-          statusEl.textContent = `Downloading ${obModel}... (~1.3 GB - 4.5 GB)`;
+          statusEl.textContent = `Downloading ${obModel}...`;
           statusEl.className = 'ob-status';
         }
         
@@ -7248,8 +8780,10 @@ async function obNext() {
 
       try {
         await invoke('switch_model', {
-          name: obModel || 'llava', provider: p.id,
-          base_url: getBaseUrl(p.id), vision: false
+          name: obModel || (p.id === 'ollama' ? 'llava' : 'LocalAI-functioncall-llama3.2-3b-v0.5'),
+          provider: p.id,
+          base_url: getBaseUrl(p.id),
+          vision: false
         });
         await invoke('complete_setup');
         if (statusEl) { statusEl.textContent = '✓ Configured successfully'; statusEl.className = 'ob-status ok'; }
@@ -7475,6 +9009,26 @@ async function setupEventListeners() {
       state.currentConvId = session_id;
     }
     if (session_id && session_id !== state.currentConvId) return;
+    
+    if (msg && msg.startsWith('JSON_MEDIA_GEN:')) {
+      try {
+        const payload = JSON.parse(msg.substring(15));
+        const existing = msgs.querySelector(`.media-skeleton-loader[data-media-type="${payload.type}"]`);
+        if (!existing) {
+          const loader = createMediaSkeletonLoader(payload.type, payload.prompt);
+          if (state.thinkingEl) {
+            msgs.insertBefore(loader, state.thinkingEl);
+          } else {
+            msgs.appendChild(loader);
+          }
+          msgs.scrollTop = msgs.scrollHeight;
+          syncWindowSize();
+        }
+      } catch (err) {
+        console.error("Failed to parse JSON_MEDIA_GEN step", err);
+      }
+    }
+
     if (msg) updateThinkingLabel(String(msg));
   });
 
@@ -7496,6 +9050,8 @@ async function setupEventListeners() {
       state.currentConvId = session_id;
     }
     if (session_id && session_id !== state.currentConvId) return;
+    msgs.querySelectorAll('.media-skeleton-loader').forEach(el => el.remove());
+
     if (currentChatStream) {
       currentChatStream.done(result || "");
       currentChatStream = null;
@@ -7566,30 +9122,58 @@ async function setupEventListeners() {
     
     state.downloads[payload.model] = payload;
 
-  if (payload.model === 'Ollama' || (typeof obModel !== 'undefined' && payload.model === obModel)) {
-    const obCard = $('ob-card');
-    if (obCard && obStep === 2 && obProvider?.id === 'ollama') {
-      const progressBar = obCard.querySelector('.model-progress-bar');
-      const progressText = obCard.querySelector('.model-progress-text');
-      if (progressBar) progressBar.style.width = `${payload.percent}%`;
-      if (progressText) progressText.textContent = `${payload.status} (${payload.percent}%)`;
+    // 1. Onboarding updates
+    if (payload.model === 'Ollama' || payload.model === 'LocalAI' || (typeof obModel !== 'undefined' && payload.model === obModel)) {
+      const obCard = $('ob-card');
+      if (obCard && obStep === 2) {
+        const progressBar = obCard.querySelector('.model-progress-bar');
+        const progressText = obCard.querySelector('.model-progress-text');
+        const statusDetail = obCard.querySelector('.installer-status-detail');
+        if (progressBar) progressBar.style.width = `${payload.percent}%`;
+        if (progressText) progressText.textContent = `${payload.percent}%`;
+        if (statusDetail) {
+          statusDetail.textContent = payload.status + (payload.total ? ` (${formatBytes(payload.completed || 0)} of ${formatBytes(payload.total)})` : '');
+        }
+        return; // Return here so we don't fall through to renderModelList(true)!
+      }
     }
-  }
 
-  if (payload.model === 'Ollama') {
-    const card = $('model-list')?.querySelector('.ollama-installer-card');
-    if (card) {
-      const progressBar = card.querySelector('.model-progress-bar');
-      const progressText = card.querySelector('.model-progress-text');
-      if (progressBar) progressBar.style.width = `${payload.percent}%`;
-      if (progressText) progressText.textContent = `${payload.status} (${payload.percent}%)`;
+    // 2. If the model overlay is closed, do not perform any DOM rendering/polling for the model list
+    const modelOverlay = $('overlay-model');
+    if (!modelOverlay || !modelOverlay.classList.contains('open')) {
       return;
     }
-    const obCard = $('ob-card');
-    if (obCard && obStep === 2 && obProvider?.id === 'ollama') {
-      return;
+
+    // 3. Model list inline updates
+    if (payload.model === 'Ollama') {
+      const card = $('model-list')?.querySelector('.ollama-installer-card');
+      if (card) {
+        const progressBar = card.querySelector('.model-progress-bar');
+        const progressText = card.querySelector('.model-progress-text');
+        const statusDetail = card.querySelector('.installer-status-detail');
+        if (progressBar) progressBar.style.width = `${payload.percent}%`;
+        if (progressText) progressText.textContent = `${payload.percent}%`;
+        if (statusDetail) {
+          statusDetail.textContent = payload.status + (payload.total ? ` (${formatBytes(payload.completed || 0)} of ${formatBytes(payload.total)})` : '');
+        }
+        return;
+      }
     }
-  }
+
+    if (payload.model === 'LocalAI') {
+      const card = $('model-list')?.querySelector('.localai-installer-card');
+      if (card) {
+        const progressBar = card.querySelector('.model-progress-bar');
+        const progressText = card.querySelector('.model-progress-text');
+        const statusDetail = card.querySelector('.installer-status-detail');
+        if (progressBar) progressBar.style.width = `${payload.percent}%`;
+        if (progressText) progressText.textContent = `${payload.percent}%`;
+        if (statusDetail) {
+          statusDetail.textContent = payload.status + (payload.total ? ` (${formatBytes(payload.completed || 0)} of ${formatBytes(payload.total)})` : '');
+        }
+        return;
+      }
+    }
     
     // Smooth inline progress updates without full list redraw
     const list = $('model-list');
@@ -7602,7 +9186,7 @@ async function setupEventListeners() {
           progressBar.style.width = `${payload.percent}%`;
         }
         if (progressText) {
-          progressText.textContent = `${payload.status} (${payload.percent}%)`;
+          progressText.textContent = payload.status + (payload.total ? ` (${formatBytes(payload.completed || 0)} of ${formatBytes(payload.total)})` : '') + ` (${payload.percent}%)`;
         }
         return; // Success! Inline updated.
       }
@@ -7611,17 +9195,41 @@ async function setupEventListeners() {
   });
 
   // Model download finished
-  await listen('download-finished', e => {
+  await listen('download-finished', async e => {
     const payload = e.payload || {};
     const modelName = payload.model;
     if (state.downloads) delete state.downloads[modelName];
     toast(`Successfully downloaded ${modelName}!`);
-    _cachedModels = null;
-    renderModelList();
     
-    // Switch to the model automatically
-    const isVision = _cachedModels?.find(m => m.name === modelName)?.vision || false;
-    switchModel(modelName, 'ollama', 'http://127.0.0.1:11434', isVision, true);
+    if (modelName === 'LocalAI' || modelName === 'Ollama') {
+      _cachedModels = null;
+      await renderModelList();
+      return;
+    }
+
+    _cachedModels = null;
+    await renderModelList();
+    
+    // Switch to the model automatically by querying updated cached models list
+    const m = (_cachedModels || []).find(x => x.name === modelName);
+    if (m) {
+      switchModel(m.name, m.provider, m.base_url || '', m.vision || false, true);
+    } else {
+      // Fallback logic
+      const laCatalog = [
+        "LocalAI-functioncall-llama3.2-3b-v0.5",
+        "stablediffusion-ggml",
+        "animatediff",
+        "kokoro",
+        "faster-whisper",
+        "musicgen"
+      ];
+      if (laCatalog.includes(modelName)) {
+        switchModel(modelName, 'localai', '', false, true);
+      } else {
+        switchModel(modelName, 'ollama', 'http://127.0.0.1:11434', false, true);
+      }
+    }
 
     // Auto-advance onboarding setup if this model was being downloaded
     if (obStep === 2 && obProvider?.id === 'ollama' && obModel === modelName) {
@@ -7843,6 +9451,18 @@ function escHtml(s) {
 }
 function escAttr(s) {
   return String(s||'').replace(/'/g,'&#39;').replace(/"/g,'&quot;');
+}
+function formatBytes(bytes) {
+  if (bytes === 0 || !bytes) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+}
+function stripAnsi(text) {
+  if (!text) return '';
+  const ansiRegex = /[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+  return text.replace(ansiRegex, '');
 }
 
 // ── Boot ────────────────────────────────────────────────────────────────
@@ -8993,6 +10613,34 @@ window.addEventListener('resize', () => {
 async function handleDownloadCancel(name) {
   try {
     await invoke('cancel_download', { name });
+    
+    // Wait a brief moment to ensure file handles are released
+    await new Promise(resolve => setTimeout(resolve, 300));
+    
+    // Find provider to clean up model files from disk
+    let provider = 'ollama';
+    let baseUrl = '';
+    const laCatalog = [
+      "LocalAI-functioncall-llama3.2-3b-v0.5",
+      "stablediffusion-ggml",
+      "animatediff",
+      "kokoro",
+      "faster-whisper",
+      "musicgen"
+    ];
+    if (laCatalog.includes(name)) {
+      provider = 'localai';
+    } else {
+      let models = _cachedModels || [];
+      const m = models.find(x => x.name === name);
+      if (m) {
+        provider = m.provider;
+        baseUrl = m.base_url || '';
+      }
+    }
+    
+    await invoke('delete_model', { name, provider, base_url: baseUrl });
+    
     if (state.downloads && state.downloads[name]) {
       delete state.downloads[name];
     }
@@ -9010,6 +10658,7 @@ async function handleDownloadPauseResume(name, isPaused) {
       if (!state.downloads) state.downloads = {};
       state.downloads[name] = { model: name, status: 'Resuming...', percent: state.downloads[name]?.percent || 0 };
       renderModelList(true);
+      scrollModelPanelToTop();
       
       let models = _cachedModels || [];
       const m = models.find(x => x.name === name) || {};
@@ -9065,13 +10714,8 @@ async function handleGgufImport() {
   state.selectedGgufPath = null;
   state.selectedGgufName = '';
   
-  renderModelList(true);
-  
-  // Scroll list container to top
-  const body = $('model-panel-body');
-  if (body) {
-    body.scrollTo({ top: 0, behavior: 'smooth' });
-  }
+  await renderModelList(true);
+  scrollModelPanelToTop();
   
   try {
     await invoke('import_gguf_model', { name, path });
@@ -9141,10 +10785,63 @@ window.skipTour = skipTour;
 
 window.retryOllamaConnection = async function() {
   if (state.connectingToOllama) return;
+  state.connectingToOllama = true;
+  renderModelList(true);
   toast("Reconnecting to Ollama...");
+  
+  // Try to list models (Ollama is running check)
+  let attempts = 0;
+  while (attempts < 6) {
+    try {
+      await invoke('list_ollama_models');
+      isOllamaRunning = true;
+      break;
+    } catch(e) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    attempts++;
+  }
+  
+  state.connectingToOllama = false;
   await checkOllamaConnection();
   if (!isOllamaRunning) {
     toast("Ollama is still starting. Please wait...");
+  } else {
+    toast("Connected to Ollama!");
+  }
+};
+
+window.retryLocalAiConnection = async function() {
+  if (connectingToLocalAi) return;
+  connectingToLocalAi = true;
+  startLocalAiLogPolling();
+  renderModelList(true);
+  toast("Starting and connecting to LocalAI...");
+  try {
+    await invoke('start_localai');
+  } catch(e) {
+    console.warn("start_localai failed or already started:", e);
+  }
+  
+  // Poll connection for up to 10 seconds so log polling is active while booting
+  let attempts = 0;
+  while (attempts < 10) {
+    const running = await invoke('is_localai_running').catch(() => false);
+    if (running) {
+      isLocalAiRunning = true;
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    attempts++;
+  }
+
+  connectingToLocalAi = false;
+  stopLocalAiLogPolling();
+  await checkLocalAiConnection();
+  if (!isLocalAiRunning) {
+    toast("LocalAI is still starting. Please wait...");
+  } else {
+    toast("Connected to LocalAI!");
   }
 };
 
@@ -9156,19 +10853,44 @@ window.startOllamaDownloadFlow = async function() {
     status: 'Downloading Ollama...',
   };
   renderModelList(true);
+  scrollModelPanelToTop();
   if (obStep === 2 && obProvider?.id === 'ollama') {
     renderOnboarding();
   }
 
-  invoke('install_ollama').then(() => {
+  invoke('install_ollama').then(async () => {
     if (state.downloads && state.downloads['Ollama']) {
       delete state.downloads['Ollama'];
     }
     toast('Ollama installed and started successfully!', 5000);
     _cachedModels = null;
+    isOllamaInstalled = true;
+    isOllamaRunning = true;
     renderModelList();
+    
     if (obStep === 2 && obProvider?.id === 'ollama') {
+      obModel = 'gemma3:4b';
+      toast(`Downloading default model ${obModel}...`);
+      if (!state.downloads) state.downloads = {};
+      state.downloads[obModel] = { model: obModel, status: 'Downloading...', percent: 0 };
       renderOnboarding();
+      
+      try {
+        await invoke('pull_model', { name: obModel, base_url: getBaseUrl('ollama') });
+        await invoke('switch_model', {
+          name: obModel,
+          provider: 'ollama',
+          base_url: getBaseUrl('ollama'),
+          vision: false
+        });
+        await invoke('complete_setup');
+        obStep = 3;
+        renderOnboarding();
+      } catch(err) {
+        if (state.downloads) delete state.downloads[obModel];
+        toast('Failed to download default model: ' + err);
+        renderOnboarding();
+      }
     }
   }).catch(err => {
     if (state.downloads && state.downloads['Ollama']) {
@@ -9744,3 +11466,142 @@ onDOMContentLoaded(() => {
     });
   });
 });
+
+window.startLocalAiDownloadFlow = async function() {
+  localAiInstallError = null;
+  toast("Starting LocalAI installation...");
+  if (!state.downloads) state.downloads = {};
+  state.downloads['LocalAI'] = {
+    percent: 0,
+    status: 'Downloading LocalAI...',
+  };
+  renderModelList(true);
+  scrollModelPanelToTop();
+  if (obStep === 2 && obProvider?.id === 'localai') {
+    renderOnboarding();
+  }
+
+  invoke('install_localai').then(async () => {
+    if (state.downloads && state.downloads['LocalAI']) {
+      delete state.downloads['LocalAI'];
+    }
+    toast('LocalAI installed and started successfully!', 5000);
+    _cachedModels = null;
+    isLocalAiInstalled = true;
+    isLocalAiRunning = true;
+    renderModelList();
+    
+    if (obStep === 2 && obProvider?.id === 'localai') {
+      obModel = 'LocalAI-functioncall-llama3.2-3b-v0.5';
+      toast(`Downloading default model ${obModel}...`);
+      if (!state.downloads) state.downloads = {};
+      state.downloads[obModel] = { model: obModel, status: 'Downloading...', percent: 0 };
+      renderOnboarding();
+      
+      try {
+        await invoke('pull_model', { name: obModel, base_url: getBaseUrl('localai') });
+        await invoke('switch_model', {
+          name: obModel,
+          provider: 'localai',
+          base_url: getBaseUrl('localai'),
+          vision: false
+        });
+        await invoke('complete_setup');
+        obStep = 3;
+        renderOnboarding();
+      } catch(err) {
+        if (state.downloads) delete state.downloads[obModel];
+        toast('Failed to download default model: ' + err);
+        renderOnboarding();
+      }
+    }
+  }).catch(err => {
+    if (state.downloads && state.downloads['LocalAI']) {
+      delete state.downloads['LocalAI'];
+    }
+    localAiInstallError = err;
+    toast('LocalAI installation failed: ' + err, 5000);
+    renderModelList();
+    if (obStep === 2 && obProvider?.id === 'localai') {
+      renderOnboarding();
+    }
+  });
+};
+
+window.handleLocalAiPauseResume = function(isPaused) {
+  const dlKey = Object.keys(state.downloads || {}).find(k => k === 'LocalAI' || k === obModel);
+  if (!dlKey) return;
+  
+  if (isPaused) {
+    toast(`Resuming ${dlKey} download...`);
+    if (!state.downloads) state.downloads = {};
+    state.downloads[dlKey] = { percent: state.downloads[dlKey]?.percent || 0, status: `Resuming ${dlKey}...` };
+    renderModelList(true);
+    if (obStep === 2 && obProvider?.id === 'localai') {
+      renderOnboarding();
+    }
+    if (dlKey === 'LocalAI') {
+      invoke('install_localai').then(() => {
+        if (state.downloads && state.downloads['LocalAI']) delete state.downloads['LocalAI'];
+        toast('LocalAI installed successfully!', 5000);
+        _cachedModels = null;
+        renderModelList();
+        if (obStep === 2 && obProvider?.id === 'localai') renderOnboarding();
+      }).catch(err => {
+        if (state.downloads && state.downloads['LocalAI']) delete state.downloads['LocalAI'];
+        toast('LocalAI install failed: ' + err, 5000);
+        renderModelList();
+        if (obStep === 2 && obProvider?.id === 'localai') renderOnboarding();
+      });
+    } else {
+      invoke('pull_model', { name: dlKey, base_url: getBaseUrl('localai') }).catch(console.warn);
+    }
+  } else {
+    if (state.downloads && state.downloads[dlKey]) {
+      state.downloads[dlKey].status = 'Paused';
+    }
+    renderModelList(true);
+    if (obStep === 2 && obProvider?.id === 'localai') {
+      renderOnboarding();
+    }
+    invoke('cancel_download', { name: dlKey }).catch(console.warn);
+    toast(`${dlKey} download paused`);
+  }
+};
+
+window.handleLocalAiCancel = function() {
+  const dlKey = Object.keys(state.downloads || {}).find(k => k === 'LocalAI' || k === obModel);
+  if (!dlKey) return;
+
+  toast(`${dlKey} installation cancelled`);
+  if (state.downloads && state.downloads[dlKey]) {
+    delete state.downloads[dlKey];
+  }
+  invoke('cancel_download', { name: dlKey }).catch(console.warn);
+  renderModelList(true);
+  if (obStep === 2 && obProvider?.id === 'localai') {
+    renderOnboarding();
+  }
+};
+
+
+function scrollModelPanelToTop() {
+  const body = $('model-panel-body');
+  if (!body) return;
+  body.style.scrollBehavior = 'auto';
+  body.scrollTop = 0;
+  body.scrollTo({ top: 0, behavior: 'auto' });
+  
+  let count = 0;
+  const forceScroll = () => {
+    body.scrollTop = 0;
+    count++;
+    if (count < 20) {
+      requestAnimationFrame(forceScroll);
+    } else {
+      body.style.scrollBehavior = '';
+    }
+  };
+  requestAnimationFrame(forceScroll);
+}
+window.scrollModelPanelToTop = scrollModelPanelToTop;

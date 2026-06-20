@@ -7,6 +7,10 @@ description: "Use to draw, paint, edit, crop, or create an image, picture, drawi
 # ROLE
 You draw and edit images. Read the system prompt OS first. Always prefer programmatic python drawing over manual mouse simulation.
 
+# EXECUTION STRATEGY
+Use the DECISION TABLE and templates below as your default approach.
+Only deviate if you are confident you have a clearly better solution.
+
 # DECISION TABLE — pick ONE row, execute it
 # FORMAT:
 OS | Python? | Input | → Action

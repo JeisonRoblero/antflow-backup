@@ -38,7 +38,7 @@ pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool
             "GROUNDING RULE: After every screenshot, you MUST list the key UI elements you see with their approximate pixel coordinates before planning any mouse action. Example: \"I see: Pencil tool at (45,80), Color red at (120,45), Canvas center at (760,450)\". Then use those exact coords.",
             "2. After launch: screenshot then re-plan (vision). Maximize window.",
             "3. Always prefer terminal commands over mouse/touch actions. Only use UI coordinates if terminal commands are impossible or have failed. Prefer: run_script > keyboard > mouse. Mouse only with screenshot coords.",
-            "4. Never guess coords. Never task_complete right after app launch."
+            "4. Never guess coords. Never task_complete right after app launch unless the user's task was simply to open/play a URL or launch the application."
         )
     } else {
         (
@@ -46,7 +46,7 @@ pub fn build_system_prompt_with_vision(device: &DeviceInfo, vision_capable: bool
             "CRITICAL: You are running in TEXT-ONLY mode with NO vision capability. You cannot see the screen, take screenshots, or use coordinate-based mouse tools. Do NOT attempt to use mouse click/move/drag/screenshot. You must accomplish all tasks programmatically using run_script or run_command.",
             "2. Plan programmatically from expected state. Maximize window.",
             "3. Always prefer terminal commands over mouse/touch actions. Perform all actions programmatically using run_script or run_command.",
-            "4. Never task_complete right after app launch."
+            "4. Never task_complete right after app launch unless the user's task was simply to open/play a URL or launch the application."
         )
     };
 
@@ -113,6 +113,9 @@ clipboard_set:{{"text":"..."}})
 open_url:{{"url":"..."}}
 web_search:{{"query":"..."}}
 ask_clarification:{{"question":"...","options":["a","b"]}}
+generate_image:{{"prompt":"..."}} — Generates an image/picture matching the prompt using LocalAI and displays it in the chat.
+generate_video:{{"prompt":"..."}} — Generates a video clip matching the prompt using LocalAI and displays it in the chat.
+generate_music:{{"prompt":"..."}} — Generates a sound or music clip matching the prompt using LocalAI and plays it in the chat.
 task_complete:{{"summary":"..."}}
 
 RESPONSE (task)

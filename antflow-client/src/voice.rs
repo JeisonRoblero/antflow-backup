@@ -195,45 +195,49 @@ async fn run_voice_pipeline(
     write_wav_file(&wav_path, &samples)?;
 
     let state = app_handle.state::<AppState>();
-    let (provider_id, api_key, model_name, base_url) = {
-        let cfg = state.cfg.lock().await;
-        (
-            cfg.ai.provider.clone(),
-            cfg.ai.api_key.clone(),
-            cfg.ai.model.clone(),
-            cfg.ai.base_url.clone(),
-        )
-    };
+    let cfg = state.cfg.lock().await.clone();
+    let (provider_id, api_key, model_name, base_url) = (
+        cfg.ai.provider.clone(),
+        cfg.ai.api_key.clone(),
+        cfg.ai.model.clone(),
+        cfg.ai.base_url.clone(),
+    );
 
     let mut stt_key = String::new();
     let mut stt_url = "https://api.openai.com/v1".to_string();
     let mut stt_provider = "openai".to_string();
 
-    if provider_id == "openai" && !api_key.is_empty() {
-        stt_key = api_key.clone();
-    } else if provider_id == "groq" && !api_key.is_empty() {
-        stt_key = api_key.clone();
-        stt_url = "https://api.groq.com/openai/v1".to_string();
-        stt_provider = "groq".to_string();
+    let local_stt_active = !cfg.localai_models.listening.is_empty();
+    if local_stt_active {
+        stt_provider = "localai".to_string();
+        stt_url = format!("http://127.0.0.1:{}", crate::ai::localai::get_active_port());
     } else {
-        let keys = state.provider_keys_multi.lock().await;
-        if let Some(val) = keys.get("openai").and_then(|v| v.first()) {
-            if !val.is_empty() {
-                stt_key = val.clone();
-            }
-        }
-        if stt_key.is_empty() {
-            if let Some(val) = keys.get("groq").and_then(|v| v.first()) {
+        if provider_id == "openai" && !api_key.is_empty() {
+            stt_key = api_key.clone();
+        } else if provider_id == "groq" && !api_key.is_empty() {
+            stt_key = api_key.clone();
+            stt_url = "https://api.groq.com/openai/v1".to_string();
+            stt_provider = "groq".to_string();
+        } else {
+            let keys = state.provider_keys_multi.lock().await;
+            if let Some(val) = keys.get("openai").and_then(|v| v.first()) {
                 if !val.is_empty() {
                     stt_key = val.clone();
-                    stt_url = "https://api.groq.com/openai/v1".to_string();
-                    stt_provider = "groq".to_string();
+                }
+            }
+            if stt_key.is_empty() {
+                if let Some(val) = keys.get("groq").and_then(|v| v.first()) {
+                    if !val.is_empty() {
+                        stt_key = val.clone();
+                        stt_url = "https://api.groq.com/openai/v1".to_string();
+                        stt_provider = "groq".to_string();
+                    }
                 }
             }
         }
     }
 
-    if stt_key.is_empty() {
+    if stt_key.is_empty() && !local_stt_active {
         eprintln!("Voice: No API key found for Whisper transcription");
         let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
         reset_session_to_listening().await;
@@ -252,13 +256,51 @@ async fn run_voice_pipeline(
 
     let form = reqwest::multipart::Form::new()
         .part("file", part)
-        .text("model", if stt_provider == "groq" { "whisper-large-v3" } else { "whisper-1" });
+        .text("model", if stt_provider == "localai" { cfg.localai_models.listening.clone() } else if stt_provider == "groq" { "whisper-large-v3".to_string() } else { "whisper-1".to_string() });
 
-    let resp = client.post(&url)
-        .header("Authorization", format!("Bearer {}", stt_key))
-        .multipart(form)
-        .send()
-        .await?;
+    let resp_res = if local_stt_active {
+        let local_res = client.post(&url)
+            .multipart(form)
+            .send()
+            .await;
+        match local_res {
+            Ok(r) if r.status().is_success() => Ok(r),
+            _ => {
+                // Quiet fallback
+                let fallback_stt_provider = if !api_key.is_empty() && provider_id == "groq" { "groq" } else { "openai" };
+                let fallback_stt_url = if fallback_stt_provider == "groq" { "https://api.groq.com/openai/v1" } else { "https://api.openai.com/v1" };
+                let fallback_stt_key = if fallback_stt_provider == "groq" { api_key.clone() } else {
+                    let keys = state.provider_keys_multi.lock().await;
+                    keys.get("openai").and_then(|v| v.first()).cloned().unwrap_or_default()
+                };
+                if !fallback_stt_key.is_empty() {
+                    let fallback_url = format!("{}/audio/transcriptions", fallback_stt_url.trim_end_matches('/'));
+                    let wav_bytes_fb = std::fs::read(&wav_path)?;
+                    let part_fb = reqwest::multipart::Part::bytes(wav_bytes_fb)
+                        .file_name("audio.wav")
+                        .mime_str("audio/wav")?;
+                    let fallback_form = reqwest::multipart::Form::new()
+                        .part("file", part_fb)
+                        .text("model", if fallback_stt_provider == "groq" { "whisper-large-v3" } else { "whisper-1" });
+                    client.post(&fallback_url)
+                        .header("Authorization", format!("Bearer {}", fallback_stt_key))
+                        .multipart(fallback_form)
+                        .send()
+                        .await
+                } else {
+                    anyhow::bail!("LocalAI STT failed, and no fallback API keys are available");
+                }
+            }
+        }
+    } else {
+        client.post(&url)
+            .header("Authorization", format!("Bearer {}", stt_key))
+            .multipart(form)
+            .send()
+            .await
+    };
+
+    let resp = resp_res?;
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -362,7 +404,7 @@ async fn run_voice_pipeline(
             let parts = split_sentence_for_tts(&sentence);
             for part in parts {
                 if *cancel_rx_clone.borrow() { break; }
-                let audio_bytes = match synthesize_tts(&part, &provider_id_clone, &api_key_clone).await {
+                let audio_bytes = match synthesize_tts(&part, &provider_id_clone, &api_key_clone, &app_handle_clone).await {
                     Ok(b) => b,
                     Err(e) => {
                         eprintln!("TTS synthesis failed: {}", e);
@@ -468,11 +510,41 @@ async fn reset_session_to_listening() {
     }
 }
 
-async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str) -> anyhow::Result<Vec<u8>> {
+async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str, app_handle: &tauri::AppHandle) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::new();
     let cleaned = text.trim();
     if cleaned.is_empty() {
         return Ok(vec![]);
+    }
+
+    let state = app_handle.state::<AppState>();
+    let cfg = state.cfg.lock().await.clone();
+    let local_voice_active = !cfg.localai_models.speaking.is_empty();
+
+    if local_voice_active {
+        let active_port = crate::ai::localai::get_active_port();
+        let url = format!("http://127.0.0.1:{}/v1/audio/speech", active_port);
+        let voice = if cfg.localai_voice.is_empty() { "af_sky".to_string() } else { cfg.localai_voice.clone() };
+        let body = json!({
+            "model": cfg.localai_models.speaking,
+            "input": cleaned,
+            "voice": voice
+        });
+
+        let local_res = client.post(&url)
+            .json(&body)
+            .send()
+            .await;
+
+        match local_res {
+            Ok(r) if r.status().is_success() => {
+                let bytes = r.bytes().await?;
+                return Ok(bytes.to_vec());
+            }
+            _ => {
+                eprintln!("LocalAI TTS failed; falling back to default voice");
+            }
+        }
     }
 
     if provider_id == "openai" && !api_key.is_empty() {
@@ -595,7 +667,7 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lookup = [0u8; 256];
     for (i, &c) in ALPHABET.iter().enumerate() {

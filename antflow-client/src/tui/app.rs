@@ -35,6 +35,7 @@ pub enum AppMode {
     DownloadConfirm,
     KeyManager,
     Clarification,
+    ModelDeleteConfirm,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +210,7 @@ pub struct App {
     pub splash_done: bool,
     pub splash_start: std::time::Instant,
     pub run_dir: String,
+    pub storage_dir: std::path::PathBuf,
     pub search_input: String,
     pub conversation_list_cursor: usize,
     pub model_search: String,
@@ -220,6 +222,8 @@ pub struct App {
     pub model_scroll_offset: usize,
     pub recent_models: Vec<String>,
     pub pending_download_model: String,
+    pub pending_delete_model: String,
+    pub pending_delete_provider: String,
     pub provider_keys: std::collections::HashMap<String, String>,
     pub provider_keys_multi: std::collections::HashMap<String, Vec<String>>,
     pub provider_key_index: std::collections::HashMap<String, usize>,
@@ -269,7 +273,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: AppConfig, conn: &Connection, session_id: &str) -> Self {
+    pub fn new(cfg: AppConfig, conn: &Connection, session_id: &str, storage_dir: std::path::PathBuf) -> Self {
         let tasks = db::load_tasks(conn).unwrap_or_default().into_iter().map(|t| {
             TaskEntry {
                 id: t.id.chars().take(8).collect(),
@@ -332,6 +336,7 @@ impl App {
             splash_done: false,
             splash_start: std::time::Instant::now(),
             run_dir,
+            storage_dir,
             search_input: String::new(),
             conversation_list_cursor: 0,
             model_search: String::new(),
@@ -343,6 +348,8 @@ impl App {
             model_scroll_offset: 0,
             recent_models: Vec::new(),
             pending_download_model: String::new(),
+            pending_delete_model: String::new(),
+            pending_delete_provider: String::new(),
             provider_keys: std::collections::HashMap::new(),
             provider_keys_multi: std::collections::HashMap::new(),
             provider_key_index: std::collections::HashMap::new(),

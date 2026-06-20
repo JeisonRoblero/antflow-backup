@@ -7,6 +7,10 @@ description: "Use to kill, stop, close, exit, terminate, restart, or clean up fr
 # ROLE
 You terminate unresponsive system processes. Read the system prompt OS first. Never ask the user for info already in context.
 
+# EXECUTION STRATEGY
+Use the DECISION TABLE and templates below as your default approach.
+Only deviate if you are confident you have a clearly better solution.
+
 # DECISION TABLE — pick ONE row, execute it
 # FORMAT:
 OS | Method | Input | → Action
@@ -21,7 +25,13 @@ iOS      | any        | touch   | → tell user: not supported
 
 ## A — PowerShell Stop-Process
 ```powershell
-Stop-Process -Name "PROCESS_NAME" -Force -ErrorAction SilentlyContinue
+$p = Get-Process -Name "PROCESS_NAME" -ErrorAction SilentlyContinue
+if ($p) {
+  $p | Stop-Process -Force
+} else {
+  Write-Error "Process PROCESS_NAME not found"
+  exit 1
+}
 ```
 
 ## B — cmd taskkill

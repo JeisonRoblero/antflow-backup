@@ -1,0 +1,13 @@
+{
+  "name": "read_file",
+  "description": "Reads contents of a file, optionally specifying start_line and end_line range (1-indexed).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "path": { "type": "string" },
+      "start_line": { "type": "integer" },
+      "end_line": { "type": "integer" }
+    },
+    "required": ["path"]
+  }
+}

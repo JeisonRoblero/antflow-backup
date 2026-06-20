@@ -13,7 +13,7 @@ tui = ["dep:ratatui", "dep:crossterm"]
 gui = ["dep:tauri"]
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"], optional = true }
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api"], optional = true }
 
 # --- Async runtime ---
 tokio = { version = "1", features = ["full"] }

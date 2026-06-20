@@ -11,6 +11,7 @@ pub struct ModelEntry {
     pub is_installed: bool,
     pub is_cloud: bool,
     pub size_gb: f32,
+    pub category: Option<String>,
 }
 
 #[derive(Clone)]
@@ -49,6 +50,7 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
             is_installed: m.installed,
             is_cloud: false,
             size_gb: m.size_gb,
+            category: Some("chat".to_string()),
         })
         .collect();
 
@@ -64,6 +66,26 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
                 is_installed: false,
                 is_cloud: false,
                 size_gb: k.size_gb,
+                category: Some("chat".to_string()),
+            });
+        }
+    }
+
+    let mut localai_models: Vec<ModelEntry> = Vec::new();
+    let la_catalog = crate::ai::localai::get_catalog();
+    for m in la_catalog {
+        if search.is_empty() || m.name.to_lowercase().contains(&search) {
+            let is_installed = crate::ai::localai::is_model_installed(&app.storage_dir, &m.name);
+            localai_models.push(ModelEntry {
+                name: m.name.clone(),
+                provider_id: "localai".to_string(),
+                provider_name: "LocalAI".to_string(),
+                model_id: m.name.clone(),
+                vision: m.vision,
+                is_installed,
+                is_cloud: false,
+                size_gb: m.size_gb,
+                category: Some(m.category.clone()),
             });
         }
     }
@@ -81,6 +103,21 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
                 provider_color: Color::Rgb(80, 200, 120),
                 has_key: true,
                 models: ollama_models,
+            }],
+        });
+    }
+
+    if !localai_models.is_empty() {
+        let installed_count = localai_models.iter().filter(|m| m.is_installed).count();
+        sections.push(ProviderSection {
+            label: "󰣆  Local — LocalAI".to_string(),
+            header_color: Color::Rgb(100, 160, 255),
+            count_label: format!("{} installed", installed_count),
+            providers: vec![ProviderGroup {
+                provider_label: String::new(),
+                provider_color: Color::Rgb(100, 160, 255),
+                has_key: true,
+                models: localai_models,
             }],
         });
     }
@@ -116,6 +153,7 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
                 is_installed: false,
                 is_cloud: true,
                 size_gb: 0.0,
+                category: Some("chat".to_string()),
             });
         }
     }
@@ -156,6 +194,7 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
                 is_installed,
                 is_cloud: false,
                 size_gb: m.size_bytes as f32 / (1024.0 * 1024.0 * 1024.0),
+                category: Some("chat".to_string()),
             }
         }).collect();
 
@@ -199,6 +238,7 @@ pub fn build_model_list_grouped(app: &App) -> Vec<ProviderSection> {
                         is_installed: false,
                         is_cloud: false,
                         size_gb: 0.0,
+                        category: Some("chat".to_string()),
                     }],
                 }],
             });
@@ -218,6 +258,7 @@ fn provider_color(id: &str) -> Color {
         "nvidia"     => Color::Rgb(118, 185, 0),
         "openrouter" => Color::Rgb(160, 100, 255),
         "together"   => Color::Rgb(0, 180, 200),
+        "localai"    => Color::Rgb(100, 160, 255),
         _            => Color::White,
     }
 }

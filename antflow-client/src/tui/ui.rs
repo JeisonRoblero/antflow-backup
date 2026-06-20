@@ -108,6 +108,7 @@ draw_top_bar(f, app, top_chunks[0]);
         AppMode::DownloadConfirm => { draw_dim_overlay(f, size); draw_download_confirm(f, app, size); }
         AppMode::KeyManager => { draw_dim_overlay(f, size); draw_key_manager(f, app, size); }
         AppMode::Clarification => { draw_dim_overlay(f, size); draw_clarification(f, app, size); }
+        AppMode::ModelDeleteConfirm => { draw_dim_overlay(f, size); draw_model_delete_confirm(f, app, size); }
         _ => {}
     }
 }
@@ -1015,43 +1016,99 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_bottom_bar(f: &mut Frame, app: &App, area: Rect, panel_visible: bool, term_width: u16) {
-    let hints = match app.mode {
+    let s = match app.mode {
         AppMode::Chat | AppMode::CommandMenu => {
-            return f.render_widget(
-                Paragraph::new(Line::from(if term_width >= 80 {
-                    let panel_action = if panel_visible { "hide" } else { "show" };
-                    let mut s = vec![
-                        Span::styled(" / ", Style::default().fg(ACCENT)),
-                        Span::styled("commands", Style::default().fg(DIM)),
-                        Span::styled("  Ctrl+q ", Style::default().fg(ACCENT)),
-                        Span::styled("quit", Style::default().fg(DIM)),
-                        Span::styled("  Esc ", Style::default().fg(ACCENT)),
-                        Span::styled("stop", Style::default().fg(DIM)),
-                        Span::styled("  ↑↓ ", Style::default().fg(ACCENT)),
-                        Span::styled("scroll", Style::default().fg(DIM)),
-                        Span::styled("  Ctrl+d ", Style::default().fg(ACCENT)),
-                        Span::styled(panel_action.to_string() + " panel", Style::default().fg(DIM)),
-                    ];
-                    if panel_visible && term_width >= 110 {
-                        s.push(Span::styled("  Ctrl+← → ", Style::default().fg(ACCENT)));
-                        s.push(Span::styled("resize", Style::default().fg(DIM)));
-                    }
-                    s
-                } else {
-                    vec![Span::styled(
-                        " /  Ctrl+q  Esc  Ctrl+d panel",
-                        Style::default().fg(DIM),
-                    )]
-                })).style(Style::default().bg(BG)),
-                area,
-            );
+            let panel_action = if panel_visible { "hide" } else { "show" };
+            if term_width >= 100 {
+                let mut v = vec![
+                    Span::styled(" / ", Style::default().fg(ACCENT)),
+                    Span::styled("commands", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+h ", Style::default().fg(ACCENT)),
+                    Span::styled("help", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+m ", Style::default().fg(ACCENT)),
+                    Span::styled("model", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+r ", Style::default().fg(ACCENT)),
+                    Span::styled("history", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+t ", Style::default().fg(ACCENT)),
+                    Span::styled("tasks", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+d ", Style::default().fg(ACCENT)),
+                    Span::styled(panel_action.to_string() + " panel", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+q ", Style::default().fg(ACCENT)),
+                    Span::styled("quit", Style::default().fg(DIM)),
+                ];
+                if panel_visible && term_width >= 120 {
+                    v.push(Span::styled("  Ctrl+← → ", Style::default().fg(ACCENT)));
+                    v.push(Span::styled("resize", Style::default().fg(DIM)));
+                }
+                v
+            } else {
+                vec![
+                    Span::styled(" / ", Style::default().fg(ACCENT)),
+                    Span::styled("cmds", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+h ", Style::default().fg(ACCENT)),
+                    Span::styled("help", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+m ", Style::default().fg(ACCENT)),
+                    Span::styled("model", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+r ", Style::default().fg(ACCENT)),
+                    Span::styled("hist", Style::default().fg(DIM)),
+                    Span::styled("  Ctrl+t ", Style::default().fg(ACCENT)),
+                    Span::styled("tasks", Style::default().fg(DIM)),
+                ]
+            }
         }
-        _ => "",
+        AppMode::ModelSelect => {
+            vec![
+                Span::styled(" ↑↓ ", Style::default().fg(ACCENT)),
+                Span::styled("scroll", Style::default().fg(DIM)),
+                Span::styled("  Enter ", Style::default().fg(ACCENT)),
+                Span::styled("select model", Style::default().fg(DIM)),
+                Span::styled("  Esc ", Style::default().fg(ACCENT)),
+                Span::styled("cancel", Style::default().fg(DIM)),
+                Span::styled("  Ctrl+d ", Style::default().fg(ACCENT)),
+                Span::styled("delete GGUF", Style::default().fg(DIM)),
+            ]
+        }
+        AppMode::ConversationList => {
+            vec![
+                Span::styled(" ↑↓ ", Style::default().fg(ACCENT)),
+                Span::styled("scroll", Style::default().fg(DIM)),
+                Span::styled("  Enter ", Style::default().fg(ACCENT)),
+                Span::styled("load", Style::default().fg(DIM)),
+                Span::styled("  Ctrl+r ", Style::default().fg(ACCENT)),
+                Span::styled("rename", Style::default().fg(DIM)),
+                Span::styled("  Backspace/Ctrl+d ", Style::default().fg(ACCENT)),
+                Span::styled("delete", Style::default().fg(DIM)),
+                Span::styled("  Esc ", Style::default().fg(ACCENT)),
+                Span::styled("cancel", Style::default().fg(DIM)),
+            ]
+        }
+        AppMode::TaskManager => {
+            vec![
+                Span::styled(" ↑↓ ", Style::default().fg(ACCENT)),
+                Span::styled("scroll", Style::default().fg(DIM)),
+                Span::styled("  Enter/p ", Style::default().fg(ACCENT)),
+                Span::styled("toggle task", Style::default().fg(DIM)),
+                Span::styled("  Backspace/d ", Style::default().fg(ACCENT)),
+                Span::styled("delete", Style::default().fg(DIM)),
+                Span::styled("  Esc ", Style::default().fg(ACCENT)),
+                Span::styled("close", Style::default().fg(DIM)),
+            ]
+        }
+        AppMode::Help => {
+            vec![
+                Span::styled(" Esc / Ctrl+h ", Style::default().fg(ACCENT)),
+                Span::styled("close help", Style::default().fg(DIM)),
+            ]
+        }
+        _ => {
+            vec![
+                Span::styled(" Esc ", Style::default().fg(ACCENT)),
+                Span::styled("cancel/close", Style::default().fg(DIM)),
+            ]
+        }
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(hints, Style::default().fg(DIM))).style(Style::default().bg(BG)),
-        area,
-    );
+
+    f.render_widget(Paragraph::new(Line::from(s)).style(Style::default().bg(BG)), area);
 }
 
 #[allow(dead_code)]
@@ -1253,7 +1310,19 @@ fn draw_model_overlay(f: &mut Frame, app: &App, area: Rect) {
             }
 
             for entry in &provider_group.models {
-                let is_active = entry.name == app.cfg.ai.model;
+                let is_active = if entry.provider_id == "localai" {
+                    match entry.category.as_deref() {
+                        Some("chat") => entry.name == app.cfg.localai_models.chat || (app.cfg.ai.provider == "localai" && entry.name == app.cfg.ai.model),
+                        Some("images") => entry.name == app.cfg.localai_models.images,
+                        Some("video") => entry.name == app.cfg.localai_models.video,
+                        Some("speaking") => entry.name == app.cfg.localai_models.speaking,
+                        Some("listening") => entry.name == app.cfg.localai_models.listening,
+                        Some("music") => entry.name == app.cfg.localai_models.music,
+                        _ => entry.name == app.cfg.ai.model,
+                    }
+                } else {
+                    entry.name == app.cfg.ai.model
+                };
                 let is_selected = sel_i == cursor;
 
                 let mut spans = vec![
@@ -1285,6 +1354,28 @@ fn draw_model_overlay(f: &mut Frame, app: &App, area: Rect) {
                         .fg(name_color)
                         .add_modifier(if is_active { Modifier::BOLD } else { Modifier::empty() }),
                 ));
+
+                if let Some(ref cat) = entry.category {
+                    let cat_label = match cat.as_str() {
+                        "chat" => "Chat",
+                        "images" => "Images",
+                        "video" => "Video",
+                        "speaking" => "Speaking",
+                        "listening" => "Listening",
+                        "music" => "Music",
+                        _ => cat.as_str(),
+                    };
+                    let (fg, bg) = match cat.as_str() {
+                        "chat" => (Color::White, Color::Rgb(30, 100, 40)),
+                        "images" => (Color::White, Color::Rgb(30, 60, 140)),
+                        "video" => (Color::White, Color::Rgb(90, 30, 140)),
+                        "speaking" => (Color::White, Color::Rgb(140, 30, 30)),
+                        "listening" => (Color::White, Color::Rgb(140, 80, 20)),
+                        "music" => (Color::White, Color::Rgb(30, 110, 110)),
+                        _ => (Color::White, Color::Rgb(60, 60, 60)),
+                    };
+                    spans.push(Span::styled(format!(" [{}]", cat_label), Style::default().fg(fg).bg(bg)));
+                }
 
                 if entry.size_gb > 0.0 {
                     spans.push(Span::styled(
@@ -1657,16 +1748,29 @@ fn draw_download_confirm(f: &mut Frame, app: &App, area: Rect) {
     let popup = centered_rect(popup_w, h_pct, area);
     f.render_widget(Clear, popup);
 
-    let info = OLLAMA_CATALOG.iter().find(|k| k.name == app.pending_download_model.as_str());
-    let size_str = info.map(|k| format!("{:.1} GB", k.size_gb)).unwrap_or_else(|| "unknown size".to_string());
-    let vision_str = info.map(|k| if k.vision { "  👁 vision capable" } else { "" }).unwrap_or("");
+    let la_catalog = crate::ai::localai::get_catalog();
+    let is_localai = la_catalog.iter().any(|m| m.name == app.pending_download_model.as_str()) || app.pending_download_model == "LocalAI Engine";
+
+    let (size_str, vision_str, engine_str) = if app.pending_download_model == "LocalAI Engine" {
+        ("~250 MB".to_string(), "", "LocalAI")
+    } else if is_localai {
+        let info = la_catalog.iter().find(|m| m.name == app.pending_download_model.as_str());
+        let size_str = info.map(|m| format!("{:.1} GB", m.size_gb)).unwrap_or_else(|| "unknown size".to_string());
+        let vision_str = info.map(|m| if m.vision { "  👁 vision capable" } else { "" }).unwrap_or("");
+        (size_str, vision_str, "LocalAI")
+    } else {
+        let info = OLLAMA_CATALOG.iter().find(|k| k.name == app.pending_download_model.as_str());
+        let size_str = info.map(|k| format!("{:.1} GB", k.size_gb)).unwrap_or_else(|| "unknown size".to_string());
+        let vision_str = info.map(|k| if k.vision { "  👁 vision capable" } else { "" }).unwrap_or("");
+        (size_str, vision_str, "Ollama")
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Rgb(80, 160, 255)))
         .title(Span::styled(
-            " Download Model ",
+            if app.pending_download_model == "LocalAI Engine" { " Setup LocalAI Engine " } else { " Download Model " },
             Style::default().fg(Color::Rgb(80, 160, 255)).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(BG));
@@ -1677,7 +1781,7 @@ fn draw_download_confirm(f: &mut Frame, app: &App, area: Rect) {
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Model:  ", Style::default().fg(DIM)),
+            Span::styled(if app.pending_download_model == "LocalAI Engine" { "  Engine: " } else { "  Model:  " }, Style::default().fg(DIM)),
             Span::styled(
                 app.pending_download_model.clone(),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
@@ -1690,7 +1794,7 @@ fn draw_download_confirm(f: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "  Ollama will pull this model in the background.",
+            format!("  {} will pull this model in the background.", engine_str),
             Style::default().fg(Color::Rgb(140, 140, 160)),
         )),
         Line::from(Span::styled(
@@ -1865,6 +1969,48 @@ fn draw_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(text), inner);
 }
 
+fn draw_model_delete_confirm(f: &mut Frame, app: &App, area: Rect) {
+    let needed = 10u16;
+    let h_pct = ((needed as f32 / area.height as f32) * 100.0) as u16;
+    let h_pct = h_pct.clamp(25, 50);
+    let popup_w = if area.width < 80 { 95 } else { 46 };
+    let popup = centered_rect(popup_w, h_pct, area);
+    f.render_widget(Clear, popup);
+
+    let name = &app.pending_delete_model;
+    let provider = &app.pending_delete_provider;
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(ERROR_COLOR))
+        .title(Span::styled(" Delete Model ", Style::default().fg(ERROR_COLOR).add_modifier(Modifier::BOLD)));
+
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  Delete \"{}\" ({})?", name, provider),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  This will permanently delete the model file.", Style::default().fg(DIM))),
+        Line::from(""),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter / y  ", Style::default().fg(Color::Rgb(12,14,20)).bg(ERROR_COLOR).add_modifier(Modifier::BOLD)),
+            Span::styled("  confirm delete", Style::default().fg(ERROR_COLOR)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Esc / n    ", Style::default().fg(DIM).bg(Color::Rgb(25,28,40)).add_modifier(Modifier::BOLD)),
+            Span::styled("  cancel", Style::default().fg(DIM)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(text), inner);
+}
+
 fn draw_help_overlay(f: &mut Frame, area: Rect) {
     let popup_w = if area.width < 80 { 98 } else { 55 };
     let popup = centered_rect(popup_w, 92, area);
@@ -1888,21 +2034,29 @@ fn draw_help_overlay(f: &mut Frame, area: Rect) {
         Line::from(Span::styled("  /info           System info", Style::default().fg(Color::White))),
         Line::from(Span::styled("  /quit           Quit (confirm twice)", Style::default().fg(Color::White))),
         Line::from(""),
-        Line::from(Span::styled("  Keyboard", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  Global Hotkeys", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  Ctrl+H      Toggle Help overlay", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+M      Select AI model", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+R      Browse conversation history", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+T      Open Task Manager", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+D      Toggle sidebar panel", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+← →    Resize sidebar panel", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+Q      Quit application", Style::default().fg(Color::White))),
+        Line::from(""),
+        Line::from(Span::styled("  Chat Controls", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled("  Enter       Send message", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  up/down     Scroll chat", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  Ctrl+E      Expand/collapse thinking", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  Esc         Stop current task", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  Ctrl+Q      Quit (confirm)", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  up/down     Scroll chat log", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+E      Expand/collapse thinking bubble", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Esc         Cancel current active task", Style::default().fg(Color::White))),
         Line::from(""),
-        Line::from(Span::styled("  Conversations", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled("  Enter       Load selected", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  Ctrl+R      Rename", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  Ctrl+D      Delete (with confirm)", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  History / Sessions", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  Enter       Load selected conversation", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Ctrl+R      Rename selected conversation", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Backspace   Delete selected conversation", Style::default().fg(Color::White))),
         Line::from(""),
-        Line::from(Span::styled("  Top bar", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled("  ctx shows tokens used/limit (%)", Style::default().fg(Color::White))),
-        Line::from(Span::styled("  cost shown for cloud providers", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Task Manager", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled("  Enter / P   Toggle (pause/resume) selected task", Style::default().fg(Color::White))),
+        Line::from(Span::styled("  Backspace/D Delete selected task", Style::default().fg(Color::White))),
     ];
 
     f.render_widget(Paragraph::new(text).block(block), popup);
@@ -2560,17 +2714,18 @@ fn draw_ob_provider(
     let key_inner = key_block.inner(cols[2]);
     f.render_widget(key_block, cols[2]);
 
-    if is_ollama {
+    let is_local = is_ollama || ob.current_provider().map(|p| p.id == "localai").unwrap_or(false);
+    if is_local {
         f.render_widget(
             Paragraph::new(vec![
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  No API key needed.",
+                    if is_ollama { "  No API key needed." } else { "  LocalAI setup required." },
                     Style::default().fg(Color::Rgb(80, 200, 120)),
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Ollama runs locally",
+                    if is_ollama { "  Ollama runs locally" } else { "  LocalAI runs locally" },
                     Style::default().fg(DIM),
                 )),
                 Line::from(Span::styled(

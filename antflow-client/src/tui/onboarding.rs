@@ -95,6 +95,14 @@ pub const ONBOARDING_PROVIDERS: &[OnboardingProvider] = &[
         color: ratatui::style::Color::Rgb(80, 210, 130),
     },
     OnboardingProvider {
+        id: "localai",
+        label: "LocalAI (local, free)",
+        base_url: "",
+        needs_key: false,
+        default_model: "LocalAI-functioncall-llama3.2-3b-v0.5",
+        color: ratatui::style::Color::Rgb(100, 160, 255),
+    },
+    OnboardingProvider {
         id: "openai",
         label: "OpenAI",
         base_url: "https://api.openai.com/v1",
@@ -168,6 +176,8 @@ pub struct OnboardingModel {
 }
 
 pub const ONBOARDING_MODELS: &[OnboardingModel] = &[
+    // LocalAI
+    OnboardingModel { provider_id: "localai", model_id: "LocalAI-functioncall-llama3.2-3b-v0.5", vision: false },
     // OpenAI
     OnboardingModel { provider_id: "openai", model_id: "gpt-4.1",        vision: true  },
     OnboardingModel { provider_id: "openai", model_id: "gpt-4.1-mini",   vision: true  },

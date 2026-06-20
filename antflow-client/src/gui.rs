@@ -54,6 +54,7 @@ pub struct ModelInfo {
     pub vision: bool,
     pub size_gb: f32,
     pub installed: bool,
+    pub category: String,
 }
 
 #[derive(Serialize)]
@@ -141,6 +142,21 @@ pub async fn run(
 
                 let _ = cmd.spawn();
                 tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            }
+        }
+        
+        // Auto-start LocalAI if selected or active
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let any_localai_active = _cfg.ai.provider == "localai"
+                || !_cfg.localai_models.chat.is_empty()
+                || !_cfg.localai_models.images.is_empty()
+                || !_cfg.localai_models.video.is_empty()
+                || !_cfg.localai_models.speaking.is_empty()
+                || !_cfg.localai_models.listening.is_empty()
+                || !_cfg.localai_models.music.is_empty();
+            if any_localai_active && crate::ai::localai::is_installed(&storage_dir).await {
+                let _ = crate::ai::localai::start_server(&storage_dir).await;
             }
         }
     }
@@ -240,6 +256,7 @@ pub async fn run(
             get_config,
             list_models,
             switch_model,
+            delete_model,
             list_conversations,
             new_conversation,
             load_conversation,
@@ -268,6 +285,15 @@ pub async fn run(
             select_gguf_file,
             install_ollama,
             run_chat,
+            is_localai_installed,
+            is_localai_running,
+            start_localai,
+            get_localai_log,
+            install_localai,
+            list_localai_models,
+            switch_localai_model,
+            save_localai_voice,
+            get_localai_voices,
             verify_api_key,
             search_online_models,
             show_window,
@@ -433,18 +459,6 @@ async fn run_prompt(
     };
     let _ = db::insert_message(&conn, &sid, "user", &prompt);
 
-    // Cancel any existing run for this SPECIFIC session
-    {
-        let mut running = state.running_sessions.lock().await;
-        if let Some(act) = running.remove(&sid) {
-            act.stop_flag.store(true, Ordering::Relaxed);
-            if let Some(s) = act.answer_sender {
-                let _ = s.try_send("cancelled".to_string());
-            }
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let (q_tx, mut q_rx) = mpsc::channel::<(String, Vec<String>)>(2);
@@ -453,15 +467,23 @@ async fn run_prompt(
     let (msg_tx, mut msg_rx) = mpsc::channel::<String>(64);
     let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
 
-    // Store in running_sessions map
+    // Cancel any existing run for this SPECIFIC session and insert the new one atomically
     {
         let mut running = state.running_sessions.lock().await;
+        if let Some(act) = running.remove(&sid) {
+            act.stop_flag.store(true, Ordering::Relaxed);
+            if let Some(s) = act.answer_sender {
+                let _ = s.try_send("cancelled".to_string());
+            }
+        }
         running.insert(sid.clone(), ActiveSessionState {
             stop_flag: stop_flag.clone(),
             answer_sender: Some(a_tx),
             result_receiver: None,
         });
     }
+    // Give any previous run time to see the cancellation stop flag and exit cleanly
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     let cfg = state.cfg.lock().await.clone();
     let mut history = state.history.lock().await.clone();
@@ -482,6 +504,12 @@ async fn run_prompt(
     let sid_for_msg = sid.clone();
     let _msg_fwd = tokio::spawn(async move {
         while let Some(msg) = msg_rx.recv().await {
+            if msg.starts_with("JSON_TOKEN_LIMIT:") {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg["JSON_TOKEN_LIMIT:".len()..]) {
+                    let _ = app2.emit("token-usage", val);
+                }
+                continue;
+            }
             let _ = app2.emit("status", AgentStepPayload {
                 session_id: sid_for_msg.clone(),
                 message: msg.clone(),
@@ -515,6 +543,9 @@ async fn run_prompt(
         let outcome = async {
             let patterns = RedactPatterns::new();
             let provider = ai::provider_for_config(&cfg.ai);
+            if stop.load(Ordering::Relaxed) {
+                return Err(anyhow::anyhow!("Task was cancelled"));
+            }
             executor::run_task(
                 &p2, &sid2, history, provider.as_ref(),
                 &storage_dir, &cfg, &patterns, stop, msg_tx, token_limit, q_tx, a_rx,
@@ -1123,19 +1154,37 @@ async fn list_models(
     let skip = skip_ollama.unwrap_or(false);
     if !skip {
         if let Ok(ollama_models) = crate::ai::ollama::list_models(&ollama_url).await {
-        for m in ollama_models {
-            let v = crate::ai::ollama::is_vision_model(&m.name);
-            out.push(ModelInfo {
-                name: m.name,
-                provider: "ollama".to_string(),
-                provider_name: "Ollama".to_string(),
-                base_url: ollama_url.clone(),
-                vision: v,
-                size_gb: m.size_bytes as f32 / (1024.0 * 1024.0 * 1024.0),
-                installed: true,
-            });
+            for m in ollama_models {
+                let v = crate::ai::ollama::is_vision_model(&m.name);
+                out.push(ModelInfo {
+                    name: m.name,
+                    provider: "ollama".to_string(),
+                    provider_name: "Ollama".to_string(),
+                    base_url: ollama_url.clone(),
+                    vision: v,
+                    size_gb: m.size_bytes as f32 / (1024.0 * 1024.0 * 1024.0),
+                    installed: true,
+                    category: "chat".to_string(),
+                });
+            }
         }
     }
+
+    // Add ALL LocalAI catalog models (chat, images, video, speaking, listening, music)
+    let la_catalog = crate::ai::localai::get_catalog();
+    let storage_dir_val = state.storage_dir.lock().await.clone();
+    for m in la_catalog {
+        let is_inst = crate::ai::localai::is_model_installed(&storage_dir_val, &m.name);
+        out.push(ModelInfo {
+            name: m.name.clone(),
+            provider: "localai".to_string(),
+            provider_name: "LocalAI".to_string(),
+            base_url: crate::ai::localai::get_localai_base_url(),
+            vision: m.vision,
+            size_gb: m.size_gb,
+            installed: is_inst,
+            category: m.category.clone(),
+        });
     }
 
     for pm in crate::tui::app::CLOUD_MODELS {
@@ -1147,6 +1196,7 @@ async fn list_models(
             vision: pm.vision,
             size_gb: 0.0,
             installed: true,
+            category: "chat".to_string(),
         });
     }
 
@@ -1162,6 +1212,7 @@ async fn list_models(
                 vision: k.vision,
                 size_gb: k.size_gb,
                 installed: false,
+                category: "chat".to_string(),
             });
         }
     }
@@ -1176,6 +1227,7 @@ async fn list_models(
             vision: false,
             size_gb: 0.64,
             installed: true,
+            category: "chat".to_string(),
         });
     }
 
@@ -1221,6 +1273,73 @@ async fn switch_model(
 }
 
 #[tauri::command(rename_all = "snake_case")]
+async fn delete_model(
+    name: String,
+    provider: String,
+    base_url: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    if provider == "ollama" {
+        let mut url = base_url.unwrap_or_else(|| {
+            "http://127.0.0.1:11434".to_string()
+        });
+        if url.contains("localhost") {
+            url = url.replace("localhost", "127.0.0.1");
+        }
+        crate::ai::ollama::delete_model(&url, &name).await.map_err(|e| e.to_string())?;
+    } else if provider == "localai" {
+        let storage_dir = state.storage_dir.lock().await.clone();
+        crate::ai::localai::delete_model(&storage_dir, &name).await.map_err(|e| e.to_string())?;
+    } else {
+        return Err(format!("Cannot delete model from provider '{}'", provider));
+    }
+
+    // Clear from active configuration if needed
+    let mut cfg = state.cfg.lock().await.clone();
+    let mut changed = false;
+    
+    if cfg.ai.model == name {
+        cfg.ai.model = String::new();
+        changed = true;
+    }
+    
+    if provider == "localai" {
+        if cfg.localai_models.chat == name {
+            cfg.localai_models.chat = String::new();
+            changed = true;
+        }
+        if cfg.localai_models.images == name {
+            cfg.localai_models.images = String::new();
+            changed = true;
+        }
+        if cfg.localai_models.video == name {
+            cfg.localai_models.video = String::new();
+            changed = true;
+        }
+        if cfg.localai_models.speaking == name {
+            cfg.localai_models.speaking = String::new();
+            changed = true;
+        }
+        if cfg.localai_models.listening == name {
+            cfg.localai_models.listening = String::new();
+            changed = true;
+        }
+        if cfg.localai_models.music == name {
+            cfg.localai_models.music = String::new();
+            changed = true;
+        }
+    }
+    
+    if changed {
+        let storage_dir = state.storage_dir.lock().await.clone();
+        config::save(&storage_dir, &cfg).map_err(|e| e.to_string())?;
+        *state.cfg.lock().await = cfg;
+    }
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 async fn pull_model(
     name: String,
     base_url: Option<String>,
@@ -1242,8 +1361,51 @@ async fn pull_model(
     
     let app_handle_clone = app_handle.clone();
     let name_clone = name.clone();
+    let url_clone = url.clone();
     tokio::spawn(async move {
         let state = app_handle_clone.state::<AppState>();
+        
+        let la_catalog = crate::ai::localai::get_catalog();
+        if let Some(la_model) = la_catalog.iter().find(|m| m.name == name_clone) {
+            let storage_dir = state.storage_dir.lock().await.clone();
+            let progress_callback = {
+                let app_handle_clone = app_handle_clone.clone();
+                let name_clone = name_clone.clone();
+                move |percent, status: &str, completed, total| {
+                    let _ = app_handle_clone.emit("download-progress", serde_json::json!({
+                        "model": name_clone,
+                        "status": status,
+                        "percent": percent,
+                        "completed": completed,
+                        "total": total
+                    }));
+                }
+            };
+
+            match crate::ai::localai::download_model_file(&storage_dir, &name_clone, &la_model.download_url, &la_model.filename, Some(rx), progress_callback).await {
+                Ok(_) => {
+                    let mut active = state.active_downloads.lock().await;
+                    active.remove(&name_clone);
+                    let _ = app_handle_clone.emit("download-finished", serde_json::json!({ "model": name_clone }));
+                }
+                Err(e) => {
+                    let mut active = state.active_downloads.lock().await;
+                    active.remove(&name_clone);
+                    
+                    let err_str = e.to_string();
+                    if err_str == "Download cancelled" || err_str.contains("cancel") {
+                        let file_path = storage_dir.join("localai_models").join(&la_model.filename);
+                        if file_path.exists() {
+                            let _ = std::fs::remove_file(&file_path);
+                        }
+                    }
+                    
+                    let _ = app_handle_clone.emit("download-failed", serde_json::json!({ "model": name_clone, "error": err_str }));
+                }
+            }
+            return;
+        }
+
         let client = reqwest::Client::new();
         let pull_url = format!("{}/api/pull", url.trim_end_matches('/'));
         let body = serde_json::json!({ "name": name_clone, "stream": true });
@@ -1275,6 +1437,7 @@ async fn pull_model(
                     let mut active = state.active_downloads.lock().await;
                     active.remove(&name_clone);
                     let _ = app_handle_clone.emit("download-failed", serde_json::json!({ "model": name_clone, "error": "Canceled" }));
+                    let _ = crate::ai::ollama::delete_model(&url_clone, &name_clone).await;
                     return;
                 }
                 res = resp.chunk() => {
@@ -1443,6 +1606,275 @@ async fn import_gguf_model(
         let _ = app_handle_clone.emit("download-finished", serde_json::json!({ "model": name_clone }));
     });
     
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn is_localai_installed(state: tauri::State<'_, AppState>) -> std::result::Result<bool, String> {
+    let storage_dir = state.storage_dir.lock().await.clone();
+    Ok(crate::ai::localai::is_installed(&storage_dir).await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn is_localai_running() -> std::result::Result<bool, String> {
+    Ok(crate::ai::localai::is_running().await)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn start_localai(state: tauri::State<'_, AppState>) -> std::result::Result<(), String> {
+    let storage_dir = state.storage_dir.lock().await.clone();
+    crate::ai::localai::start_server(&storage_dir).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_localai_log(state: tauri::State<'_, AppState>) -> std::result::Result<String, String> {
+    let storage_dir = state.storage_dir.lock().await.clone();
+    let log_path = storage_dir.join("localai.log");
+    if log_path.exists() {
+        std::fs::read_to_string(&log_path).map_err(|e| e.to_string())
+    } else {
+        Ok(String::new())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn get_localai_voices() -> std::result::Result<Vec<String>, String> {
+    Ok(vec![
+        "af_sky".to_string(),
+        "af_bella".to_string(),
+        "af_sarah".to_string(),
+        "af_nicole".to_string(),
+        "af_lois".to_string(),
+        "am_adam".to_string(),
+        "am_michael".to_string(),
+        "bf_emma".to_string(),
+        "bf_isabella".to_string(),
+        "bm_george".to_string(),
+        "bm_lewis".to_string(),
+    ])
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn install_localai(
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<(), String> {
+    let storage_dir = state.storage_dir.lock().await.clone();
+    if crate::ai::localai::is_running().await {
+        return Ok(());
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut active = state.active_downloads.lock().await;
+        active.insert("LocalAI".to_string(), tx);
+    }
+
+    #[cfg(windows)]
+    {
+        if !crate::ai::localai::is_docker_running() && crate::ai::localai::find_best_wsl_distro().is_none() {
+            // Check if wsl.exe exists and is runnable by executing `wsl -l`
+            let wsl_runnable = std::process::Command::new("wsl")
+                .arg("-l")
+                .creation_flags(0x08000000) // CREATE_NO_WINDOW
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+
+            let mut installed_distro = false;
+
+            if wsl_runnable {
+                // WSL platform is already enabled! We can try to install Ubuntu directly as the normal user.
+                let _ = app_handle.emit("download-progress", serde_json::json!({
+                    "model": "LocalAI",
+                    "status": "Installing Ubuntu distribution in WSL... Please wait, this may take a few minutes.",
+                    "completed": 0,
+                    "total": 0,
+                    "percent": 0
+                }));
+
+                let mut cmd = std::process::Command::new("wsl");
+                cmd.args(&["--install", "-d", "Ubuntu", "--no-launch"]);
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                
+                let success = cmd.status().map(|s| s.success()).unwrap_or(false);
+                if success && crate::ai::localai::find_best_wsl_distro().is_some() {
+                    installed_distro = true;
+                }
+            }
+
+            if !installed_distro {
+                // Fallback to Administrator UAC elevation if normal user install failed or if WSL platform itself needs enabling
+                let _ = app_handle.emit("download-progress", serde_json::json!({
+                    "model": "LocalAI",
+                    "status": "Enabling Windows Subsystem for Linux (WSL2)... Please approve the Windows elevation dialog.",
+                    "completed": 0,
+                    "total": 0,
+                    "percent": 0
+                }));
+
+                let mut cmd = std::process::Command::new("powershell");
+                cmd.args(&[
+                    "-Command",
+                    "Start-Process wsl -ArgumentList '--install -d Ubuntu --no-launch' -Verb RunAs -WindowStyle Hidden -Wait"
+                ]);
+                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+                let success = cmd.status().map(|s| s.success()).unwrap_or(false);
+                if !success || crate::ai::localai::find_best_wsl_distro().is_none() {
+                    let mut active = state.active_downloads.lock().await;
+                    active.remove("LocalAI");
+                    let err_msg = "Failed to install Windows Subsystem for Linux (WSL2 / Ubuntu). Make sure you approve the administrator dialog.".to_string();
+                    let _ = app_handle.emit("download-failed", serde_json::json!({
+                        "model": "LocalAI",
+                        "error": &err_msg
+                    }));
+                    return Err(err_msg);
+                }
+            }
+        }
+    }
+
+    let _ = app_handle.emit("download-progress", serde_json::json!({
+        "model": "LocalAI",
+        "status": "Connecting to LocalAI download server...",
+        "percent": 0
+    }));
+
+    let progress_callback = {
+        let app_handle = app_handle.clone();
+        move |percent, status: &str, completed, total| {
+            let _ = app_handle.emit("download-progress", serde_json::json!({
+                "model": "LocalAI",
+                "status": status,
+                "completed": completed,
+                "total": total,
+                "percent": percent
+            }));
+        }
+    };
+
+    match crate::ai::localai::download_localai_binary(&storage_dir, Some(rx), progress_callback).await {
+        Ok(_) => {
+            let mut active = state.active_downloads.lock().await;
+            active.remove("LocalAI");
+            let _ = app_handle.emit("download-finished", serde_json::json!({ "model": "LocalAI" }));
+            if let Err(e) = crate::ai::localai::start_server(&storage_dir).await {
+                let err_str = format!("Failed to start LocalAI server: {}", e);
+                let _ = app_handle.emit("download-failed", serde_json::json!({ "model": "LocalAI", "error": &err_str }));
+                return Err(err_str);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let mut active = state.active_downloads.lock().await;
+            active.remove("LocalAI");
+            
+            let err_str = e.to_string();
+            let binaries = if cfg!(target_os = "windows") {
+                vec!["local-ai-Linux-x86_64", "local-ai.exe", "local-ai"]
+            } else {
+                vec!["local-ai"]
+            };
+            for bin in binaries {
+                let dest_path = storage_dir.join(bin);
+                if dest_path.exists() {
+                    let _ = std::fs::remove_file(&dest_path);
+                }
+            }
+            
+            let _ = app_handle.emit("download-failed", serde_json::json!({ "model": "LocalAI", "error": &err_str }));
+            Err(err_str)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LocalAiModelStatus {
+    name: String,
+    category: String,
+    size_gb: f32,
+    vision: bool,
+    installed: bool,
+    download_url: String,
+    filename: String,
+    description: String,
+    active: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn list_localai_models(state: tauri::State<'_, AppState>) -> std::result::Result<Vec<LocalAiModelStatus>, String> {
+    let storage_dir = state.storage_dir.lock().await.clone();
+    let cfg = state.cfg.lock().await.clone();
+    let catalog = crate::ai::localai::get_catalog();
+    let mut out = Vec::new();
+
+    for m in catalog {
+        let installed = crate::ai::localai::is_model_installed(&storage_dir, &m.name);
+        let active = match m.category.as_str() {
+            "chat" => cfg.localai_models.chat == m.name,
+            "images" => cfg.localai_models.images == m.name,
+            "video" => cfg.localai_models.video == m.name,
+            "speaking" => cfg.localai_models.speaking == m.name,
+            "listening" => cfg.localai_models.listening == m.name,
+            "music" => cfg.localai_models.music == m.name,
+            _ => false,
+        };
+
+        out.push(LocalAiModelStatus {
+            name: m.name,
+            category: m.category,
+            size_gb: m.size_gb,
+            vision: m.vision,
+            installed,
+            download_url: m.download_url,
+            filename: m.filename,
+            description: m.description,
+            active,
+        });
+    }
+
+    Ok(out)
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn switch_localai_model(
+    category: String,
+    model_name: String,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let mut cfg = state.cfg.lock().await.clone();
+    match category.as_str() {
+        "chat" => cfg.localai_models.chat = model_name.clone(),
+        "images" => cfg.localai_models.images = model_name.clone(),
+        "video" => cfg.localai_models.video = model_name.clone(),
+        "speaking" => cfg.localai_models.speaking = model_name.clone(),
+        "listening" => cfg.localai_models.listening = model_name.clone(),
+        "music" => cfg.localai_models.music = model_name.clone(),
+        _ => return Err(format!("Unknown category: {}", category)),
+    }
+
+    let storage_dir = state.storage_dir.lock().await.clone();
+    config::save(&storage_dir, &cfg).map_err(|e| e.to_string())?;
+    *state.cfg.lock().await = cfg.clone();
+
+    if !model_name.is_empty() && crate::ai::localai::is_installed(&storage_dir).await {
+        let _ = crate::ai::localai::start_server(&storage_dir).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn save_localai_voice(
+    voice: String,
+    state: tauri::State<'_, AppState>,
+) -> std::result::Result<(), String> {
+    let mut cfg = state.cfg.lock().await.clone();
+    cfg.localai_voice = voice;
+    let storage_dir = state.storage_dir.lock().await.clone();
+    config::save(&storage_dir, &cfg).map_err(|e| e.to_string())?;
+    *state.cfg.lock().await = cfg;
     Ok(())
 }
 
@@ -2582,6 +3014,7 @@ async fn search_online_models(
             vision: is_vision,
             size_gb: m.size_bytes as f32 / (1024.0 * 1024.0 * 1024.0),
             installed: is_installed,
+            category: "chat".to_string(),
         });
     }
 

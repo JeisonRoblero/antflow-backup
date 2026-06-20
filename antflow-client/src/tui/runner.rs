@@ -16,8 +16,23 @@ use super::app::{App, AppMode};
 use super::events::{handle_events, AppEvent};
 use super::ui;
 
-// Debug logging macro (only active in debug builds)
+// Debug logging macro
 macro_rules! dbg_log {
+    ($($arg:tt)*) => {
+        {
+            let log_path = std::env::temp_dir().join("antflow_debug.log");
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, $($arg)*);
+            }
+        }
+    };
+}
+
+macro_rules! trace_log {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
         {
@@ -41,6 +56,9 @@ pub enum FetchResult {
     ImportProgress { status: String, percent: u32 },
     ImportFinished { name: String },
     ImportFailed { name: String, error: String },
+    LocalAiProgress { model: String, status: String, percent: u32 },
+    LocalAiFinished { model: String },
+    LocalAiFailed { model: String, error: String },
 }
 
 #[cfg(not(windows))]
@@ -102,6 +120,19 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
         }
     }
 
+    // Auto-start LocalAI at launch if active or any LocalAI models are active
+    let start_localai = cfg.ai.provider == "localai"
+        || !cfg.localai_models.chat.is_empty()
+        || !cfg.localai_models.images.is_empty()
+        || !cfg.localai_models.video.is_empty()
+        || !cfg.localai_models.speaking.is_empty()
+        || !cfg.localai_models.listening.is_empty()
+        || !cfg.localai_models.music.is_empty();
+
+    if start_localai && crate::ai::localai::is_installed(&storage_dir).await {
+        let _ = crate::ai::localai::start_server(&storage_dir).await;
+    }
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let (welcome_tx, mut welcome_rx) = tokio::sync::mpsc::channel::<String>(1);
     let cfg_ai_clone = cfg.ai.clone();
@@ -113,7 +144,7 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
             }
         }
     });
-    let mut app = App::new(cfg.clone(), &conn, &session_id);
+    let mut app = App::new(cfg.clone(), &conn, &session_id, storage_dir.clone());
     app.installed_models = installed_models;
     // Build OllamaModelInfo list from catalog only (fast, no per-model API calls at startup)
     {
@@ -286,6 +317,17 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                         FetchResult::ImportFailed { name, error } => {
                             app.status = "Ready".to_string();
                             app.push_message("system", &format!("✗ GGUF import failed for {}: {}", name, error));
+                        }
+                        FetchResult::LocalAiProgress { model, status, percent } => {
+                            app.status = format!("{}: {} ({}%)", model, status, percent);
+                        }
+                        FetchResult::LocalAiFinished { model } => {
+                            app.status = "Ready".to_string();
+                            app.push_message("system", &format!("✓ Successfully set up/downloaded: {}", model));
+                        }
+                        FetchResult::LocalAiFailed { model, error } => {
+                            app.status = "Ready".to_string();
+                            app.push_message("system", &format!("✗ Download failed for {}: {}", model, error));
                         }
                     }
                 }
@@ -612,6 +654,17 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                                     app.status = "Ready".to_string();
                                     app.push_message("system", &format!("✗ GGUF import failed for {}: {}", name, error));
                                 }
+                                FetchResult::LocalAiProgress { model, status, percent } => {
+                                    app.status = format!("{}: {} ({}%)", model, status, percent);
+                                }
+                                FetchResult::LocalAiFinished { model } => {
+                                    app.status = "Ready".to_string();
+                                    app.push_message("system", &format!("✓ Successfully set up/downloaded: {}", model));
+                                }
+                                FetchResult::LocalAiFailed { model, error } => {
+                                    app.status = "Ready".to_string();
+                                    app.push_message("system", &format!("✗ Download failed for {}: {}", model, error));
+                                }
                             }
                         }
                     }
@@ -869,52 +922,273 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                         app.mode = AppMode::ApiKeyInput;
                     }
                 } else {
-                    let is_installed = app.ollama_model_infos.iter()
-                        .find(|m| m.name == model_name || m.name == format!("{}:latest", model_name) || model_name.contains(&m.name))
-                        .map(|m| m.installed)
-                        .unwrap_or(false);
+                    let la_catalog = crate::ai::localai::get_catalog();
+                    let is_localai = la_catalog.iter().any(|m| m.name == model_name);
 
-                    if !is_installed {
-                        app.pending_download_model = model_name.clone();
-                        app.mode = AppMode::DownloadConfirm;
-                        terminal.draw(|f| ui::draw(f, &app))?;
-                        continue;
+                    if is_localai {
+                        // Check if LocalAI binary is installed
+                        if !crate::ai::localai::is_installed(&storage_dir).await {
+                            app.pending_download_model = "LocalAI Engine".to_string();
+                            app.mode = AppMode::DownloadConfirm;
+                            terminal.draw(|f| ui::draw(f, &app))?;
+                            continue;
+                        }
+
+                        // Check if LocalAI model is installed
+                        if !crate::ai::localai::is_model_installed(&storage_dir, &model_name) {
+                            app.pending_download_model = model_name.clone();
+                            app.mode = AppMode::DownloadConfirm;
+                            terminal.draw(|f| ui::draw(f, &app))?;
+                            continue;
+                        }
+
+                        let la_model = la_catalog.iter().find(|m| m.name == model_name).unwrap().clone();
+                        let category = &la_model.category;
+
+                        let mut new_cfg = app.cfg.clone();
+                        if category == "chat" {
+                            new_cfg.ai.provider = "localai".to_string();
+                            new_cfg.ai.model = model_name.clone();
+                            new_cfg.ai.base_url = crate::ai::localai::get_localai_base_url();
+                            new_cfg.ai.api_key = String::new();
+                            new_cfg.ai.vision_capable = la_model.vision;
+                            new_cfg.localai_models.chat = model_name.clone();
+
+                            config::save(&storage_dir, &new_cfg)?;
+                            app.cfg = new_cfg;
+                            app.token_limit = crate::tui::app::estimate_token_limit(&model_name);
+
+                            app.recent_models.retain(|m| m != &model_name);
+                            app.recent_models.insert(0, model_name.clone());
+                            if app.recent_models.len() > 5 { app.recent_models.truncate(5); }
+
+                            app.push_message("system", &format!("Switched to: {}", model_name));
+                            app.status = "Ready".to_string();
+                        } else {
+                            match category.as_str() {
+                                "images" => new_cfg.localai_models.images = model_name.clone(),
+                                "video" => new_cfg.localai_models.video = model_name.clone(),
+                                "speaking" => new_cfg.localai_models.speaking = model_name.clone(),
+                                "listening" => new_cfg.localai_models.listening = model_name.clone(),
+                                "music" => new_cfg.localai_models.music = model_name.clone(),
+                                _ => {}
+                            }
+                            config::save(&storage_dir, &new_cfg)?;
+                            app.cfg = new_cfg.clone();
+
+                            app.push_message("system", &format!("Active LocalAI {} model set to: {}", category, model_name));
+                            app.status = "Ready".to_string();
+
+                            let has_chat = !new_cfg.ai.model.is_empty() && !new_cfg.ai.provider.is_empty();
+                            if !has_chat {
+                                app.push_message("system", "Warning: No active chat model. Media generation tools will only output files without text replies until a chat model is set up.");
+                            }
+                        }
+
+                        // Auto-start LocalAI server if active
+                        let _ = crate::ai::localai::start_server(&storage_dir).await;
+                    } else {
+                        let is_installed = app.ollama_model_infos.iter()
+                            .find(|m| m.name == model_name || m.name == format!("{}:latest", model_name) || model_name.contains(&m.name))
+                            .map(|m| m.installed)
+                            .unwrap_or(false);
+
+                        if !is_installed {
+                            app.pending_download_model = model_name.clone();
+                            app.mode = AppMode::DownloadConfirm;
+                            terminal.draw(|f| ui::draw(f, &app))?;
+                            continue;
+                        }
+
+                        let mut new_cfg = app.cfg.clone();
+                        new_cfg.ai.model = model_name.clone();
+                        new_cfg.ai.provider = "ollama".to_string();
+                        new_cfg.ai.base_url = "http://localhost:11434".to_string();
+                        new_cfg.ai.api_key = String::new();
+                        new_cfg.ai.vision_capable = crate::ai::ollama::is_vision_model(&model_name);
+                        config::save(&storage_dir, &new_cfg)?;
+                        app.cfg = new_cfg;
+                        app.token_limit = crate::tui::app::estimate_token_limit(&model_name);
+
+                        app.recent_models.retain(|m| m != &model_name);
+                        app.recent_models.insert(0, model_name.clone());
+                        if app.recent_models.len() > 5 { app.recent_models.truncate(5); }
+
+                        app.push_message("system", &format!("Switched to: {}", model_name));
+                        app.status = "Ready".to_string();
                     }
-
-                    let mut new_cfg = app.cfg.clone();
-                    new_cfg.ai.model = model_name.clone();
-                    new_cfg.ai.provider = "ollama".to_string();
-                    new_cfg.ai.base_url = "http://localhost:11434".to_string();
-                    new_cfg.ai.api_key = String::new();
-                    new_cfg.ai.vision_capable = crate::ai::ollama::is_vision_model(&model_name);
-                    config::save(&storage_dir, &new_cfg)?;
-                    app.cfg = new_cfg;
-                    app.token_limit = crate::tui::app::estimate_token_limit(&model_name);
-
-                    app.recent_models.retain(|m| m != &model_name);
-                    app.recent_models.insert(0, model_name.clone());
-                    if app.recent_models.len() > 5 { app.recent_models.truncate(5); }
-
-                    app.push_message("system", &format!("Switched to: {}", model_name));
-                    app.status = "Ready".to_string();
                 }
             }
 
             AppEvent::DownloadModel(model_name) => {
-                app.push_message("system", &format!("⬇ Starting download: {} — this may take a few minutes...", model_name));
-                app.status = format!("Downloading {}...", model_name);
-                let model_clone = model_name.clone();
-                tokio::spawn(async move {
-                    let mut cmd = tokio::process::Command::new("ollama");
-                    cmd.args(["pull", &model_clone])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null());
-                    #[cfg(windows)]
-                    cmd.creation_flags(0x08000000);
-                    let _ = cmd.status().await;
-                });
-                if let Some(info) = app.ollama_model_infos.iter_mut().find(|m| m.name == model_name) {
-                    info.installed = true;
+                if model_name == "LocalAI Engine" {
+                    app.push_message("system", "⬇ Starting download: LocalAI Engine binary (~1.5 GB) — this may take a few minutes...");
+                    app.status = "Downloading LocalAI binary...".to_string();
+                    let storage_dir_clone = storage_dir.clone();
+                    let tx_clone = active_fetch_tx.clone();
+                    tokio::spawn(async move {
+                        let tx_for_callback = tx_clone.clone();
+                        let progress_callback = move |percent, status: &str, completed, total| {
+                            if let Some(ref tx) = tx_for_callback {
+                                let _ = tx.blocking_send(FetchResult::LocalAiProgress {
+                                    model: "LocalAI Engine".to_string(),
+                                    status: status.to_string(),
+                                    percent,
+                                });
+                            }
+                        };
+                        match crate::ai::localai::download_localai_binary(&storage_dir_clone, None, progress_callback).await {
+                            Ok(_) => {
+                                if let Some(ref tx) = tx_clone {
+                                    let _ = tx.blocking_send(FetchResult::LocalAiFinished {
+                                        model: "LocalAI Engine".to_string(),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(ref tx) = tx_clone {
+                                    let _ = tx.blocking_send(FetchResult::LocalAiFailed {
+                                        model: "LocalAI Engine".to_string(),
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    let la_catalog = crate::ai::localai::get_catalog();
+                    let is_localai = la_catalog.iter().any(|m| m.name == model_name);
+
+                    if is_localai {
+                        let la_model = la_catalog.iter().find(|m| m.name == model_name).unwrap().clone();
+                        app.push_message("system", &format!("⬇ Starting download: {} — this may take a few minutes...", model_name));
+                        app.status = format!("Downloading {}...", model_name);
+                        let storage_dir_clone = storage_dir.clone();
+                        let tx_clone = active_fetch_tx.clone();
+                        let model_name_str = la_model.name.clone();
+                        let download_url_str = la_model.download_url.clone();
+                        let filename_str = la_model.filename.clone();
+                        tokio::spawn(async move {
+                            let tx_for_callback = tx_clone.clone();
+                            let model_name_callback = model_name_str.clone();
+                            let progress_callback = move |percent, status: &str, completed, total| {
+                                if let Some(ref tx) = tx_for_callback {
+                                    let _ = tx.blocking_send(FetchResult::LocalAiProgress {
+                                        model: model_name_callback.clone(),
+                                        status: status.to_string(),
+                                        percent,
+                                    });
+                                }
+                            };
+                            match crate::ai::localai::download_model_file(
+                                &storage_dir_clone,
+                                &model_name_str,
+                                &download_url_str,
+                                &filename_str,
+                                None,
+                                progress_callback,
+                            ).await {
+                                Ok(_) => {
+                                    if let Some(ref tx) = tx_clone {
+                                        let _ = tx.blocking_send(FetchResult::LocalAiFinished {
+                                            model: model_name_str.clone(),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(ref tx) = tx_clone {
+                                        let _ = tx.blocking_send(FetchResult::LocalAiFailed {
+                                            model: model_name_str.clone(),
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        app.push_message("system", &format!("⬇ Starting download: {} — this may take a few minutes...", model_name));
+                        app.status = format!("Downloading {}...", model_name);
+                        let model_clone = model_name.clone();
+                        tokio::spawn(async move {
+                            let mut cmd = tokio::process::Command::new("ollama");
+                            cmd.args(["pull", &model_clone])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null());
+                            #[cfg(windows)]
+                            cmd.creation_flags(0x08000000);
+                            let _ = cmd.status().await;
+                        });
+                        if let Some(info) = app.ollama_model_infos.iter_mut().find(|m| m.name == model_name) {
+                            info.installed = true;
+                        }
+                    }
+                }
+            }
+
+            AppEvent::DeleteModel(model_name, provider) => {
+                app.status = format!("Deleting model {}...", model_name);
+                let storage_dir = app.storage_dir.clone();
+                let base_url = app.cfg.ai.base_url.clone();
+
+                let result = if provider == "ollama" {
+                    crate::ai::ollama::delete_model(&base_url, &model_name).await
+                } else {
+                    crate::ai::localai::delete_model(&storage_dir, &model_name).await
+                };
+
+                // Clear from active configuration if needed
+                let mut changed = false;
+                if app.cfg.ai.model == model_name {
+                    app.cfg.ai.model = String::new();
+                    changed = true;
+                }
+
+                if provider == "localai" {
+                    if app.cfg.localai_models.chat == model_name {
+                        app.cfg.localai_models.chat = String::new();
+                        changed = true;
+                    }
+                    if app.cfg.localai_models.images == model_name {
+                        app.cfg.localai_models.images = String::new();
+                        changed = true;
+                    }
+                    if app.cfg.localai_models.video == model_name {
+                        app.cfg.localai_models.video = String::new();
+                        changed = true;
+                    }
+                    if app.cfg.localai_models.speaking == model_name {
+                        app.cfg.localai_models.speaking = String::new();
+                        changed = true;
+                    }
+                    if app.cfg.localai_models.listening == model_name {
+                        app.cfg.localai_models.listening = String::new();
+                        changed = true;
+                    }
+                    if app.cfg.localai_models.music == model_name {
+                        app.cfg.localai_models.music = String::new();
+                        changed = true;
+                    }
+                }
+
+                if changed {
+                    let _ = crate::config::save(&storage_dir, &app.cfg);
+                }
+
+                if provider == "ollama" {
+                    app.ollama_model_infos.retain(|m| m.name != model_name);
+                }
+
+                match result {
+                    Ok(_) => {
+                        let msg = format!("Successfully deleted model: {}", model_name);
+                        app.push_message("system", &msg);
+                        app.status = msg;
+                    }
+                    Err(e) => {
+                        let msg = format!("Failed to delete model: {}", e);
+                        app.push_message("system", &msg);
+                        app.status = msg;
+                    }
                 }
             }
 
@@ -1138,8 +1412,20 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
             }
 
             AppEvent::RenameConversation => {
-                app.current_conversation_name = app.rename_input.clone();
-                app.mode = AppMode::Chat;
+                if let Some(conv) = app.conversations.get_mut(app.conversation_cursor) {
+                    let id = conv.id.clone();
+                    let new_name = app.rename_input.clone();
+                    if let Ok(_) = db::set_conversation_name(&conn, &id, &new_name) {
+                        conv.name = new_name.clone();
+                        if id == app.current_conversation_id {
+                            app.current_conversation_name = new_name;
+                        }
+                        app.status = "Conversation renamed.".to_string();
+                    } else {
+                        app.status = "Failed to rename conversation.".to_string();
+                    }
+                }
+                app.mode = AppMode::ConversationList;
             }
 
             AppEvent::DeleteConversation => {

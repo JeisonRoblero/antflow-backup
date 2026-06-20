@@ -32,7 +32,11 @@
     "macOSPrivateApi": true,
     "security": {
       "csp": null,
-      "dangerousDisableAssetCspModification": true
+      "dangerousDisableAssetCspModification": true,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**/*"]
+      }
     }
   },
   "bundle": {

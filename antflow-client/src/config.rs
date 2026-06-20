@@ -122,6 +122,26 @@ fn default_num_parallel() -> usize {
     4
 }
 
+fn default_localai_voice() -> String {
+    "af_sky".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LocalAiActiveModels {
+    #[serde(default)]
+    pub chat: String,
+    #[serde(default)]
+    pub images: String,
+    #[serde(default)]
+    pub video: String,
+    #[serde(default)]
+    pub speaking: String,
+    #[serde(default)]
+    pub listening: String,
+    #[serde(default)]
+    pub music: String,
+}
+
 // AppConfig is the single source of truth for all user settings.
 // It maps 1-to-1 with the TOML file on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +173,12 @@ pub struct AppConfig {
     // Concurrency / Parallel execution limit
     #[serde(default = "default_num_parallel")]
     pub num_parallel: usize,
+
+    #[serde(default)]
+    pub localai_models: LocalAiActiveModels,
+
+    #[serde(default = "default_localai_voice")]
+    pub localai_voice: String,
 }
 
 impl Default for AppConfig {
@@ -166,6 +192,8 @@ impl Default for AppConfig {
             run_in_background: false,
             mode: "auto".to_string(),
             num_parallel: 4,
+            localai_models: LocalAiActiveModels::default(),
+            localai_voice: default_localai_voice(),
         }
     }
 }

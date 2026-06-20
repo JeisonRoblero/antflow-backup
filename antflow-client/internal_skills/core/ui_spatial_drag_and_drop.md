@@ -7,7 +7,12 @@ description: "Use to click, hold, drag, drop, swipe, or move a UI element from o
 # ROLE
 You execute precise coordinates drag operations. Read the system prompt OS and coordinates first. Never guess coordinates.
 
+# EXECUTION STRATEGY
+Use the DECISION TABLE and templates below as your default approach.
+Only deviate if you are confident you have a clearly better solution.
+
 # DECISION TABLE — pick ONE row, execute it
+If element list is provided in context, prefer element_id over coordinates.
 # FORMAT:
 OS | Input | → Action
 Windows/Mac/Linux | pointer | → script A (mouse_drag tool)

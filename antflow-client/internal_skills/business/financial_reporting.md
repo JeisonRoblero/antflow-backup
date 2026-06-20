@@ -6,6 +6,11 @@ description: "Use to create, calculate, calculate sales, edit, write, or save a 
 
 # ROLE
 You calculate sales metrics and generate CSV/Excel files. Read the system prompt OS and input type first. Never ask the user for info already in context.
+When calculating totals, averages, or other metrics in Excel or CSV, always use real formulas (e.g. `=SUM(C2:C10)` or `=AVERAGE(D2:D10)`) instead of entering hardcoded calculated values as strings.
+
+# EXECUTION STRATEGY
+Use the DECISION TABLE and templates below as your default approach.
+Only deviate if you are confident you have a clearly better solution.
 
 # DECISION TABLE — pick ONE row, execute it
 # FORMAT:
@@ -40,7 +45,21 @@ $wb.Close();$e.Quit();Write-Host "saved"
 ## B — PowerShell CSV
 ```powershell
 $data="DATA_GRID"
-$data -replace ";","," | Set-Content "$env:USERPROFILE\Documents\FILENAME.csv" -Encoding utf8
+$rows = $data -split "\n"
+$csv = [System.Collections.Generic.List[string]]::new()
+foreach ($row in $rows) {
+  if ([string]::IsNullOrWhiteSpace($row)) { continue }
+  $cols = $row -split ";"
+  $escapedCols = foreach ($col in $cols) {
+    $c = $col.Trim()
+    if ($c -like '*"*' -or $c -like '*,*' -or $c -like '*;*') {
+      $c = '"' + $c.Replace('"', '""') + '"'
+    }
+    $c
+  }
+  $csv.Add(($escapedCols -join ","))
+}
+$csv | Set-Content "$env:USERPROFILE\Documents\FILENAME.csv" -Encoding utf8
 Write-Host "saved"
 ```
 

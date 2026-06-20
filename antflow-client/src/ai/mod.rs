@@ -7,6 +7,7 @@
 // the provider in `provider_for_config()` below.
 
 pub mod ollama;
+pub mod localai;
 pub mod openai;
 pub mod generic; // covers Anthropic, Gemini, Groq, Mistral, Together, OpenRouter, Nvidia, custom
 pub mod embeddings;
@@ -178,6 +179,11 @@ pub fn provider_for_config(cfg: &AiProviderConfig) -> Box<dyn AiProvider> {
     match cfg.provider.as_str() {
         "ollama" => Box::new(ollama::OllamaProvider::new(cfg)),
         "openai" => Box::new(openai::OpenAiProvider::new(cfg)),
+        "localai" => {
+            let mut cfg_local = cfg.clone();
+            cfg_local.base_url = format!("{}/v1", localai::get_localai_base_url());
+            Box::new(generic::GenericProvider::new(&cfg_local))
+        }
         // All other providers use the generic OpenAI-compatible adapter.
         _ => Box::new(generic::GenericProvider::new(cfg)),
     }

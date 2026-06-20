@@ -417,6 +417,7 @@ pub async fn search_huggingface_gguf(query: &str) -> Result<Vec<HfModelInfo>> {
             ("limit", "10"),
             ("sort", "downloads"),
             ("direction", "-1"),
+            ("siblings", "true"),
         ])
         .header("User-Agent", "antflow")
         .send()
@@ -493,4 +494,19 @@ pub async fn create_model(base_url: &str, model_name: &str, gguf_path: &str) -> 
     
     Ok(resp)
 }
+
+/// Deletes a model from the local Ollama instance.
+pub async fn delete_model(base_url: &str, model_name: &str) -> Result<()> {
+    let client = Client::new();
+    let url = format!("{}/api/delete", base_url.trim_end_matches('/'));
+    let body = json!({ "name": model_name });
+    let resp = client.delete(&url).json(&body).send().await
+        .context("Failed to connect to Ollama for deletion")?;
+    if !resp.status().is_success() {
+        let text = resp.text().await?;
+        anyhow::bail!("Ollama delete failed: {}", text);
+    }
+    Ok(())
+}
+
 

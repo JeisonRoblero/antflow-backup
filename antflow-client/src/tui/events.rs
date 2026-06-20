@@ -29,6 +29,7 @@ pub enum AppEvent {
     SetApiKey(String),
     ModelsFetched(Vec<crate::tui::model_fetch::FetchedModel>),
     DownloadModel(String),
+    DeleteModel(String, String),
     DeleteTask(String),
     ToggleTask(String),
     Command(String),
@@ -304,6 +305,29 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = AppMode::ConversationList;
                 }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let sections = crate::tui::model_list::build_model_list_grouped(app);
+                    let mut idx = 0usize;
+                    let mut selected_entry = None;
+                    'outer: for section in &sections {
+                        for pg in &section.providers {
+                            for entry in &pg.models {
+                                if idx == app.model_cursor {
+                                    selected_entry = Some(entry.clone());
+                                    break 'outer;
+                                }
+                                idx += 1;
+                            }
+                        }
+                    }
+                    if let Some(entry) = selected_entry {
+                        if (entry.provider_id == "ollama" || entry.provider_id == "localai") && entry.is_installed {
+                            app.pending_delete_model = entry.name;
+                            app.pending_delete_provider = entry.provider_id;
+                            app.mode = AppMode::ModelDeleteConfirm;
+                        }
+                    }
+                }
                 KeyCode::Enter => {
                     let sections = crate::tui::model_list::build_model_list_grouped(app);
                     let mut idx = 0usize;
@@ -350,7 +374,14 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                     app.mode = AppMode::Chat;
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.mode = AppMode::Chat;
+                    if let Some(conv) = app.conversations.get(app.conversation_cursor) {
+                        app.rename_input = conv.name.clone();
+                        if app.rename_input.is_empty() {
+                            app.rename_input = conv.preview.clone();
+                        }
+                        app.cursor_pos = app.rename_input.len();
+                        app.mode = AppMode::ConversationRename;
+                    }
                 }
                 KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = AppMode::ModelSelect;
@@ -362,6 +393,13 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                     }
                 }
                 KeyCode::Backspace => {
+                    if app.conversation_cursor < app.conversations.len() {
+                        return Ok(AppEvent::ToggleConversationDeleteConfirm(
+                            app.conversations[app.conversation_cursor].id.clone()
+                        ));
+                    }
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if app.conversation_cursor < app.conversations.len() {
                         return Ok(AppEvent::ToggleConversationDeleteConfirm(
                             app.conversations[app.conversation_cursor].id.clone()
@@ -386,12 +424,12 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                 KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.mode = AppMode::Chat;
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('p') => {
                     if let Some(task) = app.tasks.get(app.task_cursor) {
                         return Ok(AppEvent::ToggleTask(task.id.clone()));
                     }
                 }
-                KeyCode::Backspace => {
+                KeyCode::Backspace | KeyCode::Char('d') => {
                     if app.task_cursor < app.tasks.len() {
                         return Ok(AppEvent::DeleteTask(app.tasks[app.task_cursor].id.clone()));
                     }
@@ -419,32 +457,29 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
 
             AppMode::ConversationRename => match key.code {
                 KeyCode::Esc => {
-                    app.mode = AppMode::Chat;
-                    app.input.clear();
+                    app.mode = AppMode::ConversationList;
+                    app.rename_input.clear();
                     app.cursor_pos = 0;
                 }
                 KeyCode::Enter => {
-                    if !app.input.is_empty() {
-                        let name = app.input.clone();
-                        app.input.clear();
-                        app.cursor_pos = 0;
+                    if !app.rename_input.is_empty() {
                         return Ok(AppEvent::RenameConversation);
                     }
                 }
                 KeyCode::Backspace => {
                     if app.cursor_pos > 0 {
                         app.cursor_pos -= 1;
-                        app.input.remove(app.cursor_pos);
+                        app.rename_input.remove(app.cursor_pos);
                     }
                 }
                 KeyCode::Left => {
                     if app.cursor_pos > 0 { app.cursor_pos -= 1; }
                 }
                 KeyCode::Right => {
-                    if app.cursor_pos < app.input.len() { app.cursor_pos += 1; }
+                    if app.cursor_pos < app.rename_input.len() { app.cursor_pos += 1; }
                 }
                 KeyCode::Char(c) => {
-                    app.input.insert(app.cursor_pos, c);
+                    app.rename_input.insert(app.cursor_pos, c);
                     app.cursor_pos += 1;
                 }
                 _ => {}
@@ -471,6 +506,23 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                     let model = app.pending_download_model.clone();
                     app.mode = AppMode::Chat;
                     return Ok(AppEvent::DownloadModel(model));
+                }
+                _ => {}
+            },
+
+            AppMode::ModelDeleteConfirm => match key.code {
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    app.mode = AppMode::ModelSelect;
+                    app.pending_delete_model.clear();
+                    app.pending_delete_provider.clear();
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let model = app.pending_delete_model.clone();
+                    let provider = app.pending_delete_provider.clone();
+                    app.mode = AppMode::Chat;
+                    app.pending_delete_model.clear();
+                    app.pending_delete_provider.clear();
+                    return Ok(AppEvent::DeleteModel(model, provider));
                 }
                 _ => {}
             },
@@ -589,25 +641,181 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
 }
 
 pub fn handle_onboarding_event(app: &mut App, key: event::KeyEvent) -> Result<AppEvent> {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use crate::tui::onboarding::{OnboardingStep, ProviderFocus, ONBOARDING_PROVIDERS};
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Ok(AppEvent::Quit);
     }
 
-    match key.code {
-        KeyCode::Esc => return Ok(AppEvent::OnboardingSkip),
-        KeyCode::Enter => return Ok(AppEvent::OnboardingNext),
-        KeyCode::Char('s') => return Ok(AppEvent::OnboardingSkip),
-        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(AppEvent::OnboardingBack),
-        KeyCode::Up => {
-            app.model_cursor = app.model_cursor.saturating_sub(1);
+    let ob = match app.onboarding.as_mut() {
+        Some(o) => o,
+        None => return Ok(AppEvent::None),
+    };
+
+    match ob.step {
+        OnboardingStep::Welcome => {
+            match key.code {
+                KeyCode::Enter => {
+                    ob.step = OnboardingStep::Storage;
+                    ob.status_line.clear();
+                }
+                KeyCode::Esc | KeyCode::Char('s') | KeyCode::F(1) => {
+                    return Ok(AppEvent::OnboardingSkip);
+                }
+                _ => {}
+            }
         }
-        KeyCode::Down => {
-            app.model_cursor += 1;
+        OnboardingStep::Storage => {
+            match key.code {
+                KeyCode::Up => {
+                    ob.storage_cursor = ob.storage_cursor.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    if ob.storage_cursor < 1 {
+                        ob.storage_cursor += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    ob.chosen_storage = if ob.storage_cursor == 0 {
+                        crate::config::StorageLocation::Portable
+                    } else {
+                        crate::config::StorageLocation::Global
+                    };
+                    ob.step = OnboardingStep::Provider;
+                    ob.status_line.clear();
+                }
+                KeyCode::Esc => {
+                    ob.step = OnboardingStep::Welcome;
+                    ob.status_line.clear();
+                }
+                _ => {}
+            }
         }
-        _ => {}
+        OnboardingStep::Provider => {
+            match key.code {
+                KeyCode::Tab => {
+                    let is_local = ob.current_provider().map(|p| p.id == "ollama" || p.id == "localai").unwrap_or(false);
+                    ob.provider_focus = match ob.provider_focus {
+                        ProviderFocus::ProviderList => {
+                            if is_local {
+                                ProviderFocus::OllamaModelList
+                            } else {
+                                ProviderFocus::ModelList
+                            }
+                        }
+                        ProviderFocus::ModelList => {
+                            ProviderFocus::ApiKeyInput
+                        }
+                        ProviderFocus::ApiKeyInput => {
+                            ProviderFocus::ProviderList
+                        }
+                        ProviderFocus::OllamaModelList => {
+                            ProviderFocus::ProviderList
+                        }
+                    };
+                }
+                KeyCode::Up => {
+                    match ob.provider_focus {
+                        ProviderFocus::ProviderList => {
+                            ob.provider_cursor = ob.provider_cursor.saturating_sub(1);
+                            ob.model_cursor = 0;
+                            ob.ollama_fetched = false;
+                        }
+                        ProviderFocus::ModelList => {
+                            ob.model_cursor = ob.model_cursor.saturating_sub(1);
+                        }
+                        ProviderFocus::OllamaModelList => {
+                            ob.model_cursor = ob.model_cursor.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Down => {
+                    match ob.provider_focus {
+                        ProviderFocus::ProviderList => {
+                            if ob.provider_cursor + 1 < ONBOARDING_PROVIDERS.len() {
+                                ob.provider_cursor += 1;
+                                ob.model_cursor = 0;
+                                ob.ollama_fetched = false;
+                            }
+                        }
+                        ProviderFocus::ModelList => {
+                            let max = ob.models_for_current_provider().len().saturating_sub(1);
+                            if ob.model_cursor < max {
+                                ob.model_cursor += 1;
+                            }
+                        }
+                        ProviderFocus::OllamaModelList => {
+                            let max = ob.ollama_models.len().saturating_sub(1);
+                            if ob.model_cursor < max {
+                                ob.model_cursor += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Backspace => {
+                    if ob.provider_focus == ProviderFocus::ApiKeyInput {
+                        ob.api_key_input.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if ob.provider_focus == ProviderFocus::ApiKeyInput {
+                        ob.api_key_input.push(c);
+                    }
+                }
+                KeyCode::Enter => {
+                    let provider_id = ob.current_provider().map(|p| p.id).unwrap_or("");
+                    if provider_id == "ollama" || provider_id == "localai" {
+                        ob.commit_provider();
+                        ob.step = OnboardingStep::Memory;
+                        ob.status_line.clear();
+                    } else {
+                        return Ok(AppEvent::OnboardingValidateKey);
+                    }
+                }
+                KeyCode::Esc => {
+                    if ob.provider_focus != ProviderFocus::ProviderList {
+                        ob.provider_focus = ProviderFocus::ProviderList;
+                    } else {
+                        ob.step = OnboardingStep::Storage;
+                        ob.status_line.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        OnboardingStep::Memory => {
+            match key.code {
+                KeyCode::Char(' ') => {
+                    ob.remember_sessions = !ob.remember_sessions;
+                }
+                KeyCode::Enter => {
+                    ob.step = OnboardingStep::Done;
+                    ob.status_line.clear();
+                }
+                KeyCode::Esc => {
+                    ob.step = OnboardingStep::Provider;
+                    ob.status_line.clear();
+                }
+                _ => {}
+            }
+        }
+        OnboardingStep::Done => {
+            match key.code {
+                KeyCode::Enter => {
+                    return Ok(AppEvent::OnboardingDone);
+                }
+                KeyCode::Esc => {
+                    ob.step = OnboardingStep::Memory;
+                    ob.status_line.clear();
+                }
+                _ => {}
+            }
+        }
     }
+
     Ok(AppEvent::None)
 }
 

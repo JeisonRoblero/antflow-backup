@@ -71,6 +71,120 @@ pub fn capture_redacted(_patterns: &RedactPatterns) -> Result<Vec<u8>> {
     anyhow::bail!("Direct frame capture is not supported on iOS due to platform security sandbox restrictions.")
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Element {
+    pub id: String,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn extract_ocr_elements(image: &DynamicImage) -> Result<Vec<Element>> {
+    use gag::Gag;
+
+    let original_w = image.width();
+    let original_h = image.height();
+
+    // Scale down to a standard processing width if it is large to speed up Tesseract OCR significantly
+    let scale_factor = if original_w > 1024 {
+        1024.0 / original_w as f64
+    } else {
+        1.0
+    };
+
+    let processed_image = if scale_factor < 1.0 {
+        let new_w = (original_w as f64 * scale_factor) as u32;
+        let new_h = (original_h as f64 * scale_factor) as u32;
+        image.resize(new_w, new_h, image::imageops::FilterType::Triangle)
+    } else {
+        image.clone()
+    };
+
+    let tmp_path = std::env::temp_dir().join("antflow_ocr_elements_tmp.png");
+    processed_image.save(&tmp_path)?;
+
+    let args = rusty_tesseract::Args {
+        lang: "eng".to_string(),
+        config_variables: std::collections::HashMap::from([
+            ("tessedit_create_tsv".to_string(), "1".to_string()),
+        ]),
+        dpi: Some(150),
+        psm: Some(11),
+        oem: Some(3),
+    };
+
+    let input = rusty_tesseract::Image::from_path(&tmp_path)?;
+    let tsv = {
+        let _gag = Gag::stdout().ok();
+        rusty_tesseract::image_to_data(&input, &args)?
+    };
+
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut elements = Vec::new();
+    let mut id_counter = 1;
+
+    for line in tsv.output.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect::<Vec<&str>>();
+        if cols.len() < 12 {
+            continue;
+        }
+
+        let left: u32 = cols[6].parse().unwrap_or(0);
+        let top: u32 = cols[7].parse().unwrap_or(0);
+        let width: u32 = cols[8].parse().unwrap_or(0);
+        let height: u32 = cols[9].parse().unwrap_or(0);
+        let conf: f32 = cols[10].parse().unwrap_or(0.0);
+        let text = cols[11].trim();
+
+        if conf < 40.0 || text.is_empty() {
+            continue;
+        }
+
+        let orig_left = (left as f64 / scale_factor).round() as i32;
+        let orig_top = (top as f64 / scale_factor).round() as i32;
+        let orig_width = (width as f64 / scale_factor).round() as i32;
+        let orig_height = (height as f64 / scale_factor).round() as i32;
+
+        let center_x = orig_left + orig_width / 2;
+        let center_y = orig_top + orig_height / 2;
+
+        elements.push(Element {
+            id: format!("el_{}", id_counter),
+            label: text.to_string(),
+            x: center_x,
+            y: center_y,
+            w: orig_width,
+            h: orig_height,
+        });
+        id_counter += 1;
+    }
+
+    Ok(elements)
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn extract_ocr_elements(_image: &DynamicImage) -> Result<Vec<Element>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn capture_redacted_with_elements(patterns: &RedactPatterns) -> Result<(Vec<u8>, Vec<Element>)> {
+    let raw = capture_primary()?;
+    let redacted = redact::redact(raw, patterns);
+    let elements = extract_ocr_elements(&redacted).unwrap_or_default();
+    let png_bytes = redact::encode_png(&redacted)?;
+    Ok((png_bytes, elements))
+}
+
+#[cfg(target_os = "ios")]
+pub fn capture_redacted_with_elements(_patterns: &RedactPatterns) -> Result<(Vec<u8>, Vec<Element>)> {
+    anyhow::bail!("Direct frame capture is not supported on iOS due to platform security sandbox restrictions.")
+}
+
 // ---------------------------------------------------------------------------
 // Base64 helper (Compiled globally on all targets)
 // ---------------------------------------------------------------------------

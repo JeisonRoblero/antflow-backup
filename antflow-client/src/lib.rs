@@ -31,10 +31,42 @@ use crate::executor::new_stop_flag;
 use crate::redact::RedactPatterns;
 use crate::ui::console;
 
+fn cleanup_temp_generation_files() {
+    let temp_dir = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
+                    if filename.starts_with("localai_gen_") {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_main() -> Result<()> {
+    cleanup_temp_generation_files();
     let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
 
     macro_rules! dbg_log {
+        ($($arg:tt)*) => {
+            {
+                let log_path = std::env::temp_dir().join("antflow_debug.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true)
+                    .open(&log_path)
+                {
+                    use std::io::Write;
+                    let _ = writeln!(f, $($arg)*);
+                }
+            }
+        };
+    }
+
+    macro_rules! trace_log {
         ($($arg:tt)*) => {
             #[cfg(debug_assertions)]
             {
@@ -49,7 +81,7 @@ pub async fn run_main() -> Result<()> {
             }
         };
     }
-    #[cfg(debug_assertions)]
+
     {
         let log_path = std::env::temp_dir().join("antflow_debug.log");
         let _ = std::fs::write(&log_path, "");
@@ -86,6 +118,14 @@ pub async fn run_main() -> Result<()> {
             cfg.ai.vision_capable = expected_vision;
             let _ = config::save(&storage_dir, &cfg);
         }
+    }
+
+    // Auto-heal/validate model categories. If the active chat/reasoning model is set to a non-chat media model, clear it.
+    let non_chat_models = ["stablediffusion-ggml", "animatediff", "kokoro", "faster-whisper", "musicgen"];
+    if non_chat_models.contains(&cfg.ai.model.as_str()) {
+        cfg.ai.model = String::new();
+        cfg.ai.provider = String::new();
+        let _ = config::save(&storage_dir, &cfg);
     }
 
     match subcommand {
