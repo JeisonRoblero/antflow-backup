@@ -42,3 +42,7 @@ The AI assistant that can control any device
 
 ---
 
+<img width="1919" height="1131" alt="image" src="https://github.com/user-attachments/assets/b57b90b1-fa7e-4907-b16d-fc384a785371" />
+
+---
+
