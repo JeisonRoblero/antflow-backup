@@ -720,51 +720,86 @@ pub async fn run(cfg: AppConfig, conn: Connection, storage_dir: std::path::PathB
                                         if let Ok(crossterm::event::Event::Key(key)) = crossterm::event::read() {
                                             if key.kind == crossterm::event::KeyEventKind::Press {
                                                 if app.mode == AppMode::Clarification {
-                                                    match key.code {
-                                                        crossterm::event::KeyCode::Up => {
-                                                            if app.clarification_cursor > 0 {
-                                                                app.clarification_cursor -= 1;
+                                                    if app.clarification_typing {
+                                                        match key.code {
+                                                            crossterm::event::KeyCode::Char(c) => {
+                                                                app.input.push(c);
+                                                                app.cursor_pos = app.input.len();
                                                             }
-                                                        }
-                                                        crossterm::event::KeyCode::Down => {
-                                                            if app.clarification_cursor + 1 < app.clarification_options.len() {
-                                                                app.clarification_cursor += 1;
+                                                            crossterm::event::KeyCode::Backspace => {
+                                                                app.input.pop();
+                                                                app.cursor_pos = app.input.len();
                                                             }
-                                                        }
-                                                        crossterm::event::KeyCode::Enter => {
-                                                            let selected = app.clarification_options
-                                                                .get(app.clarification_cursor)
-                                                                .cloned()
-                                                                .unwrap_or_default();
-                                                            let is_custom = selected.to_lowercase().contains("custom")
-                                                                || selected.to_lowercase().contains("other");
-                                                            app.clarification_question = None;
-                                                            app.clarification_options.clear();
-                                                            app.mode = AppMode::Chat;
-                                                            if !is_custom {
-                                                                app.push_message("user", &selected);
-                                                                app.start_thinking();
-                                                                if let Some(tx) = app.clarification_tx.as_ref() {
-                                                                    let _ = tx.try_send(selected);
+                                                            crossterm::event::KeyCode::Esc => {
+                                                                app.clarification_typing = false;
+                                                                app.input.clear();
+                                                                app.cursor_pos = 0;
+                                                            }
+                                                            crossterm::event::KeyCode::Enter => {
+                                                                let entered = app.input.trim().to_string();
+                                                                if !entered.is_empty() {
+                                                                    app.clarification_question = None;
+                                                                    app.clarification_options.clear();
+                                                                    app.mode = AppMode::Chat;
+                                                                    app.clarification_typing = false;
+                                                                    app.input.clear();
+                                                                    app.cursor_pos = 0;
+
+                                                                    app.push_message("user", &entered);
+                                                                    app.start_thinking();
+                                                                    if let Some(tx) = app.clarification_tx.take() {
+                                                                        let _ = tx.try_send(entered);
+                                                                    }
                                                                 }
-                                                            } else {
+                                                            }
+                                                            _ => {}
+                                                        }
+                                                    } else {
+                                                        match key.code {
+                                                            crossterm::event::KeyCode::Up => {
+                                                                if app.clarification_cursor > 0 {
+                                                                    app.clarification_cursor -= 1;
+                                                                }
+                                                            }
+                                                            crossterm::event::KeyCode::Down => {
+                                                                if app.clarification_cursor + 1 < app.clarification_options.len() {
+                                                                    app.clarification_cursor += 1;
+                                                                }
+                                                            }
+                                                            crossterm::event::KeyCode::Enter => {
+                                                                let selected = app.clarification_options
+                                                                    .get(app.clarification_cursor)
+                                                                    .cloned()
+                                                                    .unwrap_or_default();
+                                                                let is_custom = selected.to_lowercase().contains("custom")
+                                                                    || selected.to_lowercase().contains("other");
+                                                                if !is_custom {
+                                                                    app.clarification_question = None;
+                                                                    app.clarification_options.clear();
+                                                                    app.mode = AppMode::Chat;
+                                                                    app.push_message("user", &selected);
+                                                                    app.start_thinking();
+                                                                    if let Some(tx) = app.clarification_tx.take() {
+                                                                        let _ = tx.try_send(selected);
+                                                                    }
+                                                                } else {
+                                                                    app.clarification_typing = true;
+                                                                    app.input.clear();
+                                                                    app.cursor_pos = 0;
+                                                                }
+                                                            }
+                                                            crossterm::event::KeyCode::Esc => {
+                                                                app.clarification_question = None;
+                                                                app.clarification_options.clear();
+                                                                app.mode = AppMode::Chat;
                                                                 if let Some(tx) = app.clarification_tx.take() {
                                                                     let _ = tx.try_send("cancelled".to_string());
                                                                 }
                                                                 app.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                                app.stop_thinking();
                                                             }
+                                                            _ => {}
                                                         }
-                                                        crossterm::event::KeyCode::Esc => {
-                                                            app.clarification_question = None;
-                                                            app.clarification_options.clear();
-                                                            app.mode = AppMode::Chat;
-                                                            if let Some(tx) = app.clarification_tx.take() {
-                                                                let _ = tx.try_send("cancelled".to_string());
-                                                            }
-                                                            app.stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                                            app.stop_thinking();
-                                                        }
-                                                        _ => {}
                                                     }
                                                 } else {
                                                     match key.code {

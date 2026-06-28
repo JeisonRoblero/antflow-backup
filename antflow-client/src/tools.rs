@@ -7,37 +7,6 @@ use serde_json::Value;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-macro_rules! dbg_log {
-    ($($arg:tt)*) => {
-        {
-            let log_path = std::env::temp_dir().join("antflow_debug.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&log_path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
-
-macro_rules! trace_log {
-    ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
-        {
-            let log_path = std::env::temp_dir().join("antflow_debug.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&log_path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -69,7 +38,7 @@ use enigo::{
 pub fn mouse_move(params: &Value) -> Result<Option<String>> {
     let x = json_int(params, "x")?;
     let y = json_int(params, "y")?;
-    trace_log!("[mouse_move] Coordinates: x={}, y={}", x, y);
+    crate::trace_log!("[mouse_move] Coordinates: x={}, y={}", x, y);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.move_mouse(x, y, Coordinate::Abs).context("Mouse move failed")?;
     std::thread::sleep(std::time::Duration::from_millis(20));
@@ -82,7 +51,7 @@ pub fn mouse_click(params: &Value) -> Result<Option<String>> {
     let button = parse_button(button_str)?;
     let x = params.get("x").and_then(|v| v.as_i64());
     let y = params.get("y").and_then(|v| v.as_i64());
-    trace_log!("[mouse_click] Button: {}, Coordinates: {:?}", button_str, x.zip(y));
+    crate::trace_log!("[mouse_click] Button: {}, Coordinates: {:?}", button_str, x.zip(y));
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
         e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
@@ -96,7 +65,7 @@ pub fn mouse_click(params: &Value) -> Result<Option<String>> {
 pub fn mouse_double_click(params: &Value) -> Result<Option<String>> {
     let x = params.get("x").and_then(|v| v.as_i64());
     let y = params.get("y").and_then(|v| v.as_i64());
-    trace_log!("[mouse_double_click] Coordinates: {:?}", x.zip(y));
+    crate::trace_log!("[mouse_double_click] Coordinates: {:?}", x.zip(y));
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     if let (Some(x), Some(y)) = (params.get("x").and_then(|v| v.as_i64()), params.get("y").and_then(|v| v.as_i64())) {
         e.move_mouse(x as i32, y as i32, Coordinate::Abs).context("Mouse move failed")?;
@@ -116,7 +85,7 @@ pub fn mouse_drag(params: &Value) -> Result<Option<String>> {
     let to_y = json_int(params, "to_y")?;
     let button_str = json_str(params, "button").unwrap_or("left");
     let button = parse_button(button_str)?;
-    trace_log!("[mouse_drag] Button: {}, From: ({},{}), To: ({},{})", button_str, from_x, from_y, to_x, to_y);
+    crate::trace_log!("[mouse_drag] Button: {}, From: ({},{}), To: ({},{})", button_str, from_x, from_y, to_x, to_y);
 
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.move_mouse(from_x, from_y, Coordinate::Abs)?;
@@ -131,7 +100,7 @@ pub fn mouse_drag(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn mouse_scroll(params: &Value) -> Result<Option<String>> {
     let amount = json_int(params, "amount")?;
-    trace_log!("[mouse_scroll] Amount: {}", amount);
+    crate::trace_log!("[mouse_scroll] Amount: {}", amount);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.scroll(amount, enigo::Axis::Vertical).context("Scroll failed")?;
     Ok(None)
@@ -141,7 +110,7 @@ pub fn mouse_scroll(params: &Value) -> Result<Option<String>> {
 pub fn key_press(params: &Value) -> Result<Option<String>> {
     let key_name = json_str(params, "key").context("key_press requires a 'key' param")?;
     let modifiers = params.get("modifiers").and_then(|m| m.as_array()).cloned().unwrap_or_default();
-    trace_log!("[key_press] Key: {}, Modifiers: {:?}", key_name, modifiers);
+    crate::trace_log!("[key_press] Key: {}, Modifiers: {:?}", key_name, modifiers);
 
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
 
@@ -167,7 +136,7 @@ pub fn key_press(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn type_text(params: &Value) -> Result<Option<String>> {
     let text = json_str(params, "text").context("type_text requires a 'text' param")?;
-    trace_log!("[type_text] Typing text: '{}'", text);
+    crate::trace_log!("[type_text] Typing text: '{}'", text);
     let mut e = Enigo::new(&Settings::default()).context("Failed to initialize input driver")?;
     e.text(text).context("Type text failed")?;
     Ok(None)
@@ -176,7 +145,7 @@ pub fn type_text(params: &Value) -> Result<Option<String>> {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn clipboard_set(params: &Value) -> Result<Option<String>> {
     let text = json_str(params, "text").context("clipboard_set requires a 'text' param")?.to_string();
-    trace_log!("[clipboard_set] Writing text to clipboard: '{}'", text);
+    crate::trace_log!("[clipboard_set] Writing text to clipboard: '{}'", text);
     let mut cb = Clipboard::new().context("Failed to open clipboard")?;
     cb.set_text(text).context("Failed to write to clipboard")?;
     Ok(None)
@@ -186,14 +155,14 @@ pub fn clipboard_set(params: &Value) -> Result<Option<String>> {
 pub fn clipboard_get(_params: &Value) -> Result<Option<String>> {
     let mut cb = Clipboard::new().context("Failed to open clipboard")?;
     let text = cb.get_text().context("Failed to read clipboard")?;
-    trace_log!("[clipboard_get] Read text from clipboard: '{}'", text);
+    crate::trace_log!("[clipboard_get] Read text from clipboard: '{}'", text);
     Ok(Some(text))
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn open_url(params: &Value) -> Result<Option<String>> {
     let url = json_str(params, "url").context("open_url requires a 'url' param")?;
-    dbg_log!("[open_url] Launching URL: '{}'", url);
+    crate::dbg_log!("[open_url] Launching URL: '{}'", url);
     open::that(url).context("Failed to open URL")?;
     Ok(None)
 }
@@ -501,7 +470,7 @@ pub fn voice_input(_params: &Value) -> Result<Option<String>> { anyhow::bail!("V
 pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<String>> {
     let command = json_str(params, "command").context("run_command requires a 'command' param")?;
     let capture = params.get("capture_output").and_then(|v| v.as_bool()).unwrap_or(false);
-    trace_log!("[run_command] executing command='{}' (capture={})", command, capture);
+    crate::trace_log!("[run_command] executing command='{}' (capture={})", command, capture);
 
     let (shell, flag) = if cfg!(target_os = "windows") {
         ("cmd", "/C")
@@ -535,7 +504,7 @@ pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomi
         cmd.creation_flags(0x08000000);
         cmd.spawn()
             .context("Failed to launch app")?;
-        dbg_log!("[run_command] command treated as background launch, returned immediately");
+        crate::dbg_log!("[run_command] command treated as background launch, returned immediately");
         return Ok(None);
     } else {
         let mut cmd = std::process::Command::new(shell);
@@ -558,7 +527,7 @@ pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomi
         loop {
             if stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = child.kill();
-                dbg_log!("[run_command] process terminated via StopFlag");
+                crate::dbg_log!("[run_command] process terminated via StopFlag");
                 anyhow::bail!("Command execution cancelled by user.");
             }
             match child.try_wait() {
@@ -567,7 +536,7 @@ pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomi
                     if start.elapsed() >= timeout {
                         let _ = child.stdout.take();
                         let _ = child.stderr.take();
-                        dbg_log!("[run_command] command timed out after 10s");
+                        crate::dbg_log!("[run_command] command timed out after 10s");
                         if capture {
                             return Ok(Some("[process still running after 10s — treated as background app]".to_string()));
                         }
@@ -590,10 +559,10 @@ pub fn run_command(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomi
             stdout.trim(),
             if stderr.is_empty() { "none".to_string() } else { stderr.trim().to_string() }
         );
-        trace_log!("[run_command] command output: {}", combined);
+        crate::trace_log!("[run_command] command output: {}", combined);
         Ok(Some(combined))
     } else {
-        dbg_log!("[run_command] command success (output not captured)");
+        crate::dbg_log!("[run_command] command success (output not captured)");
         Ok(None)
     }
 }
@@ -655,7 +624,7 @@ fn sanitize_powershell_script(script: &str) -> String {
 pub fn run_script(params: &Value, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<Option<String>> {
     let script = json_str(params, "script").context("run_script requires a 'script' param")?;
     let capture = params.get("capture_output").and_then(|v| v.as_bool()).unwrap_or(true);
-    trace_log!("[run_script] executing script (capture={}):\n--- SCRIPT START ---\n{}\n--- SCRIPT END ---", capture, script);
+    crate::trace_log!("[run_script] executing script (capture={}):\n--- SCRIPT START ---\n{}\n--- SCRIPT END ---", capture, script);
 
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = std::process::Command::new("powershell");
@@ -684,7 +653,7 @@ pub fn run_script(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomic
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = child.kill();
-            dbg_log!("[run_script] script terminated via StopFlag");
+            crate::dbg_log!("[run_script] script terminated via StopFlag");
             anyhow::bail!("Script execution cancelled by user.");
         }
         match child.try_wait() {
@@ -702,7 +671,7 @@ pub fn run_script(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomic
     }
 
     if timed_out {
-        dbg_log!("[run_script] script execution timed out after 12s");
+        crate::dbg_log!("[run_script] script execution timed out after 12s");
         if capture {
             return Ok(Some("exit_code: 1\nstdout: \nstderr: Error: Script execution timed out after 12 seconds. Do NOT use blocking operations (like -Wait or synchronous loops) unless they exit quickly. If starting a GUI application, run it in the background and do not wait for it to close.".to_string()));
         } else {
@@ -721,10 +690,10 @@ pub fn run_script(params: &Value, stop: std::sync::Arc<std::sync::atomic::Atomic
             stdout.trim(),
             if stderr.is_empty() { "none".to_string() } else { stderr.trim().to_string() }
         );
-        trace_log!("[run_script] script result:\n{}", combined);
+        crate::trace_log!("[run_script] script result:\n{}", combined);
         Ok(Some(combined))
     } else {
-        dbg_log!("[run_script] script success (output not captured)");
+        crate::dbg_log!("[run_script] script success (output not captured)");
         Ok(None)
     }
 }

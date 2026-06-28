@@ -24,6 +24,7 @@ pub struct VoiceSession {
     pub is_user_speaking: bool,
     pub app_handle: tauri::AppHandle,
     pub cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub preferred_language: Option<String>,
 }
 
 pub static ACTIVE_SESSION: std::sync::OnceLock<Mutex<Option<Arc<Mutex<VoiceSession>>>>> = std::sync::OnceLock::new();
@@ -32,7 +33,7 @@ pub fn active_session_state() -> &'static Mutex<Option<Arc<Mutex<VoiceSession>>>
     ACTIVE_SESSION.get_or_init(|| Mutex::new(None))
 }
 
-pub async fn start_session(app_handle: tauri::AppHandle) -> anyhow::Result<()> {
+pub async fn start_session(app_handle: tauri::AppHandle, preferred_language: Option<String>) -> anyhow::Result<()> {
     let mut active = active_session_state().lock().await;
     // Always create a fresh session to ensure clean VAD and audio buffers
     let session = Arc::new(Mutex::new(VoiceSession {
@@ -43,6 +44,7 @@ pub async fn start_session(app_handle: tauri::AppHandle) -> anyhow::Result<()> {
         is_user_speaking: false,
         app_handle,
         cancel_tx: None,
+        preferred_language,
     }));
     *active = Some(session);
     Ok(())
@@ -145,12 +147,13 @@ impl VoiceSession {
                         self.cancel_tx = Some(cancel_tx);
 
                         let accumulated_samples = std::mem::take(&mut self.audio_buffer);
+                        let preferred_language = self.preferred_language.clone();
                          
                         let state = self.app_handle.state::<AppState>();
                         let session_id = state.session_id.lock().await.clone();
 
                         tokio::spawn(async move {
-                            if let Err(e) = run_voice_pipeline(app_handle.clone(), session_id.clone(), accumulated_samples, cancel_rx).await {
+                            if let Err(e) = run_voice_pipeline(app_handle.clone(), session_id.clone(), accumulated_samples, cancel_rx, preferred_language).await {
                                 eprintln!("Error running voice pipeline: {}", e);
                                 let _ = app_handle.emit("voice-state", serde_json::json!({ "state": "listening" }));
                                 let _ = app_handle.emit("agent-done", serde_json::json!({
@@ -179,28 +182,25 @@ impl VoiceSession {
     }
 }
 
-async fn run_voice_pipeline(
-    app_handle: tauri::AppHandle,
-    session_id: String,
+pub async fn transcribe_samples(
+    app_handle: &tauri::AppHandle,
     samples: Vec<i16>,
-    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<()> {
+    preferred_language: Option<String>,
+) -> anyhow::Result<String> {
     if samples.is_empty() {
-        let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
-        return Ok(());
+        return Ok(String::new());
     }
 
     let temp_dir = std::env::temp_dir();
-    let wav_path = temp_dir.join("antflow_voice_input.wav");
+    let temp_id = uuid::Uuid::new_v4().to_string();
+    let wav_path = temp_dir.join(format!("antflow_voice_temp_{}.wav", temp_id));
     write_wav_file(&wav_path, &samples)?;
 
     let state = app_handle.state::<AppState>();
     let cfg = state.cfg.lock().await.clone();
-    let (provider_id, api_key, model_name, base_url) = (
+    let (provider_id, api_key) = (
         cfg.ai.provider.clone(),
         cfg.ai.api_key.clone(),
-        cfg.ai.model.clone(),
-        cfg.ai.base_url.clone(),
     );
 
     let mut stt_key = String::new();
@@ -210,7 +210,7 @@ async fn run_voice_pipeline(
     let local_stt_active = !cfg.localai_models.listening.is_empty();
     if local_stt_active {
         stt_provider = "localai".to_string();
-        stt_url = format!("http://127.0.0.1:{}", crate::ai::localai::get_active_port());
+        stt_url = format!("http://127.0.0.1:{}/v1", crate::ai::localai::get_active_port());
     } else {
         if provider_id == "openai" && !api_key.is_empty() {
             stt_key = api_key.clone();
@@ -238,13 +238,9 @@ async fn run_voice_pipeline(
     }
 
     if stt_key.is_empty() && !local_stt_active {
-        eprintln!("Voice: No API key found for Whisper transcription");
-        let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
-        reset_session_to_listening().await;
-        return Ok(());
+        let _ = std::fs::remove_file(&wav_path);
+        anyhow::bail!("Voice: No API key found for Whisper transcription");
     }
-
-    if *cancel_rx.borrow() { return Ok(()); }
 
     let client = reqwest::Client::new();
     let wav_bytes = std::fs::read(&wav_path)?;
@@ -254,9 +250,30 @@ async fn run_voice_pipeline(
         .file_name("audio.wav")
         .mime_str("audio/wav")?;
 
-    let form = reqwest::multipart::Form::new()
+    let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("model", if stt_provider == "localai" { cfg.localai_models.listening.clone() } else if stt_provider == "groq" { "whisper-large-v3".to_string() } else { "whisper-1".to_string() });
+
+    let initial_prompt = if let Some(ref lang) = preferred_language {
+        match lang.as_str() {
+            "en" => Some("Hello."),
+            "es" => Some("Hola."),
+            "fr" => Some("Bonjour."),
+            "de" => Some("Hallo."),
+            "it" => Some("Ciao."),
+            "pt" => Some("Olá."),
+            "ja" => Some("こんにちは。"),
+            "zh" => Some("你好。"),
+            "ru" => Some("Здравствуйте."),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    if let Some(prompt_val) = initial_prompt {
+        form = form.text("prompt", prompt_val.to_string());
+    }
 
     let resp_res = if local_stt_active {
         let local_res = client.post(&url)
@@ -266,7 +283,6 @@ async fn run_voice_pipeline(
         match local_res {
             Ok(r) if r.status().is_success() => Ok(r),
             _ => {
-                // Quiet fallback
                 let fallback_stt_provider = if !api_key.is_empty() && provider_id == "groq" { "groq" } else { "openai" };
                 let fallback_stt_url = if fallback_stt_provider == "groq" { "https://api.groq.com/openai/v1" } else { "https://api.openai.com/v1" };
                 let fallback_stt_key = if fallback_stt_provider == "groq" { api_key.clone() } else {
@@ -279,9 +295,12 @@ async fn run_voice_pipeline(
                     let part_fb = reqwest::multipart::Part::bytes(wav_bytes_fb)
                         .file_name("audio.wav")
                         .mime_str("audio/wav")?;
-                    let fallback_form = reqwest::multipart::Form::new()
+                    let mut fallback_form = reqwest::multipart::Form::new()
                         .part("file", part_fb)
                         .text("model", if fallback_stt_provider == "groq" { "whisper-large-v3" } else { "whisper-1" });
+                    if let Some(prompt_val) = initial_prompt {
+                        fallback_form = fallback_form.text("prompt", prompt_val.to_string());
+                    }
                     client.post(&fallback_url)
                         .header("Authorization", format!("Bearer {}", fallback_stt_key))
                         .multipart(fallback_form)
@@ -301,18 +320,54 @@ async fn run_voice_pipeline(
     };
 
     let resp = resp_res?;
+    let _ = std::fs::remove_file(&wav_path);
 
     if !resp.status().is_success() {
         let text = resp.text().await.unwrap_or_default();
-        eprintln!("STT API error: {}", text);
-        let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
-        reset_session_to_listening().await;
-        return Ok(());
+        anyhow::bail!("STT API error: {}", text);
     }
 
     let res_json: serde_json::Value = resp.json().await?;
     let transcribed_text = res_json["text"].as_str().unwrap_or("").trim().to_string();
-    
+    Ok(transcribed_text)
+}
+
+async fn run_voice_pipeline(
+    app_handle: tauri::AppHandle,
+    session_id: String,
+    samples: Vec<i16>,
+    mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    preferred_language: Option<String>,
+) -> anyhow::Result<()> {
+    if samples.is_empty() {
+        let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
+        return Ok(());
+    }
+
+    let state = app_handle.state::<AppState>();
+    let cfg = state.cfg.lock().await.clone();
+    let (provider_id, api_key, model_name, base_url) = (
+        cfg.ai.provider.clone(),
+        cfg.ai.api_key.clone(),
+        cfg.ai.model.clone(),
+        cfg.ai.base_url.clone(),
+    );
+    let client = reqwest::Client::new();
+
+    if *cancel_rx.borrow() { return Ok(()); }
+
+    let transcribed_text = match transcribe_samples(&app_handle, samples, preferred_language.clone()).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("STT error: {}", e);
+            let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
+            reset_session_to_listening().await;
+            return Ok(());
+        }
+    };
+
+    if *cancel_rx.borrow() { return Ok(()); }
+
     if transcribed_text.is_empty() {
         let _ = app_handle.emit("voice-state", json!({ "state": "listening" }));
         reset_session_to_listening().await;
@@ -352,7 +407,31 @@ async fn run_voice_pipeline(
     // Stream LLM chat completion
     let history_payload = {
         let history = state.history.lock().await;
-        history.clone()
+        let mut hist = history.clone();
+
+        // Inject system prompt first
+        let device_info = state.device_info.clone();
+        let vision_capable = cfg.ai.vision_capable;
+        let system_prompt = crate::prompt::build_system_prompt_with_vision(&device_info, vision_capable, Some(&transcribed_text));
+        hist.insert(0, ChatMessage::text("system", &system_prompt));
+
+        // Inject language instruction
+        if let Some(lang_instruction) = crate::gui::get_language_instruction(&preferred_language.clone().unwrap_or_else(|| "auto".to_string())) {
+            hist.insert(1, ChatMessage::text("system", &lang_instruction));
+        }
+
+        // Creator query reinforcement prepended directly to the last user message!
+        if crate::gui::is_creator_query(&transcribed_text) {
+            if let Some(msg) = hist.last_mut() {
+                if let serde_json::Value::String(ref s) = msg.content {
+                    msg.content = serde_json::Value::String(format!(
+                        "[System Reminder: You are Antflow, a helpful AI assistant. You were created by engineer Jeison Roblero in Antflow labs. You must reply conforming to this identity. Never say you were created by Google, OpenAI, or anyone else. State clearly that you were created by engineer Jeison Roblero in Antflow labs. Respond strictly in the language of the user's query.]\nUser Query: {}",
+                        s
+                    ));
+                }
+            }
+        }
+        hist
     };
 
     let llm_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -510,9 +589,10 @@ async fn reset_session_to_listening() {
     }
 }
 
-async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str, app_handle: &tauri::AppHandle) -> anyhow::Result<Vec<u8>> {
+pub async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str, app_handle: &tauri::AppHandle) -> anyhow::Result<Vec<u8>> {
     let client = reqwest::Client::new();
-    let cleaned = text.trim();
+    let cleaned_raw = clean_text_for_speech(text);
+    let cleaned = cleaned_raw.trim();
     if cleaned.is_empty() {
         return Ok(vec![]);
     }
@@ -524,7 +604,21 @@ async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str, app_handle
     if local_voice_active {
         let active_port = crate::ai::localai::get_active_port();
         let url = format!("http://127.0.0.1:{}/v1/audio/speech", active_port);
-        let voice = if cfg.localai_voice.is_empty() { "af_sky".to_string() } else { cfg.localai_voice.clone() };
+        let detected_lang = detect_language(cleaned);
+        let voice = if !cfg.localai_voice.is_empty() {
+            cfg.localai_voice.clone()
+        } else if cfg.localai_models.speaking.to_lowercase().contains("kokoro") {
+            match detected_lang {
+                "es" => "ef_dora".to_string(),
+                "fr" => "ff_siwis".to_string(),
+                "ja" => "jf_alpha".to_string(),
+                "it" => "if_sara".to_string(),
+                "pt" => "pf_dora".to_string(),
+                _ => "af_sky".to_string(),
+            }
+        } else {
+            "af_sky".to_string()
+        };
         let body = json!({
             "model": cfg.localai_models.speaking,
             "input": cleaned,
@@ -587,21 +681,50 @@ async fn synthesize_tts(text: &str, provider_id: &str, api_key: &str, app_handle
 
 fn detect_language(text: &str) -> &str {
     let lower = text.to_lowercase();
-    if lower.contains("hola") || lower.contains("gracias") || lower.contains("cómo") || lower.contains("esta") {
-        "es"
-    } else if lower.contains("bonjour") || lower.contains("merci") || lower.contains("oui") {
-        "fr"
-    } else if lower.contains("hallo") || lower.contains("danke") || lower.contains("bitte") {
-        "de"
-    } else if lower.contains("ciao") || lower.contains("grazie") {
-        "it"
-    } else if lower.contains("obrigado") || lower.contains("bom dia") {
-        "pt"
-    } else if lower.chars().any(|c| (0x3040..=0x30FF).contains(&(c as u32)) || (0x4E00..=0x9FFF).contains(&(c as u32))) {
-        "ja"
-    } else {
-        "en"
+    
+    // Check Spanish
+    if lower.contains('¿') || lower.contains('¡') ||
+       lower.contains("hola") || lower.contains("gracias") || lower.contains("cómo") || 
+       lower.contains("estás") || lower.contains("buenos") || lower.contains("por favor") ||
+       lower.contains("entendido") || lower.contains("español") || lower.contains("código")
+    {
+        return "es";
     }
+    
+    // Check French
+    if lower.contains("bonjour") || lower.contains("merci") || lower.contains("français") ||
+       lower.contains("s'il vous plaît") || lower.contains("plaît") || lower.contains("boucle")
+    {
+        return "fr";
+    }
+    
+    // Check Italian
+    if lower.contains("ciao") || lower.contains("grazie") || lower.contains("prego") ||
+       lower.contains("italiano") || lower.contains("codice") || lower.contains("ciclo")
+    {
+        return "it";
+    }
+    
+    // Check Portuguese
+    if lower.contains("obrigado") || lower.contains("obrigada") || lower.contains("por favor") ||
+       lower.contains("português") || lower.contains("bom dia") || lower.contains("laço")
+    {
+        return "pt";
+    }
+    
+    // Check Japanese (Hiragana, Katakana, Kanji characters range)
+    if lower.chars().any(|c| (0x3040..=0x30FF).contains(&(c as u32)) || (0x4E00..=0x9FFF).contains(&(c as u32))) {
+        return "ja";
+    }
+    
+    // Check German
+    if lower.contains("hallo") || lower.contains("danke") || lower.contains("bitte") ||
+       lower.contains("deutsch") || lower.contains("schleife")
+    {
+        return "de";
+    }
+    
+    "en"
 }
 
 fn url_encode(s: &str) -> String {
@@ -643,7 +766,7 @@ fn split_sentence_for_tts(text: &str) -> Vec<String> {
     parts
 }
 
-fn base64_encode(data: &[u8]) -> String {
+pub fn base64_encode(data: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
     for chunk in data.chunks(3) {
@@ -736,4 +859,74 @@ fn write_wav_file(path: &std::path::Path, samples: &[i16]) -> Result<(), std::io
     }
     
     Ok(())
+}
+
+fn clean_text_for_speech(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    
+    let mut s = text.to_string();
+
+    // 1. Remove markdown code blocks
+    if let Ok(re) = regex::Regex::new(r"(?s)```.*?```") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+
+    // 2. Remove LaTeX math blocks
+    if let Ok(re) = regex::Regex::new(r"(?s)\$\$.*?\$\$") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"\$[^\$\n]*?\$") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+
+    // 3. Remove html tags/comments
+    if let Ok(re) = regex::Regex::new(r"(?s)<!--.*?-->") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"<[^>]*>") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+
+    // 4. Remove images & clean links
+    if let Ok(re) = regex::Regex::new(r"!\[[^\]]*\]\([^\)]+\)") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\([^\)]+\)") {
+        s = re.replace_all(&s, "$1").into_owned();
+    }
+
+    // 5. Replace raw URLs with "link to [domain]"
+    if let Ok(re) = regex::Regex::new(r"(?i)https?://(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?:/[^\s]*)?") {
+        s = re.replace_all(&s, "link to $1").into_owned();
+    }
+
+    // 6. Remove inline code backticks
+    if let Ok(re) = regex::Regex::new(r"`([^`]+)`") {
+        s = re.replace_all(&s, "$1").into_owned();
+    }
+
+    // 7. Strip list markers and headers
+    if let Ok(re) = regex::Regex::new(r"(?m)^\s*[-*+]\s+") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"(?m)^\s*\d+\.\s+") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+    if let Ok(re) = regex::Regex::new(r"(?m)^\s*#+\s+") {
+        s = re.replace_all(&s, "").into_owned();
+    }
+
+    // 8. Strip formatting symbols
+    if let Ok(re) = regex::Regex::new(r"[*#_~+=<>\\/|{}[\]]") {
+        s = re.replace_all(&s, " ").into_owned();
+    }
+
+    // 9. Normalize multiple spaces
+    if let Ok(re) = regex::Regex::new(r"\s+") {
+        s = re.replace_all(&s, " ").into_owned();
+    }
+
+    s.trim().to_string()
 }

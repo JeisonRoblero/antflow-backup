@@ -114,6 +114,7 @@ open_url:{{"url":"..."}}
 web_search:{{"query":"..."}}
 ask_clarification:{{"question":"...","options":["a","b"]}}
 generate_image:{{"prompt":"..."}} — Generates an image/picture matching the prompt using LocalAI and displays it in the chat.
+generate_speech:{{"text":"..."}} — Synthesizes spoken audio from text using LocalAI TTS (e.g. kokoro). Prefer this over Windows COM/SAPI scripts.
 generate_video:{{"prompt":"..."}} — Generates a video clip matching the prompt using LocalAI and displays it in the chat.
 generate_music:{{"prompt":"..."}} — Generates a sound or music clip matching the prompt using LocalAI and plays it in the chat.
 task_complete:{{"summary":"..."}}
@@ -147,6 +148,7 @@ RULES
 17. Web Searches: To search the internet, ALWAYS use the web_search tool. NEVER try to fetch web pages using Invoke-WebRequest, Get-Content with URLs, curl, wget, or Start-Process with URLs — those will fail. Use web_search for any query that needs current/live information from the internet.
 18. Web/Media Playback: If asked to play/reproduce a video (e.g. YouTube), open a website, or search for a video, simply open the URL directly using the `open_url` tool or run `Start-Process '<url>'` in PowerShell. Do NOT search for developer packages (like pub.dev packages), write code to compile players, or attempt to download/install players. Direct browser playback is sufficient.
 19. Temporary Files: All temporary files, downloaded items, scraped pages, or intermediate log files generated during script or command execution MUST be written to the system TEMP folder (e.g. `$env:TEMP` on Windows, or `/tmp` on macOS/Linux). NEVER write temporary files directly to the current working directory, the project source code directory, or repository folders.
+20. Speech / TTS: When asked to speak text or generate voice audio, use `generate_speech` with LocalAI. Do NOT use WScript, SAPI COM objects, or `run_script` for text-to-speech when `generate_speech` is available.
 
 APP NAMES
 {app_hints}

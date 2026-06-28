@@ -54,6 +54,8 @@ class MainActivity : TauriActivity() {
           requestNotificationPermission()
         } else if (action == 11) {
           openNotificationSettings()
+        } else if (action == 12) {
+          requestMicrophonePermission()
         }
       } catch (e: Exception) {
         e.printStackTrace()
@@ -69,6 +71,17 @@ class MainActivity : TauriActivity() {
         if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
           requestPermissions(arrayOf(permission), 992)
         }
+      }
+    } catch (e: Exception) {
+      e.printStackTrace()
+    }
+  }
+
+  fun requestMicrophonePermission() {
+    try {
+      val permission = "android.permission.RECORD_AUDIO"
+      if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+        requestPermissions(arrayOf(permission), 993)
       }
     } catch (e: Exception) {
       e.printStackTrace()

@@ -32,24 +32,35 @@ impl OpenAiProvider {
 #[async_trait]
 impl AiProvider for OpenAiProvider {
     async fn chat(&self, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<AiResponse> {
+        let clean_messages: Vec<serde_json::Value> = messages.iter().map(|m| m.to_clean_json()).collect();
         let body = json!({
             "model": self.model,
-            "messages": messages,
+            "messages": clean_messages,
             "max_tokens": max_tokens.unwrap_or(4096)
         });
 
         let url = format!("{}/chat/completions", self.base_url);
+        crate::dbg_log!("[ai:openai] Sending non-stream chat request to model '{}' (url: {})", self.model, url);
+        let start_time = std::time::Instant::now();
 
-        let resp = self.client
+        let resp_res = self.client
             .post(&url)
-            // OpenAI requires the key in the Authorization header as "Bearer <key>".
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&body)
             .send()
-            .await
-            .context("Failed to reach OpenAI API")?;
+            .await;
+
+        let duration = start_time.elapsed().as_millis();
+        let resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:openai] Request failed after {}ms: {}", duration, e);
+                return Err(anyhow::anyhow!(e).context("Failed to reach OpenAI API"));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:openai] Received response headers in {}ms (status: {})", duration, status);
         let text = resp.text().await?;
 
         if !status.is_success() {
@@ -63,7 +74,6 @@ impl AiProvider for OpenAiProvider {
         let val: serde_json::Value = serde_json::from_str(&text)
             .context("Failed to parse OpenAI response")?;
 
-        // OpenAI wraps the reply in: choices[0].message.content
         let content = val["choices"][0]["message"]["content"]
             .as_str()
             .unwrap_or("")
@@ -106,24 +116,37 @@ impl AiProvider for OpenAiProvider {
         max_tokens: Option<u32>,
         tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<AiResponse> {
+        let clean_messages: Vec<serde_json::Value> = messages.iter().map(|m| m.to_clean_json()).collect();
         let body = json!({
             "model": self.model,
-            "messages": messages,
+            "messages": clean_messages,
             "max_tokens": max_tokens.unwrap_or(4096),
             "stream": true
         });
 
         let url = format!("{}/chat/completions", self.base_url);
+        crate::dbg_log!("[ai:openai] Sending stream chat request to model '{}' (url: {})", self.model, url);
+        let start_time = std::time::Instant::now();
 
-        let mut resp = self.client
+        let resp_res = self.client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&body)
             .send()
-            .await
-            .context("Failed to reach OpenAI API")?;
+            .await;
+
+        let duration = start_time.elapsed().as_millis();
+        let mut resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:openai] Stream request failed after {}ms: {}", duration, e);
+                return Err(anyhow::anyhow!(e).context("Failed to reach OpenAI API"));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:openai] Received stream response headers in {}ms (status: {})", duration, status);
+
         if !status.is_success() {
             let text = resp.text().await?;
             let code = status.as_u16();
@@ -174,6 +197,9 @@ impl AiProvider for OpenAiProvider {
                 }
             }
         }
+
+        let total_duration = start_time.elapsed().as_millis();
+        crate::dbg_log!("[ai:openai] Stream completed in {}ms", total_duration);
 
         let is_tool_call = full_content.trim_start().starts_with('{');
         Ok(AiResponse { content: full_content, is_tool_call })

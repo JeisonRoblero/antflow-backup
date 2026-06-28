@@ -29,6 +29,10 @@ pub fn get_localai_base_url() -> String {
     format!("http://127.0.0.1:{}", get_active_port())
 }
 
+pub fn backends_dir(storage_dir: &Path) -> PathBuf {
+    storage_dir.join("localai_backends")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalAiModel {
     pub name: String,
@@ -60,9 +64,9 @@ pub fn get_catalog() -> Vec<LocalAiModel> {
             size_gb: 1.6,
             vision: false,
             installed: false,
-            download_url: "https://huggingface.co/gpustack/stable-diffusion-v1-5-GGUF/resolve/main/stable-diffusion-v1-5-Q4_0.gguf".to_string(),
-            filename: "stable-diffusion-v1-5-Q4_0.gguf".to_string(),
-            description: "Stable Diffusion v1.5 quantized GGUF image generator.".to_string(),
+            download_url: "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf".to_string(),
+            filename: "stable-diffusion-v1-5-pruned-emaonly-Q4_0.gguf".to_string(),
+            description: "Stable Diffusion v1.5 (GGUF) — LocalAI gallery-compatible image generator.".to_string(),
         },
         LocalAiModel {
             name: "animatediff".to_string(),
@@ -391,7 +395,9 @@ pub async fn start_server(storage_dir: &Path) -> Result<()> {
     set_active_port(free_port);
 
     let models_dir = storage_dir.join("localai_models");
+    let backends_dir = backends_dir(storage_dir);
     let _ = std::fs::create_dir_all(&models_dir);
+    let _ = std::fs::create_dir_all(&backends_dir);
 
     // Setup logging
     let log_path = storage_dir.join("localai.log");
@@ -457,6 +463,7 @@ pub async fn start_server(storage_dir: &Path) -> Result<()> {
         let wsl_distro_name = wsl_distro.unwrap();
         let wsl_bin_str = to_wsl_path(&wsl_bin_path);
         let wsl_models_str = to_wsl_path(&models_dir);
+        let wsl_backends_str = to_wsl_path(&backends_dir);
 
         // Copy and chmod binary in WSL synchronously
         let mut cp_cmd = tokio::process::Command::new("wsl");
@@ -480,10 +487,10 @@ pub async fn start_server(storage_dir: &Path) -> Result<()> {
             "sh",
             "-c",
             &format!(
-                "ADDRESS=127.0.0.1:{} PORT={} MODELS_PATH='{}' exec /tmp/local-ai",
-                free_port,
-                free_port,
-                wsl_models_str
+                "ADDRESS=127.0.0.1:{port} PORT={port} THREADS=6 MODELS_PATH='{models}' BACKENDS_PATH='{backends}' DEBUG=true exec /tmp/local-ai",
+                port = free_port,
+                models = wsl_models_str,
+                backends = wsl_backends_str,
             )
         ]);
         c
@@ -506,9 +513,14 @@ pub async fn start_server(storage_dir: &Path) -> Result<()> {
         let mut c = tokio::process::Command::new(bin_path);
         c.env("ADDRESS", format!("127.0.0.1:{}", free_port));
         c.env("PORT", free_port.to_string());
+        c.env("THREADS", "6");
         if let Some(s) = models_dir.to_str() {
             c.env("MODELS_PATH", s);
         }
+        if let Some(s) = backends_dir.to_str() {
+            c.env("BACKENDS_PATH", s);
+        }
+        c.env("DEBUG", "true");
         c
     };
 
@@ -534,6 +546,9 @@ pub async fn start_server(storage_dir: &Path) -> Result<()> {
             break;
         }
     }
+
+    // Preemptively clean up incompatible libraries on startup
+    let _ = cleanup_incompatible_wsl_libraries().await;
 
     Ok(())
 }
@@ -595,26 +610,137 @@ pub fn write_model_yaml(storage_dir: &Path, model_name: &str, category: &str, fi
     let models_dir = storage_dir.join("localai_models");
     let _ = std::fs::create_dir_all(&models_dir);
     let config_path = models_dir.join(format!("{}.yaml", model_name));
-    
-    let backend = match category {
-        "chat" => "llama-cpp",
-        "images" => "stablediffusion",
-        "video" => "animatediff",
-        "speaking" => "kokoro",
-        "listening" => "faster-whisper",
-        "music" => "musicgen",
-        _ => "llama-cpp",
-    };
 
-    let yaml_content = format!(
-        "name: {}\nbackend: {}\nparameters:\n  model: {}\n",
-        model_name, backend, filename
-    );
+    let yaml_content = if category == "images" {
+        // Matches LocalAI gallery sd-ggml.yaml layout for SD 1.5.
+        format!(
+            "name: {model_name}\nbackend: stablediffusion-ggml\nstep: 15\ncfg_scale: 7.5\nthreads: 6\noptions:\n- \"sampler:euler\"\nparameters:\n  model: {filename}\n  threads: 6\n  gpu_layers: 0\n"
+        )
+    } else {
+        let backend = match category {
+            "chat" => "llama-cpp",
+            "video" => "animatediff",
+            "speaking" => "kokoro",
+            "listening" => "faster-whisper",
+            "music" => "musicgen",
+            _ => "llama-cpp",
+        };
+        format!(
+            "name: {model_name}\nbackend: {backend}\nparameters:\n  model: {filename}\n"
+        )
+    };
 
     std::fs::write(&config_path, yaml_content)
         .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
 
     Ok(())
+}
+
+fn image_yaml_is_valid(content: &str, expected_filename: &str) -> bool {
+    content.contains("backend: stablediffusion-ggml")
+        && content.contains("sampler:euler")
+        && content.contains(&format!("model: {expected_filename}"))
+        && content.lines().any(|l| l.trim() == "step: 15")
+        && content.contains("threads: 6")
+}
+
+pub fn verify_image_model_weights(storage_dir: &Path, model_name: &str) -> Result<()> {
+    let models_dir = storage_dir.join("localai_models");
+    let filename = match get_catalog()
+        .iter()
+        .find(|m| m.name == model_name)
+        .map(|m| m.filename.clone())
+        .or_else(|| {
+            let yaml_path = models_dir.join(format!("{}.yaml", model_name));
+            std::fs::read_to_string(&yaml_path).ok().and_then(|content| {
+                content.lines().find_map(|line| {
+                    let trimmed = line.trim();
+                    trimmed
+                        .strip_prefix("model:")
+                        .map(|v| v.trim().to_string())
+                })
+            })
+        }) {
+            Some(f) => f,
+            None => return Ok(()), // Bypass local verification for non-catalog/external models
+        };
+
+    let weights_path = models_dir.join(&filename);
+    if !weights_path.exists() {
+        anyhow::bail!(
+            "Image model weights not found at {}. Re-install the model in Settings → Models.",
+            weights_path.display()
+        );
+    }
+    let len = std::fs::metadata(&weights_path)?.len();
+    if len < 100_000_000 {
+        anyhow::bail!(
+            "Image model file {} looks incomplete ({} bytes). Re-download it in Settings → Models.",
+            filename,
+            len
+        );
+    }
+    Ok(())
+}
+
+pub fn tail_localai_log(storage_dir: &Path, max_lines: usize) -> String {
+    let log_path = storage_dir.join("localai.log");
+    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= max_lines {
+        content
+    } else {
+        lines[lines.len() - max_lines..].join("\n")
+    }
+}
+
+/// Fix legacy YAML configs (e.g. `backend: stablediffusion` for GGUF image models).
+pub fn repair_model_yaml(storage_dir: &Path, model_name: &str) -> Result<bool> {
+    let catalog = get_catalog();
+    let Some(model_info) = catalog.iter().find(|m| m.name == model_name) else {
+        return Ok(false);
+    };
+
+    let models_dir = storage_dir.join("localai_models");
+    let config_path = models_dir.join(format!("{}.yaml", model_name));
+
+    let needs_repair = if !config_path.exists() {
+        true
+    } else if model_info.category == "images" {
+        let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+        !image_yaml_is_valid(&content, &model_info.filename)
+            || (content.contains("backend: stablediffusion")
+                && !content.contains("backend: stablediffusion-ggml"))
+            || content.contains("parameters:\n  step:")
+            || content.contains("parameters:\r\n  step:")
+    } else {
+        false
+    };
+
+    if needs_repair {
+        write_model_yaml(
+            storage_dir,
+            model_name,
+            &model_info.category,
+            &model_info.filename,
+        )?;
+        // #region agent log
+        crate::debug_log::session_log(
+            "localai.rs:repair_model_yaml",
+            "repaired model yaml config",
+            serde_json::json!({
+                "model": model_name,
+                "category": model_info.category,
+                "config_path": config_path.to_string_lossy(),
+            }),
+            "H1",
+            "post-fix",
+        );
+        // #endregion
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 pub async fn download_model_file<F>(
@@ -928,4 +1054,26 @@ pub async fn delete_model(storage_dir: &Path, model_name: &str) -> Result<()> {
 
     Ok(())
 }
+
+pub async fn cleanup_incompatible_wsl_libraries() -> Result<()> {
+    #[cfg(windows)]
+    {
+        if let Some(distro) = find_best_wsl_distro() {
+            crate::dbg_log!("[localai] cleaning up incompatible libraries in WSL distro: {}", distro);
+            let mut cp_cmd = tokio::process::Command::new("wsl");
+            cp_cmd.args(&[
+                "-d",
+                &distro,
+                "sh",
+                "-c",
+                "rm -f /tmp/localai/backend_data/backend-assets/lib/ld.so /tmp/localai/backend_data/backend-assets/lib/libc.so.6 /tmp/localai/backend_data/backend-assets/lib/libdl.so.2 /tmp/localai/backend_data/backend-assets/lib/libm.so.6 /tmp/localai/backend_data/backend-assets/lib/libpthread.so.0 /tmp/localai/backend_data/backend-assets/lib/librt.so.1 /tmp/localai/backend_data/backend-assets/lib/libstdc++.so.6 /tmp/localai/backend_data/backend-assets/lib/libgcc_s.so.1"
+            ]);
+            use std::os::windows::process::CommandExt;
+            cp_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            let _ = cp_cmd.status().await;
+        }
+    }
+    Ok(())
+}
+
 

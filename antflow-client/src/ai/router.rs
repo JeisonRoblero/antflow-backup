@@ -102,11 +102,14 @@ fn parse_skill_md(content: &str) -> Option<(String, String, String)> {
 }
 
 fn init_router_cache() -> anyhow::Result<RouterCache> {
+    let init_start = std::time::Instant::now();
+    crate::dbg_log!("[ROUTER] init_router_cache start");
     let embedder = get_embedder().map_err(|e| anyhow::anyhow!("Failed to initialize embedder: {}", e))?;
+    crate::dbg_log!("[ROUTER] embedder ready (+{}ms)", init_start.elapsed().as_millis());
     let mut internal_skills = Vec::new();
     let mut tools = Vec::new();
 
-    // Load internal skills
+    let skills_start = std::time::Instant::now();
     for file in InternalSkillsAsset::iter() {
         if let Some(file_data) = InternalSkillsAsset::get(&file) {
             if let Ok(content_str) = std::str::from_utf8(&file_data.data) {
@@ -125,7 +128,13 @@ fn init_router_cache() -> anyhow::Result<RouterCache> {
             }
         }
     }
+    crate::dbg_log!(
+        "[ROUTER] encoded {} internal skills (+{}ms)",
+        internal_skills.len(),
+        skills_start.elapsed().as_millis()
+    );
 
+    let tools_start = std::time::Instant::now();
     // Load tools
     for file in ToolsAsset::iter() {
         if let Some(file_data) = ToolsAsset::get(&file) {
@@ -144,8 +153,31 @@ fn init_router_cache() -> anyhow::Result<RouterCache> {
             }
         }
     }
+    crate::dbg_log!(
+        "[ROUTER] encoded {} tools (+{}ms)",
+        tools.len(),
+        tools_start.elapsed().as_millis()
+    );
 
+    crate::dbg_log!(
+        "[ROUTER] init_router_cache complete (+{}ms total)",
+        init_start.elapsed().as_millis()
+    );
     Ok(RouterCache { internal_skills, tools })
+}
+
+pub fn prewarm_router() {
+    let start = std::time::Instant::now();
+    crate::dbg_log!("[ROUTER] prewarm start");
+    let _ = get_embedder();
+    crate::dbg_log!("[ROUTER] prewarm embedder (+{}ms)", start.elapsed().as_millis());
+    let cache = get_router_cache();
+    crate::dbg_log!(
+        "[ROUTER] prewarm complete: {} skills, {} tools (+{}ms total)",
+        cache.internal_skills.len(),
+        cache.tools.len(),
+        start.elapsed().as_millis()
+    );
 }
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -166,49 +198,24 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     dot_product / (norm_a.sqrt() * norm_b.sqrt())
 }
 
-/// Returns true if the prompt is a conversational / meta / UI-navigation request
-/// that should NOT be enriched with task-specific tokens.
-fn is_meta_or_chat_query(lower: &str) -> bool {
-    let trimmed = lower.trim()
-        .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
-
-    // Exact short greetings / meta phrases
-    let exact = [
-        "hello", "hi", "hey", "hola", "yo", "sup", "bye", "goodbye",
-        "thanks", "thank you", "gracias", "buenos dias", "buenas noches", "buenas tardes",
-    ];
-    if exact.iter().any(|p| trimmed == *p) {
-        return true;
-    }
-
-    // Substring patterns that indicate UI / meta requests, NOT real tasks
-    let meta_phrases = [
-        "show me options", "show options", "give me options", "give me choices",
-        "what can you do", "what are you", "who are you",
-        "que puedes hacer", "qué puedes hacer", "que sabes hacer", "qué sabes hacer",
-        "muestrame opciones", "muéstrame opciones", "dame opciones",
-        "not a task", "no es una tarea", "just chat", "solo responde",
-        "don't search", "dont search", "no busques", "no searches",
-    ];
-    if meta_phrases.iter().any(|p| trimmed.contains(p)) {
-        return true;
-    }
-
-    false
-}
-
 fn enrich_routing_query(prompt: &str) -> String {
     let lower = prompt.to_lowercase();
 
     // Early exit: conversational / meta queries must NOT be enriched
-    if is_meta_or_chat_query(&lower) {
+    if crate::intent::is_meta_or_chat_query(&lower)
+        || crate::intent::is_capability_question(&lower)
+        || crate::intent::is_media_capability_list_query(&lower)
+    {
         return prompt.to_string();
     }
 
     let mut query = prompt.to_string();
     
-    if lower.contains("escribe") || lower.contains("teclea") || lower.contains("digita") || lower.contains("escribir")
-        || lower.contains("write") || lower.contains("type") || lower.contains("keyboard") || lower.contains("text") {
+    let wants_typing = lower.contains("escribe") || lower.contains("teclea") || lower.contains("digita") || lower.contains("escribir")
+        || lower.contains("write") || lower.contains("keyboard")
+        || (lower.contains("type") && !lower.contains("types of") && !lower.contains("type of"))
+        || (lower.contains("text") && !lower.contains("text-to-speech") && !lower.contains("text to speech"));
+    if wants_typing {
         query.push_str(" write type text keyboard type_text");
     }
     if lower.contains("pantalla") || lower.contains("captura") || lower.contains("pantallazo")
@@ -261,43 +268,35 @@ fn enrich_routing_query(prompt: &str) -> String {
     query
 }
 
-macro_rules! trace_log {
-    ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
-        {
-            let log_path = std::env::temp_dir().join("antflow_debug.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&log_path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
-}
-
 pub fn route_prompt(prompt: &str, threshold: f32) -> (Vec<(SkillInfo, f32)>, Vec<(ToolInfo, f32)>) {
+    let route_start = std::time::Instant::now();
+    crate::dbg_log!("[ROUTER] route_prompt start: '{}'", prompt);
     let cache = get_router_cache();
+    crate::dbg_log!(
+        "[ROUTER] cache ready: {} skills, {} tools (+{}ms)",
+        cache.internal_skills.len(),
+        cache.tools.len(),
+        route_start.elapsed().as_millis()
+    );
     let embedder = match get_embedder() {
         Ok(e) => e,
         Err(e) => {
             let err_msg = format!("Failed to instantiate LocalEmbedder: {:?}", e);
             eprintln!("[ROUTER ERROR] {}", err_msg);
-            trace_log!("[ROUTER ERROR] {}", err_msg);
+            crate::trace_log!("[ROUTER ERROR] {}", err_msg);
             return (Vec::new(), Vec::new());
         }
     };
 
     let enriched = enrich_routing_query(prompt);
-    trace_log!("[ROUTER] Enriched query: '{}'", enriched);
+    crate::trace_log!("[ROUTER] Enriched query: '{}'", enriched);
 
     let prompt_emb = match embedder.encode(&enriched) {
         Ok(emb) => emb,
         Err(e) => {
             let err_msg = format!("Failed to encode prompt: {:?}", e);
             eprintln!("[ROUTER ERROR] {}", err_msg);
-            trace_log!("[ROUTER ERROR] {}", err_msg);
+            crate::trace_log!("[ROUTER ERROR] {}", err_msg);
             return (Vec::new(), Vec::new());
         }
     };
@@ -329,8 +328,9 @@ pub fn route_prompt(prompt: &str, threshold: f32) -> (Vec<(SkillInfo, f32)>, Vec
     matched_tools.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Log only final matched results (not every individual cosine similarity)
-    trace_log!("[ROUTER] Matched internal skills: {:?}", matched_skills.iter().map(|(s, score)| format!("{} ({:.4})", s.id, score)).collect::<Vec<_>>());
-    trace_log!("[ROUTER] Matched tools: {:?}", matched_tools.iter().map(|(t, score)| format!("{} ({:.4})", t.id, score)).collect::<Vec<_>>());
+    crate::trace_log!("[ROUTER] Matched internal skills: {:?}", matched_skills.iter().map(|(s, score)| format!("{} ({:.4})", s.id, score)).collect::<Vec<_>>());
+    crate::trace_log!("[ROUTER] Matched tools: {:?}", matched_tools.iter().map(|(t, score)| format!("{} ({:.4})", t.id, score)).collect::<Vec<_>>());
+    crate::dbg_log!("[ROUTER] route_prompt done (+{}ms total)", route_start.elapsed().as_millis());
 
     (matched_skills, matched_tools)
 }

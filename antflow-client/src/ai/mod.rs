@@ -67,6 +67,35 @@ impl ChatMessage {
             ]),
         }
     }
+
+    // Convert ChatMessage to a JSON representation suitable for standard APIs,
+    // filtering out non-standard content parts (like custom "file" types).
+    pub fn to_clean_json(&self) -> serde_json::Value {
+        if let serde_json::Value::Array(parts) = &self.content {
+            let mut cleaned_parts = Vec::new();
+            for part in parts {
+                let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if part_type == "text" || part_type == "image_url" {
+                    cleaned_parts.push(part.clone());
+                } else if part_type == "system_note" {
+                    let text = part.get("text").cloned().unwrap_or(serde_json::Value::String("".to_string()));
+                    cleaned_parts.push(serde_json::json!({
+                        "type": "text",
+                        "text": text
+                    }));
+                }
+            }
+            serde_json::json!({
+                "role": self.role,
+                "content": cleaned_parts
+            })
+        } else {
+            serde_json::json!({
+                "role": self.role,
+                "content": self.content
+            })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

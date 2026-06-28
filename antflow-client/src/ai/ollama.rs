@@ -109,15 +109,26 @@ impl AiProvider for OllamaProvider {
         }
 
         let url = format!("{}/api/chat", self.base_url);
+        crate::dbg_log!("[ai:ollama] Sending non-stream chat request to model '{}' (url: {})", self.model, url);
+        let start_time = std::time::Instant::now();
 
-        let resp = self.client
+        let resp_res = self.client
             .post(&url)
             .json(&body)
             .send()
-            .await
-            .context("Failed to reach Ollama. Is it running?")?;
+            .await;
+
+        let duration = start_time.elapsed().as_millis();
+        let resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:ollama] Request failed after {}ms: {}", duration, e);
+                return Err(anyhow::anyhow!(e).context("Failed to reach Ollama. Is it running?"));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:ollama] Received response headers in {}ms (status: {})", duration, status);
         let text = resp.text().await?;
 
         if !status.is_success() {
@@ -216,15 +227,27 @@ impl AiProvider for OllamaProvider {
         }
 
         let url = format!("{}/api/chat", self.base_url);
+        crate::dbg_log!("[ai:ollama] Sending stream chat request to model '{}' (url: {})", self.model, url);
+        let start_time = std::time::Instant::now();
 
-        let mut resp = self.client
+        let resp_res = self.client
             .post(&url)
             .json(&body)
             .send()
-            .await
-            .context("Failed to reach Ollama. Is it running?")?;
+            .await;
+
+        let duration = start_time.elapsed().as_millis();
+        let mut resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:ollama] Stream request failed after {}ms: {}", duration, e);
+                return Err(anyhow::anyhow!(e).context("Failed to reach Ollama. Is it running?"));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:ollama] Received stream response headers in {}ms (status: {})", duration, status);
+
         if !status.is_success() {
             let text = resp.text().await?;
             anyhow::bail!("Ollama returned {}: {}", status, text);
@@ -264,6 +287,9 @@ impl AiProvider for OllamaProvider {
                 }
             }
         }
+
+        let total_duration = start_time.elapsed().as_millis();
+        crate::dbg_log!("[ai:ollama] Stream completed in {}ms", total_duration);
 
         let is_tool_call = full_content.trim_start().starts_with('{');
         Ok(AiResponse { content: full_content, is_tool_call })

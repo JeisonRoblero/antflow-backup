@@ -27,7 +27,7 @@ class ModelDownloadService : Service() {
         const val ACTION_RESUME = "com.antflow.app.ACTION_RESUME"
         const val ACTION_CANCEL = "com.antflow.app.ACTION_CANCEL"
 
-        const val TOTAL_SIZE_BYTES = 665000000L // Approx 635 MB
+        const val TOTAL_SIZE_BYTES = 695242752L // 695.2 MB
         
         @Volatile var isPaused = false
         @Volatile var isCancelled = false
@@ -170,6 +170,7 @@ class ModelDownloadService : Service() {
         val modelFiles = listOf(
             "ndarray-cache.json",
             "mlc-chat-config.json",
+            "tensor-cache.json",
             "tokenizer.json",
             "tokenizer_config.json"
         ) + (0..21).map { "params_shard_$it.bin" }

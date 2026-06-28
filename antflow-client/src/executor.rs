@@ -16,39 +16,457 @@ use std::sync::Arc;
 
 pub type StopFlag = Arc<std::sync::atomic::AtomicBool>;
 
-macro_rules! dbg_log {
-    ($($arg:tt)*) => {
-        {
-            let log_path = std::env::temp_dir().join("antflow_debug.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&log_path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, $($arg)*);
-            }
-        }
-    };
+fn build_chat_capabilities_hint(cfg: &AppConfig) -> String {
+    let mut caps = Vec::new();
+    caps.push("desktop automation (open apps, type, click, run scripts)".to_string());
+    caps.push("web search".to_string());
+    if !cfg.localai_models.images.is_empty() {
+        caps.push(format!(
+            "image generation via LocalAI model `{}` (use when user wants a picture drawn)",
+            cfg.localai_models.images
+        ));
+    }
+    if !cfg.localai_models.speaking.is_empty() {
+        caps.push(format!(
+            "text-to-speech via LocalAI model `{}` (use when user wants spoken audio)",
+            cfg.localai_models.speaking
+        ));
+    }
+    if !cfg.localai_models.video.is_empty() {
+        caps.push(format!("video generation via LocalAI model `{}`", cfg.localai_models.video));
+    }
+    if !cfg.localai_models.music.is_empty() {
+        caps.push(format!("music/sound generation via LocalAI model `{}`", cfg.localai_models.music));
+    }
+    format!(
+        "Your installed capabilities: {}. Answer capability questions conversationally in chat. \
+         When the user asks what you can do, use ask_clarification with grouped options.",
+        caps.join("; ")
+    )
 }
 
-macro_rules! trace_log {
-    ($($arg:tt)*) => {
-        #[cfg(debug_assertions)]
-        {
-            let log_path = std::env::temp_dir().join("antflow_debug.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
-                .open(&log_path)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, $($arg)*);
-            }
+fn append_configured_media_tools(
+    tools_list: &mut String,
+    cfg: &AppConfig,
+) {
+    let mut extras = Vec::new();
+    if !cfg.localai_models.images.is_empty() {
+        extras.push(format!(
+            "generate_image:{{\"prompt\":\"string\"}} — Generates an image using LocalAI model `{}` and displays it in chat.",
+            cfg.localai_models.images
+        ));
+    }
+    if !cfg.localai_models.speaking.is_empty() {
+        extras.push(format!(
+            "generate_speech:{{\"text\":\"string\"}} — Synthesizes spoken audio from text using LocalAI TTS model `{}`. Prefer this over Windows COM/SAPI scripts.",
+            cfg.localai_models.speaking
+        ));
+    }
+    if !cfg.localai_models.video.is_empty() {
+        extras.push(format!(
+            "generate_video:{{\"prompt\":\"string\"}} — Generates a video using LocalAI model `{}`.",
+            cfg.localai_models.video
+        ));
+    }
+    if !cfg.localai_models.music.is_empty() {
+        extras.push(format!(
+            "generate_music:{{\"prompt\":\"string\"}} — Generates audio/music using LocalAI model `{}`.",
+            cfg.localai_models.music
+        ));
+    }
+    if !extras.is_empty() {
+        if !tools_list.is_empty() {
+            tools_list.push('\n');
         }
-    };
+        tools_list.push_str(&extras.join("\n"));
+    }
 }
 
 // Max chars kept from a single tool output before truncation.
 const TOOL_OUTPUT_MAX_CHARS: usize = 2000;
+
+fn is_media_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "generate_image" | "generate_video" | "generate_music" | "generate_speech"
+    )
+}
+
+fn media_output_failed(output: &str) -> bool {
+    let trimmed = output.trim();
+    trimmed.starts_with("Error generating") || trimmed.to_lowercase().contains("failed with http")
+}
+
+fn media_output_succeeded(output: &str) -> bool {
+    let trimmed = output.trim();
+    !media_output_failed(trimmed)
+        && (trimmed.contains("![Image]")
+            || trimmed.contains("<audio")
+            || trimmed.contains("<video")
+            || trimmed.starts_with("<video"))
+}
+
+fn is_unrecoverable_media_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("grpc service not ready")
+        || lower.contains("localai is not running")
+        || lower.contains("no active localai model")
+        || lower.contains("failed to load model")
+        || lower.contains("no localai model configured")
+}
+
+fn effective_step_delay(delay_ms: u64, tool_name: &str, is_launch: bool) -> u64 {
+    if is_launch {
+        delay_ms.max(1500).min(8000)
+    } else if is_media_tool(tool_name) {
+        0
+    } else {
+        delay_ms.min(500)
+    }
+}
+
+fn strip_ansi_codes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.next() == Some('[') {
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn humanize_api_error_detail(err: &str) -> String {
+    let trimmed = strip_ansi_codes(err).trim().to_string();
+    let lower = trimmed.to_lowercase();
+
+    // Log the raw error detail internally so developers can diagnose it
+    crate::dbg_log!("[humanize_api_error] raw error: {}", trimmed);
+
+    // ── Catch broad internal/log-like patterns and return clean messages ──
+
+    // LocalAI CLI / backend install errors
+    if lower.contains("localai cli")
+        || lower.contains("failed resolving model 'backends'")
+        || lower.contains("failed resolving model 'install'")
+        || lower.contains("error installing models")
+    {
+        return "The image generation backend could not be prepared. Please restart LocalAI in Settings → Models.".to_string();
+    }
+
+    // Port conflict
+    if lower.contains("address already in use") || lower.contains("bind:") {
+        return "LocalAI could not start because its port is already in use. Close any other LocalAI instances, or restart from Settings → Models.".to_string();
+    }
+
+    // gRPC / model loader errors
+    if lower.contains("grpc service not ready") || lower.contains("failed to load model") {
+        return "The image model is still loading. Wait a moment and try again, or restart LocalAI in Settings → Models.".to_string();
+    }
+    if lower.contains("backend not found") {
+        return "The image generation backend is not installed. Open Settings → Models, re-install the image model, and wait for LocalAI to finish setting up.".to_string();
+    }
+
+    // LocalAI not running
+    if lower.contains("not running") || lower.contains("connection refused") {
+        return "LocalAI is not running. Start the engine in Settings → Models.".to_string();
+    }
+
+    // Model weights issues
+    if lower.contains("weights not found") || lower.contains("re-install the model") || lower.contains("re-download") {
+        return "The image model file is missing or incomplete. Re-download it in Settings → Models.".to_string();
+    }
+
+    // No model configured
+    if lower.contains("no active localai model") || lower.contains("no active model") {
+        return "No image model is set up. Configure one in Settings → Models.".to_string();
+    }
+
+    // Raw ANSI escape codes or LocalAI startup logs leaked — never show these
+    if trimmed.contains("\x1b[") || trimmed.contains("[0m")
+        || lower.contains("dbg ") || lower.contains("inf ") || lower.contains("wrn ") || lower.contains("err ")
+        || lower.contains("ftl ") || lower.contains("starting localai using")
+        || lower.contains("preloading models") || lower.contains("core/startup")
+        || lower.contains("cpu capabilities") || lower.contains("gpu count")
+        || lower.contains("extracting backend assets") || lower.contains("guessdefaultsfromfile")
+        || lower.contains("model name:") || lower.contains("model file loaded")
+        || trimmed.len() > 500
+    {
+        return "The image engine encountered an internal error during startup. Check Settings → Models to ensure the engine is running and the model is installed.".to_string();
+    }
+
+    // Try to extract a clean message from JSON error responses
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                    if let Some(msg) = parsed["error"]["message"].as_str() {
+                        return humanize_grpc_loader_message(msg);
+                    }
+                    if let Some(msg) = parsed["message"].as_str() {
+                        return humanize_grpc_loader_message(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    // HTTP status errors with JSON body
+    if lower.contains("http status") {
+        if let Some(json_start) = trimmed.find('{') {
+            let prefix = trimmed[..json_start].trim().trim_end_matches(':').trim();
+            if let Some(end) = trimmed.rfind('}') {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&trimmed[json_start..=end]) {
+                    if let Some(msg) = parsed["error"]["message"].as_str() {
+                        let detail = humanize_grpc_loader_message(msg);
+                        if prefix.is_empty() {
+                            return detail;
+                        }
+                        return format!("{}: {}", prefix, detail);
+                    }
+                }
+            }
+        }
+        // Even if JSON parsing failed, don't show raw HTTP error
+        return "Image generation failed due to a server error. Try again or restart LocalAI in Settings → Models.".to_string();
+    }
+
+    // Final fallback: if the error is very long or looks technical, don't show raw text
+    if trimmed.len() > 200 || lower.contains("panic") || lower.contains("stack trace") || lower.contains("goroutine") {
+        return "Image generation encountered an unexpected error. Try again or restart LocalAI in Settings → Models.".to_string();
+    }
+
+    humanize_grpc_loader_message(&trimmed)
+}
+
+fn humanize_grpc_loader_message(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("grpc service not ready") || lower.contains("failed to load model") {
+        return "The image model is still loading. Wait a moment and try again, or restart LocalAI in Settings → Models."
+            .to_string();
+    }
+    if lower.contains("backend not found") {
+        return "The image generation backend is not installed. Open Settings → Models, \
+                re-install the image model, and wait for LocalAI to finish installing backends."
+            .to_string();
+    }
+    if lower.contains("not running") || lower.contains("connection refused") {
+        return "LocalAI is not running. Start the LocalAI engine in Settings → Models."
+            .to_string();
+    }
+    // Don't return raw technical messages — provide a generic clean fallback
+    if msg.len() > 150 || msg.contains('\n') {
+        return "Image generation failed. Please try again or restart LocalAI in Settings → Models.".to_string();
+    }
+    msg.to_string()
+}
+
+fn media_failure_user_message(err: &str) -> String {
+    let detail = humanize_api_error_detail(err);
+    // The detail is already user-friendly after humanization.
+    // Don't append raw error dumps — just show the clean message with a tip.
+    format!(
+        "**Image generation failed.**\n\n\
+         {}\n\n\
+         If this keeps happening, open **Settings → Models**, confirm the model is installed, \
+         start the LocalAI engine, and wait until it shows as ready.",
+        detail
+    )
+}
+
+fn send_media_gen_progress(
+    msg_tx: &tokio::sync::mpsc::Sender<String>,
+    media_type: &str,
+    prompt: &str,
+    step: u32,
+    total_steps: u32,
+) {
+    let percent = if total_steps > 0 {
+        ((step as u64 * 100) / total_steps as u64).min(100) as u8
+    } else {
+        0
+    };
+    let _ = msg_tx.try_send(format!(
+        "JSON_MEDIA_GEN:{}",
+        serde_json::json!({
+            "type": media_type,
+            "prompt": prompt,
+            "status": "progress",
+            "percent": percent,
+            "step": step,
+            "total_steps": total_steps
+        })
+    ));
+}
+
+fn send_media_gen_indeterminate(
+    msg_tx: &tokio::sync::mpsc::Sender<String>,
+    media_type: &str,
+    prompt: &str,
+    status: &str,
+    message: &str,
+) {
+    let _ = msg_tx.try_send(format!(
+        "JSON_MEDIA_GEN:{}",
+        serde_json::json!({
+            "type": media_type,
+            "prompt": prompt,
+            "status": status,
+            "indeterminate": true,
+            "message": message
+        })
+    ));
+}
+
+fn send_media_gen_complete(
+    msg_tx: &tokio::sync::mpsc::Sender<String>,
+    media_type: &str,
+    prompt: &str,
+) {
+    let _ = msg_tx.try_send(format!(
+        "JSON_MEDIA_GEN:{}",
+        serde_json::json!({
+            "type": media_type,
+            "prompt": prompt,
+            "status": "complete",
+            "percent": 100
+        })
+    ));
+}
+
+fn send_media_gen_failed(
+    msg_tx: &tokio::sync::mpsc::Sender<String>,
+    media_type: &str,
+    prompt: &str,
+) {
+    let _ = msg_tx.try_send(format!(
+        "JSON_MEDIA_GEN:{}",
+        serde_json::json!({
+            "type": media_type,
+            "prompt": prompt,
+            "status": "failed",
+            "percent": 0
+        })
+    ));
+}
+
+async fn rewrite_media_prompt_with_llm(
+    raw_prompt: &str,
+    cfg: &AppConfig,
+) -> String {
+    let provider = crate::ai::provider_for_config(&cfg.ai);
+    let system_instruction = "You are a translator. Translate the user's prompt to English. Keep the output extremely simple and direct, matching exactly what the user requested. Do not add any new elements, details, explanations, objects, or background scenery. Output ONLY the final English translation, with absolutely no quotes, introduction, explanations, or metadata.";
+    
+    let messages = vec![
+        crate::ai::ChatMessage::text("system", system_instruction),
+        crate::ai::ChatMessage::text("user", raw_prompt),
+    ];
+
+    match provider.chat(messages, Some(100)).await {
+        Ok(res) => {
+            let cleaned = res.content.trim().trim_matches('"').trim().to_string();
+            if !cleaned.is_empty() {
+                crate::dbg_log!("[media_rewrite] Expanded prompt: '{}' -> '{}'", raw_prompt, cleaned);
+                return cleaned;
+            }
+        }
+        Err(e) => {
+            crate::dbg_log!("[media_rewrite] Failed to rewrite prompt: {}", e);
+        }
+    }
+    raw_prompt.to_string()
+}
+
+async fn try_image_generation_fast_path(
+    prompt: &str,
+    messages: &[ChatMessage],
+    cfg: &AppConfig,
+    storage_dir: &Path,
+    msg_tx: &tokio::sync::mpsc::Sender<String>,
+    performed_searches: &[(String, Vec<crate::search::SearchResult>)],
+    all_search_images: &[crate::search::SearchImage],
+) -> Option<Result<String>> {
+    let raw_image_prompt = crate::intent::compose_media_prompt_from_history(prompt, messages)?;
+    if !crate::intent::has_pending_image_generation(messages)
+        && !crate::intent::is_explicit_image_request(&raw_image_prompt)
+    {
+        return None;
+    }
+
+    if cfg.localai_models.images.is_empty() {
+        return Some(Ok(
+            "Image generation is not configured. Please set an image model in Settings → Models."
+                .to_string(),
+        ));
+    }
+
+    let image_prompt = rewrite_media_prompt_with_llm(&raw_image_prompt, cfg).await;
+
+    crate::dbg_log!(
+        "[run_task] image fast-path: generate_image prompt='{}'",
+        image_prompt
+    );
+    // #region agent log
+    crate::debug_log::session_log(
+        "executor.rs:media_fast_path",
+        "direct generate_image fast path",
+        serde_json::json!({ "prompt": prompt, "image_prompt": image_prompt }),
+        "H2",
+        "pre-fix",
+    );
+    // #endregion
+
+    let _ = msg_tx
+        .send(format!(
+            "JSON_MEDIA_GEN:{}",
+            serde_json::json!({
+                "type": "image",
+                "prompt": image_prompt,
+                "status": "generating"
+            })
+        ))
+        .await;
+    let _ = msg_tx.send("Generating image...".to_string()).await;
+
+    let gen_result =
+        generate_image_async(&image_prompt, storage_dir, Some(msg_tx), &image_prompt).await;
+
+    match &gen_result {
+        Ok(output) if media_output_succeeded(output) => {
+            send_media_gen_complete(msg_tx, "image", &image_prompt);
+        }
+        _ => {
+            send_media_gen_failed(msg_tx, "image", &image_prompt);
+        }
+    }
+
+    match gen_result {
+        Ok(output) if media_output_succeeded(&output) => Some(Ok(prepend_search_context(
+            &output,
+            performed_searches,
+            all_search_images,
+        ))),
+        Ok(output) => Some(Ok(prepend_search_context(
+            &media_failure_user_message(&output),
+            performed_searches,
+            all_search_images,
+        ))),
+        Err(e) => Some(Ok(prepend_search_context(
+            &media_failure_user_message(&e.to_string()),
+            performed_searches,
+            all_search_images,
+        ))),
+    }
+}
 
 // Completed CGAE cycles kept as raw messages; older cycles are summarised.
 const RAW_CYCLES_KEPT: usize = 1;
@@ -686,7 +1104,7 @@ async fn compress_context(
         Err(_) => format!("[Context compressed — original task: {}]", original_prompt),
     };
 
-    dbg_log!("[compress] {} messages → summary ({} chars)", to_compress.len(), summary.len());
+    crate::dbg_log!("[compress] {} messages → summary ({} chars)", to_compress.len(), summary.len());
 
     let mut result = Vec::new();
     if let Some(sys) = system {
@@ -898,7 +1316,7 @@ async fn chat_with_retry(
                     label, attempt, MAX_RETRIES,
                     wait_ms as f64 / 1000.0
                 );
-                dbg_log!("[chat_with_retry] {} err='{}' wait={}ms", label, err_str, wait_ms);
+                crate::dbg_log!("[chat_with_retry] {} err='{}' wait={}ms", label, err_str, wait_ms);
                 let _ = msg_tx.try_send(msg);
 
                 tokio::time::sleep(Duration::from_millis(wait_ms)).await;
@@ -959,16 +1377,8 @@ pub async fn run_task(
     let mut is_obvious_chat = false;
     {
         let prompt_lower = prompt.to_lowercase();
-        
-        let anti_task_phrases: &[&str] = &[
-            "no action", "just chat", "just answer", "just tell me", "just respond",
-            "solo responde", "solo dime", "solo contesta", "ninguna accion", "sin accion",
-            "no ejecutes", "no hagas nada", "solo por aqui", "en el chat", "por el chat",
-            "don't do anything", "no need to do", "no action required", "no action needed",
-            "just here", "chat only", "conversational", "no task",
-            "damelo aqui", "responde aqui", "dime aqui",
-        ];
-        let is_anti_task = anti_task_phrases.iter().any(|p| prompt_lower.contains(p));
+
+        let is_anti_task = crate::intent::is_anti_task_correction(&prompt_lower);
 
         let task_keywords: &[&str] = &[
             "screenshot", "captura de pantalla", "pantallazo", "take a screenshot", "take screenshot",
@@ -997,53 +1407,22 @@ pub async fn run_task(
             })
         };
 
-        let exact_chat_patterns: &[&str] = &[
-            // English
-            "hello", "hi there", "good morning", "good evening", "good night",
-            "how are you", "what's up", "whats up", "thank you", "thanks", "thx",
-            "hi", "hey", "yo", "sup", "wassup", "bye", "goodbye",
-            // Spanish
-            "hola", "buenos dias", "buenas noches", "buenas tardes", "adios", "gracias",
-            // French
-            "bonjour", "salut", "bonsoir", "merci", "au revoir",
-            // German
-            "hallo", "guten morgen", "guten tag", "guten abend", "danke", "tschüss",
-            // Italian
-            "ciao", "buongiorno", "grazie", "arrivederci",
-            // Portuguese
-            "olá", "oi", "bom dia", "boa tarde", "boa noite", "obrigado", "obrigada", "tchau",
-            // Chinese
-            "你好", "早上好", "下午好", "晚上好", "谢谢", "再见",
-        ];
-        let starts_with_chat_patterns: &[&str] = &[
-            "what is your name", "who are you", "what can you do",
-        ];
-
-        is_obvious_chat = if cfg.mode == "chat" {
-            true
-        } else if cfg.mode == "task" {
-            false
-        } else {
-            if is_obvious_task {
-                false
-            } else {
-                let trimmed = prompt_lower.trim()
-                    .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¡' || c == '¿' || c.is_whitespace());
-                exact_chat_patterns.iter().any(|p| trimmed == *p) ||
-                starts_with_chat_patterns.iter().any(|p| trimmed.starts_with(p)) ||
-                trimmed.contains("show me options") ||
-                trimmed.contains("show me some options") ||
-                trimmed.contains("give me choices") ||
-                trimmed.contains("give me some choices") ||
-                trimmed.contains("what can you do")
-            }
-        };
+        is_obvious_chat = crate::intent::should_force_chat_mode(prompt, is_obvious_task, &cfg.mode);
 
         if is_obvious_chat {
             is_chat_mode = true;
-            dbg_log!("[gate] Pre-emptive keyword match → CHAT: '{}'", prompt);
+            crate::dbg_log!("[gate] Pre-emptive keyword match → CHAT: '{}'", prompt);
+            // #region agent log
+            crate::debug_log::session_log(
+                "executor.rs:gate",
+                "forced chat via keyword/meta detection",
+                serde_json::json!({ "prompt": prompt, "is_obvious_task": is_obvious_task }),
+                "H1",
+                "pre-fix",
+            );
+            // #endregion
         } else if !is_obvious_task {
-            dbg_log!("[gate] Pre-emptive Running AI gate classifier for: '{}'", prompt);
+            crate::dbg_log!("[gate] Pre-emptive Running AI gate classifier for: '{}'", prompt);
             let mut history_str = String::new();
             if messages.len() > 1 {
                 let start_idx = if messages.len() > 4 { messages.len() - 4 } else { 0 };
@@ -1084,7 +1463,7 @@ pub async fn run_task(
                 )
             };
 
-            let ai_says_task = match provider.chat(
+            let mut ai_says_task = match provider.chat(
                 vec![
                     ChatMessage::text("system", "You are a classifier. You must reply with either TASK or CHAT based on the user's message."),
                     ChatMessage::text("user", &gate_prompt)
@@ -1093,26 +1472,106 @@ pub async fn run_task(
             ).await {
                 Ok(resp) => {
                     let content = resp.content.trim();
-                    if content.is_empty() {
-                        true
-                    } else {
-                        content.to_uppercase().contains("TASK")
-                    }
+                    crate::intent::gate_classifier_says_task(content)
                 }
-                Err(_) => true,
+                Err(_) => false,
             };
+
+            if ai_says_task
+                && (crate::intent::is_meta_or_chat_query(&prompt_lower)
+                    || crate::intent::is_capability_question(&prompt_lower)
+                    || crate::intent::is_media_capability_list_query(&prompt_lower)
+                    || is_anti_task)
+            {
+                crate::dbg_log!(
+                    "[gate] Overriding AI TASK → CHAT due to meta/capability/anti-task cues: '{}'",
+                    prompt
+                );
+                ai_says_task = false;
+            }
+
+            // #region agent log
+            crate::debug_log::session_log(
+                "executor.rs:gate",
+                "ai gate classification result",
+                serde_json::json!({
+                    "prompt": prompt,
+                    "ai_says_task": ai_says_task,
+                    "is_meta": crate::intent::is_meta_or_chat_query(&prompt_lower),
+                    "is_capability": crate::intent::is_capability_question(&prompt_lower),
+                    "is_anti_task": is_anti_task,
+                }),
+                "H1",
+                "pre-fix",
+            );
+            // #endregion
 
             if !ai_says_task {
                 is_chat_mode = true;
-                dbg_log!("[gate] Pre-emptive AI gate → CHAT: '{}'", prompt);
+                crate::dbg_log!("[gate] Pre-emptive AI gate → CHAT: '{}'", prompt);
             } else {
-                dbg_log!("[gate] Pre-emptive AI gate → TASK: '{}'", prompt);
+                crate::dbg_log!("[gate] Pre-emptive AI gate → TASK: '{}'", prompt);
             }
         }
     }
 
+    // Affirmation after image clarification → execute generation, not more chat or desktop automation.
+    if is_chat_mode
+        && crate::intent::is_task_affirmation(prompt)
+        && crate::intent::has_pending_image_generation(&messages)
+    {
+        is_chat_mode = false;
+        crate::dbg_log!(
+            "[gate] Override CHAT → TASK: affirmation with pending image generation: '{}'",
+            prompt
+        );
+    }
+
+    // Explicit image requests → generate directly; skip LLM clarification when the prompt is sufficient.
+    if is_chat_mode
+        && !crate::intent::is_task_affirmation(prompt)
+        && crate::intent::is_explicit_image_request(prompt)
+    {
+        crate::dbg_log!(
+            "[gate] Explicit image request — attempting direct generation: '{}'",
+            prompt
+        );
+        if let Some(result) = try_image_generation_fast_path(
+            prompt,
+            &messages,
+            cfg,
+            storage_dir,
+            &msg_tx,
+            &performed_searches,
+            &all_search_images,
+        )
+        .await
+        {
+            return result;
+        }
+    }
+
     if is_chat_mode {
-        dbg_log!("[chat_mode] Pre-emptive chat mode triggered");
+        crate::dbg_log!("[chat_mode] Pre-emptive chat mode triggered");
+
+        if crate::intent::is_task_affirmation(prompt)
+            && crate::intent::has_pending_image_generation(&messages)
+        {
+            if let Some(result) = try_image_generation_fast_path(
+                prompt,
+                &messages,
+                cfg,
+                storage_dir,
+                &msg_tx,
+                &performed_searches,
+                &all_search_images,
+            )
+            .await
+            {
+                return result;
+            }
+        }
+
         let mut chat_history = messages.clone();
         let mut search_context = String::new();
 
@@ -1121,7 +1580,7 @@ pub async fn run_task(
         let has_search_intent = detect_search_intent(prompt);
         if has_search_intent {
             let query = extract_search_query(prompt, provider).await;
-            dbg_log!("[chat_mode] Pre-flight search detected search intent. Query: '{}'", query);
+            crate::dbg_log!("[chat_mode] Pre-flight search detected search intent. Query: '{}'", query);
             let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
 
             let mut is_net_err = false;
@@ -1162,19 +1621,26 @@ pub async fn run_task(
             search_info.push_str("\n(Use the above search results to reply to the user. Always include relevant links and images using markdown.)");
             search_context = search_info;
         } else {
-            dbg_log!("[chat_mode] No search intent detected, skipping pre-flight search");
+            crate::dbg_log!("[chat_mode] No search intent detected, skipping pre-flight search");
         }
 
+        let capabilities_hint = build_chat_capabilities_hint(cfg);
         let chat_system = if search_context.is_empty() {
             format!(
                 "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
+                 {}\n\
                  You have access to web_search and ask_clarification.\n\
                  - Web Search: To look up current information, include a JSON block like:\n\
                    ```json\n{{\"web_search\": \"your search query\"}}\n```\n\
-                 - Ask Clarification (Options Menu): To present a list of choices/options for the user to select from (e.g., when they ask for options, or when you need clarification/more details), include a JSON block like:\n\
+                 - Ask Clarification (Options Menu): ONLY when the request is genuinely ambiguous or the user asked for options. \
+                   Do NOT ask clarification for complete requests (e.g. \"generate an image of a duck\" is complete — do not ask what the duck is doing). \
+                   Never use ask_clarification just to offer creative variants. Include a JSON block like:\n\
                    ```json\n{{\"ask_clarification\": {{\"question\": \"What would you like to do?\", \"options\": [\"Option 1\", \"Option 2\"]}}}}\n```\n\
                    in your response. The system will display these options as a premium, selectable popover menu directly above the user's input.\n\
-                 When showing options to the user, always use the ask_clarification tool. Never list options as plain text.\n\
+                 When showing options to the user, use ask_clarification — never list options as plain text.\n\
+                 For image generation: only ask ONE clarification when critical details are truly missing. \
+                 After the user selects an option, the system automatically generates the image — \
+                 do NOT ask them to say \"do it\" or confirm again.\n\
                  Current date/time: {}\n\
                  Be concise, accurate, and helpful. Never output raw JSON as your entire response.\n\
                  When presenting list items with descriptions (such as web search findings, lists of options, or recommendations), structure them cleanly. Keep bullet points compact. Put the description inline after a colon or nested on a new line using exactly 2 spaces of indentation, for example:\n\
@@ -1183,16 +1649,23 @@ pub async fn run_task(
                  - **Option A**\n\
                    Description indented here.\n\
                  Do NOT leave empty lines between a bullet point and its indented description.",
+                capabilities_hint,
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z")
             )
         } else {
             format!(
                 "You are antflow, a helpful AI assistant. Respond conversationally in the user's language using rich Markdown.\n\
+                 {}\n\
                  You have access to ask_clarification to present options menus if needed.\n\
-                 - Ask Clarification (Options Menu): To present a list of choices/options for the user to select from (e.g., when they ask for options, or when you need clarification/more details), include a JSON block like:\n\
+                 - Ask Clarification (Options Menu): ONLY when the request is genuinely ambiguous or the user asked for options. \
+                   Do NOT ask clarification for complete requests (e.g. \"generate an image of a duck\" is complete — do not ask what the duck is doing). \
+                   Never use ask_clarification just to offer creative variants. Include a JSON block like:\n\
                    ```json\n{{\"ask_clarification\": {{\"question\": \"What would you like to do?\", \"options\": [\"Option 1\", \"Option 2\"]}}}}\n```\n\
                    in your response. The system will display these options as a premium, selectable popover menu directly above the user's input.\n\
-                 When showing options to the user, always use the ask_clarification tool. Never list options as plain text.\n\
+                 When showing options to the user, use ask_clarification — never list options as plain text.\n\
+                 For image generation: only ask ONE clarification when critical details are truly missing. \
+                 After the user selects an option, the system automatically generates the image — \
+                 do NOT ask them to say \"do it\" or confirm again.\n\
                  Current date/time: {}\n\
                  Use the following search results to answer the user's query. You must include the relevant search links and markdown images from the context in your response:\n\
                  {}\n\n\
@@ -1203,6 +1676,7 @@ pub async fn run_task(
                  - **Option A**\n\
                    Description indented here.\n\
                  Do NOT leave empty lines between a bullet point and its indented description.",
+                capabilities_hint,
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"),
                 search_context
             )
@@ -1253,7 +1727,7 @@ pub async fn run_task(
             let clarification_pattern = "\"ask_clarification\"";
             if raw_reply.contains(clarification_pattern) {
                 if let Some((question, options)) = extract_chat_clarification(&raw_reply) {
-                    dbg_log!("[chat_mode] Model requested clarification: '{}', options: {:?}", question, options);
+                    crate::dbg_log!("[chat_mode] Model requested clarification: '{}', options: {:?}", question, options);
                     let _ = clarification_tx.send((question.clone(), options)).await;
                     
                     let answer = loop {
@@ -1266,10 +1740,40 @@ pub async fn run_task(
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     };
                     
-                    dbg_log!("[chat_mode] Received user answer to clarification: '{}'", answer);
+                    crate::dbg_log!("[chat_mode] Received user answer to clarification: '{}'", answer);
                     
                     chat_history.push(ChatMessage::text("assistant", &raw_reply));
                     chat_history.push(ChatMessage::text("user", &answer));
+
+                    // After the user picks a clarification option for an image request,
+                    // generate immediately — no second LLM turn and no "do it" confirmation.
+                    if crate::intent::has_pending_image_generation(&chat_history) {
+                        crate::dbg_log!(
+                            "[chat_mode] Post-clarification auto-generate for image request"
+                        );
+                        // #region agent log
+                        crate::debug_log::session_log(
+                            "executor.rs:chat_clarification",
+                            "post-clarification image auto-generate",
+                            serde_json::json!({ "answer": answer }),
+                            "H4",
+                            "pre-fix",
+                        );
+                        // #endregion
+                        if let Some(result) = try_image_generation_fast_path(
+                            &answer,
+                            &chat_history,
+                            cfg,
+                            storage_dir,
+                            &msg_tx,
+                            &performed_searches,
+                            &all_search_images,
+                        )
+                        .await
+                        {
+                            return result;
+                        }
+                    }
                     
                     let final_res = if let Some(tx) = token_tx.clone() {
                         provider.chat_stream(chat_history.clone(), Some(1000), tx).await
@@ -1287,7 +1791,7 @@ pub async fn run_task(
             let search_pattern = "\"web_search\"";
             if raw_reply.contains(search_pattern) && search_context.is_empty() {
                 if let Some(query) = extract_chat_search_query(&raw_reply) {
-                    dbg_log!("[chat_mode] Model requested web search: '{}'", query);
+                    crate::dbg_log!("[chat_mode] Model requested web search: '{}'", query);
                     let _ = msg_tx.send(format!("Searching web for: \"{}\"", query)).await;
 
                     let mut is_net_err = false;
@@ -1354,11 +1858,11 @@ pub async fn run_task(
         // This prevents wasting 4+ API calls on acknowledgment/translation/CGAE
         // for a request that was never a task.
         if is_obvious_chat {
-            dbg_log!("[chat_mode] Chat response failed but gate was obvious CHAT — returning fallback instead of TASK");
+            crate::dbg_log!("[chat_mode] Chat response failed but gate was obvious CHAT — returning fallback instead of TASK");
             return Ok("I'm here to help! Could you tell me more about what you'd like me to do? I can automate desktop tasks, search the web, run commands, draw images, and much more.".to_string());
         }
 
-        dbg_log!("[chat_mode] Pre-emptive chat response failed or matched TASK, falling back to TASK execution mode");
+        crate::dbg_log!("[chat_mode] Pre-emptive chat response failed or matched TASK, falling back to TASK execution mode");
     }
 
     let mut messages = messages;
@@ -1379,9 +1883,24 @@ pub async fn run_task(
     let mut ack = String::new();
 
     let _ = msg_tx.send("Analyzing request...".to_string()).await;
-    dbg_log!("[run_task] Received user query: '{}'", prompt);
+    let contextual_prompt = crate::intent::resolve_task_prompt_from_history(prompt, &messages);
+    crate::dbg_log!("[run_task] Received user query: '{}' (contextual: '{}')", prompt, contextual_prompt);
 
-    let mut english_prompt = prompt.to_string();
+    if let Some(result) = try_image_generation_fast_path(
+        prompt,
+        &messages,
+        cfg,
+        storage_dir,
+        &msg_tx,
+        &performed_searches,
+        &all_search_images,
+    )
+    .await
+    {
+        return result;
+    }
+
+    let mut english_prompt = contextual_prompt.clone();
 
     // Fast dynamic conversational acknowledgment, progress steps, and translation query combined!
     let ack_prompt = format!(
@@ -1391,14 +1910,14 @@ pub async fn run_task(
          Finally, translate the user's query into English.\n\
          Reply with ONLY a JSON object in this format:\n\
          {{\n  \"acknowledgment\": \"<concise acknowledgment>\",\n  \"steps\": [\"Step 1\", \"Step 2\", \"Step 3\"],\n  \"english_translation\": \"<English translation of user's query>\"\n}}",
-        prompt
+        contextual_prompt
     );
 
     if let Ok(resp) = provider.chat(vec![ChatMessage::text("user", &ack_prompt)], Some(350)).await {
-        dbg_log!("[run_task] Combined AI response content: {}", resp.content);
+        crate::dbg_log!("[run_task] Combined AI response content: {}", resp.content);
         if let Some(clean_json) = crate::json_utils::extract_best_json(&resp.content) {
             if let Ok(val) = serde_json::from_str::<Value>(&clean_json) {
-                dbg_log!("[run_task] Parsed combined response JSON: {}", clean_json);
+                crate::dbg_log!("[run_task] Parsed combined response JSON: {}", clean_json);
                 if let Some(a) = val["acknowledgment"].as_str() {
                     ack = a.to_string();
                 }
@@ -1414,7 +1933,7 @@ pub async fn run_task(
                     let clean = t.trim().trim_matches('"').trim().to_string();
                     if !clean.is_empty() {
                         english_prompt = clean.clone();
-                        dbg_log!("[run_task] English Translation of query: '{}'", english_prompt);
+                        crate::dbg_log!("[run_task] English Translation of query: '{}'", english_prompt);
                     }
                 }
             }
@@ -1422,7 +1941,7 @@ pub async fn run_task(
     }
 
     if ack.is_empty() {
-        ack = generate_acknowledgment(prompt);
+        ack = generate_acknowledgment(&contextual_prompt);
     }
 
     // Stream the AI's dynamic acknowledgment to the user!
@@ -1447,12 +1966,35 @@ pub async fn run_task(
 
     // --- SEMANTIC ROUTER ---
     let threshold = 0.35;
+    let route_start = std::time::Instant::now();
     let (mut matched_skills, mut matched_tools) = crate::ai::router::route_prompt(&english_prompt, threshold);
+    crate::dbg_log!("[run_task] route_prompt finished (+{}ms)", route_start.elapsed().as_millis());
+    let cache = crate::ai::router::get_router_cache();
     if matched_skills.len() > 1 {
         matched_skills.truncate(1);
     }
 
-    let cache = crate::ai::router::get_router_cache();
+    if !cfg.localai_models.images.is_empty()
+        && (crate::intent::is_media_generation_task(&english_prompt)
+            || crate::intent::has_pending_image_generation(&messages))
+    {
+        matched_skills.retain(|(s, _)| s.id == "creative_image_editing");
+        if !matched_skills.iter().any(|(s, _)| s.id == "creative_image_editing") {
+            if let Some(skill) = cache.internal_skills.iter().find(|s| s.id == "creative_image_editing") {
+                matched_skills.insert(0, (skill.clone(), 0.85));
+            }
+        }
+        crate::dbg_log!("[ROUTER] Media-only task: using creative_image_editing only");
+    } else if !cfg.localai_models.images.is_empty()
+        && crate::intent::is_media_generation_task(&english_prompt)
+        && !matched_skills.iter().any(|(s, _)| s.id == "creative_image_editing")
+    {
+        if let Some(skill) = cache.internal_skills.iter().find(|s| s.id == "creative_image_editing") {
+            matched_skills.insert(0, (skill.clone(), 0.85));
+            crate::dbg_log!("[ROUTER] Injected creative_image_editing for media generation task");
+        }
+    }
+
     let mut needed_tool_ids = std::collections::HashSet::new();
 
     for (skill, _) in &matched_skills {
@@ -1526,17 +2068,17 @@ pub async fn run_task(
     }
 
     for (skill, score) in &matched_skills {
-        dbg_log!("[ROUTER] Matched skill/tool '{}' with score {}", skill.id, score);
+        crate::dbg_log!("[ROUTER] Matched skill/tool '{}' with score {}", skill.id, score);
     }
     for (tool, score) in &matched_tools {
-        dbg_log!("[ROUTER] Matched skill/tool '{}' with score {}", tool.id, score);
+        crate::dbg_log!("[ROUTER] Matched skill/tool '{}' with score {}", tool.id, score);
     }
 
     if let Ok(device_info) = crate::device::collect() {
         let mut corrected_system_prompt = crate::prompt::build_system_prompt_with_vision(&device_info, vision_capable, Some(&english_prompt));
 
         // Format dynamic tool definitions
-        let tools_list_str = if matched_tools.is_empty() {
+        let mut tools_list_str = if matched_tools.is_empty() {
             "No tools are currently available for this task. Respond conversationally to the user.".to_string()
         } else {
             let mut parts = Vec::new();
@@ -1559,6 +2101,7 @@ pub async fn run_task(
             }
             parts.join("\n")
         };
+        append_configured_media_tools(&mut tools_list_str, cfg);
 
         // Replace the TOOLS section in system prompt
         if let Some(tools_start) = corrected_system_prompt.find("TOOLS\n") {
@@ -1593,7 +2136,7 @@ pub async fn run_task(
             let path_str = abs_path.to_string_lossy().replace("\\", "/");
             let skill_instructions = slice_skill_instructions(&skill_instructions_raw, &path_str);
 
-            dbg_log!("[run_task] Prepending skill instructions from skill '{}'", skill.id);
+            crate::dbg_log!("[run_task] Prepending skill instructions from skill '{}'", skill.id);
             if !skill_instructions_combined.is_empty() {
                 skill_instructions_combined.push_str("\n\n");
             }
@@ -1609,7 +2152,7 @@ pub async fn run_task(
                 if let Some(text) = msg.content.as_str() {
                     if text.starts_with("You are antflow") || text.contains("You are a precise, cross-platform spatial automation agent") {
                         msg.content = serde_json::Value::String(corrected_system_prompt.clone());
-                        dbg_log!("[run_task] Corrected system prompt vision_capable to {}", vision_capable);
+                        crate::dbg_log!("[run_task] Corrected system prompt vision_capable to {}", vision_capable);
                         found_system = true;
                         break;
                     }
@@ -1625,7 +2168,7 @@ pub async fn run_task(
     if token_limit > 0 {
         let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_initial, "limit": token_limit }))).await;
         if used_tokens_initial > (token_limit * 85 / 100) {
-            dbg_log!("[compress] triggering: used≈{} limit={}", used_tokens_initial, token_limit);
+            crate::dbg_log!("[compress] triggering: used≈{} limit={}", used_tokens_initial, token_limit);
             messages = compress_context(&messages, provider, prompt, &msg_tx).await;
             let used_tokens_after = estimate_tokens(&messages);
             let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_after, "limit": token_limit }))).await;
@@ -1655,19 +2198,12 @@ pub async fn run_task(
     let mut no_screen_change_count: usize = 0;
     let mut failed_attempts: Vec<String> = Vec::new();
     let mut executed_attempts: Vec<(String, Value)> = Vec::new();
+    let mut media_failures: usize = 0;
+    let mut last_media_error = String::new();
 
     'cgae: loop {
         if stop.load(Ordering::Relaxed) {
             return Ok("Task stopped by user.".to_string());
-        }
-        if cycles >= 5 {
-            let failure_summary = format!(
-                "Task failed: reached maximum limit of 5 cycles without completion. Failed attempts: {}",
-                failed_attempts.join("; ")
-            );
-            dbg_log!("[run_task] Hard stop at cycle 5. Calling task_complete with failure summary.");
-            let _ = db::log_action(&conn, session_id, "task_complete", &serde_json::json!({ "summary": failure_summary }).to_string(), None);
-            return Ok(prepend_search_context(&failure_summary, &performed_searches, &all_search_images));
         }
         if cycles >= MAX_CYCLES {
             return Ok(prepend_search_context(&format!("Reached maximum cycles ({MAX_CYCLES}). Last known state saved."), &performed_searches, &all_search_images));
@@ -1677,7 +2213,7 @@ pub async fn run_task(
         }
         cycles += 1;
         cycle_starts.push(messages.len());
-        dbg_log!("[cycle {}] starting (total_steps={})", cycles, total_steps);
+        crate::dbg_log!("[cycle {}] starting (total_steps={})", cycles, total_steps);
 
         if cycles >= 3 {
             let screenshot_only_cycles = cycle_starts.windows(2)
@@ -1698,14 +2234,14 @@ pub async fn run_task(
                 .count();
             let last_two_screenshot_only = screenshot_only_cycles >= 2;
             if last_two_screenshot_only {
-                dbg_log!("[cycle {}] SCREENSHOT LOOP DETECTED — injecting screenshot + forced act", cycles);
+                crate::dbg_log!("[cycle {}] SCREENSHOT LOOP DETECTED — injecting screenshot + forced act", cycles);
                 if vision_capable {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                     if cfg!(target_os = "windows") {
                         let _ = execute_tool_async("run_script".to_string(), serde_json::json!({
                             "script": "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.Interaction]::AppActivate((Get-Process | Where-Object {$_.MainWindowTitle -ne ''} | Sort-Object StartTime -Descending | Select-Object -First 1).Id) | Out-Null",
                             "capture_output": false
-                        }), storage_dir, &[], stop.clone()).await;
+                        }), storage_dir, &[], stop.clone(), Some(&msg_tx)).await;
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                     if let Ok((img, elements)) = take_screenshot_with_elements(patterns, prompt).await {
@@ -1817,7 +2353,7 @@ pub async fn run_task(
         if token_limit > 0 {
             let _ = msg_tx.send(format!("JSON_TOKEN_LIMIT:{}", serde_json::json!({ "used": used_tokens_before, "limit": token_limit }))).await;
             if used_tokens_before > (token_limit * 85 / 100) {
-                dbg_log!("[compress] triggering inside loop: used≈{} limit={}", used_tokens_before, token_limit);
+                crate::dbg_log!("[compress] triggering inside loop: used≈{} limit={}", used_tokens_before, token_limit);
                 messages = compress_context(&messages_for_ai, provider, prompt, &msg_tx).await;
                 // Re-build messages_for_ai from compressed history
                 messages_for_ai = {
@@ -1855,7 +2391,7 @@ pub async fn run_task(
         let _ = msg_tx.send(format!("{}...", step_text)).await;
         let response = chat_with_retry(provider, messages_for_ai, Some(2048), &msg_tx).await?;
         let raw = response.content.trim();
-        dbg_log!("[cycle {}] raw AI response: {}", cycles, raw);
+        crate::dbg_log!("[cycle {}] raw AI response: {}", cycles, raw);
         let content = strip_fences(raw);
 
         {
@@ -1865,7 +2401,7 @@ pub async fn run_task(
             let is_hallucinated_coords = !vision_capable && (at_paren_count >= 5 || brush_size_count >= 3);
 
             if is_hallucinated_coords {
-                dbg_log!("[cycle {}] HALLUCINATION DETECTED: {} 'at (' patterns, {} 'brush size' patterns — injecting correction",
+                crate::dbg_log!("[cycle {}] HALLUCINATION DETECTED: {} 'at (' patterns, {} 'brush size' patterns — injecting correction",
                     cycles, at_paren_count, brush_size_count);
                 messages.push(ChatMessage::text("user",
                     "STOP. Your last response contained fabricated UI coordinates that do not reflect the real screen. \
@@ -1882,7 +2418,7 @@ pub async fn run_task(
         db::insert_message(&conn, session_id, "assistant", &content)?;
 
         let json_content = extract_best_json(&content);
-        dbg_log!("[cycle {}] extracted json: {:?}", cycles, json_content);
+        crate::dbg_log!("[cycle {}] extracted json: {:?}", cycles, json_content);
 
         let val: Value = match json_content {
             None => {
@@ -1923,7 +2459,7 @@ pub async fn run_task(
                     v
                 }
                 Err(e) => {
-                    dbg_log!("[cycle {}] JSON parse error: {}", cycles, e);
+                    crate::dbg_log!("[cycle {}] JSON parse error: {}", cycles, e);
                     db::insert_message(&conn, session_id, "system",
                         &format!("JSON parse failed: {e}\nRaw: {}", &content[..content.len().min(200)])
                     ).ok();
@@ -1938,7 +2474,7 @@ pub async fn run_task(
 
         // SCHEMA VERIFICATION
         if !val.is_object() || (val["plan"].as_array().is_none() && val["tool"].as_str().is_none()) {
-            dbg_log!("[cycle {}] Invalid JSON schema: missing 'plan' or 'tool'", cycles);
+            crate::dbg_log!("[cycle {}] Invalid JSON schema: missing 'plan' or 'tool'", cycles);
             messages.push(ChatMessage::text("user",
                 "Your response is a JSON object but is missing the REQUIRED 'plan' (array of steps) or 'tool' (string) fields. \
                  If you are executing a task, you MUST output a JSON object with this exact shape:\n\
@@ -2023,7 +2559,7 @@ pub async fn run_task(
 
             if !validation_errors.is_empty() {
                 let error_list = validation_errors.join("; ");
-                dbg_log!("[cycle {}] PRE-EXEC VALIDATION FAILED: {}", cycles, error_list);
+                crate::dbg_log!("[cycle {}] PRE-EXEC VALIDATION FAILED: {}", cycles, error_list);
                 messages.push(ChatMessage::text("user", &format!(
                     "Your plan has validation errors and cannot execute: {}. \
                      Fix these issues and reply with a corrected plan. \
@@ -2133,15 +2669,31 @@ pub async fn run_task(
                     continue 'cgae;
                 }
                 other => {
-                    dbg_log!("[cycle {}] single tool: {}", cycles, other);
+                    crate::dbg_log!("[cycle {}] single tool: {}", cycles, other);
                     notify_media_generation_if_needed(other, &val["params"], &msg_tx).await;
-                    let out = execute_tool_async(other.to_string(), val["params"].clone(), storage_dir, &screen_elements, stop.clone()).await;
+                    let out = execute_tool_async(other.to_string(), val["params"].clone(), storage_dir, &screen_elements, stop.clone(), Some(&msg_tx)).await;
                     let _ = db::log_action(&conn, session_id, other, &val["params"].to_string(), None);
                     match out {
                         Ok(o) => {
                             // Fingerprint: for mouse actions, hash tool only (coords vary but mean no progress)
                             // For other tools, hash tool+args
                             same_action_count = track_action_repetition(other, &val["params"], &mut recent_action_hashes);
+                            if is_media_tool(other) {
+                                if let Some(ref s) = o {
+                                    if media_output_failed(s) {
+                                        crate::dbg_log!(
+                                            "[cycle {}] single media tool '{}' failed: {}",
+                                            cycles,
+                                            other,
+                                            truncate_tool_output(s)
+                                        );
+                                        let fb = format!("Output:\n{}", truncate_tool_output(s));
+                                        messages.push(ChatMessage::text("user", &fb));
+                                        failed = Some((0, truncate_tool_output(s)));
+                                        continue 'cgae;
+                                    }
+                                }
+                            }
                             let fb = o.map(|s| format!("Output:\n{}", truncate_tool_output(&s)))
                                 .unwrap_or_else(|| "Done.".to_string());
                             messages.push(ChatMessage::text("user", &fb));
@@ -2193,7 +2745,7 @@ pub async fn run_task(
                     }
                 }
 
-                dbg_log!("[cycle {} step {}/{}] tool='{}' params={}", cycles, i+1, steps.len(), tool_name, params);
+                crate::dbg_log!("[cycle {} step {}/{}] tool='{}' params={}", cycles, i+1, steps.len(), tool_name, params);
 
                 let step_desc = match tool_name {
                     "mouse_click" => {
@@ -2286,14 +2838,14 @@ public class Win32 {{
                             if let Some(obj) = params.as_object_mut() {
                                 obj.insert("script".to_string(), serde_json::json!(patched));
                             }
-                            dbg_log!("[cycle {} step {}] AUTO-PATCHED Win32 Add-Type header", cycles, i+1);
+                            crate::dbg_log!("[cycle {} step {}] AUTO-PATCHED Win32 Add-Type header", cycles, i+1);
                         }
                     }
 
                     {
                         let script = params["script"].as_str().unwrap_or("").to_string();
                         if let Some(corrected) = resolve_app_command(&script) {
-                            dbg_log!("[cycle {} step {}] APP COMMAND CORRECTED: '{}' -> '{}'",
+                            crate::dbg_log!("[cycle {} step {}] APP COMMAND CORRECTED: '{}' -> '{}'",
                                 cycles, i+1, script, corrected);
                             if let Some(obj) = params.as_object_mut() {
                                 obj.insert("script".to_string(), serde_json::json!(corrected));
@@ -2306,7 +2858,7 @@ public class Win32 {{
                         .all(|l| l.trim().is_empty() || l.trim().starts_with('#') || l.trim().starts_with("//"));
                     if is_noop {
                         noop_script_count += 1;
-                        dbg_log!("[cycle {} step {}] NO-OP SCRIPT (count={}): {}", cycles, i+1, noop_script_count, script);
+                        crate::dbg_log!("[cycle {} step {}] NO-OP SCRIPT (count={}): {}", cycles, i+1, noop_script_count, script);
                         let feedback = if noop_script_count >= 3 {
                             "CRITICAL: You have sent a comments-only script 3 times in a row. \
                              You MUST write real executable code. \
@@ -2345,7 +2897,7 @@ public class Win32 {{
                 match tool_name {
                 "task_complete" => {
                     // Don't trust task_complete from inside a plan — force visual verification
-                    dbg_log!("[cycle {} step {}] task_complete in plan - deferring to visual eval", cycles, i+1);
+                    crate::dbg_log!("[cycle {} step {}] task_complete in plan - deferring to visual eval", cycles, i+1);
                     plan_summary = step["params"]["summary"].as_str().unwrap_or(&plan_summary).to_string();
                     has_task_complete = true;
                     break;
@@ -2369,15 +2921,15 @@ public class Win32 {{
                             execute_tool_async("run_script".to_string(), serde_json::json!({
                                 "script": format!("if (Get-Process -Name '{}' -ErrorAction SilentlyContinue) {{ 'is_active' }} else {{ 'inactive' }}", exe_clean),
                                 "capture_output": true
-                            }), storage_dir, &[], stop.clone()).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
+                            }), storage_dir, &[], stop.clone(), None).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
                         } else {
                             execute_tool_async("run_command".to_string(), serde_json::json!({
                                 "command": format!("pgrep -x '{}' > /dev/null 2>&1 && echo is_active || echo inactive", exe_clean),
                                 "capture_output": true
-                            }), storage_dir, &[], stop.clone()).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
+                            }), storage_dir, &[], stop.clone(), None).await.ok().flatten().map(|o| o.contains("is_active")).unwrap_or(false)
                         };
                         if already_running {
-                            dbg_log!("[cycle {} step {}] {} already running — focusing", cycles, i+1, exe_clean);
+                            crate::dbg_log!("[cycle {} step {}] {} already running — focusing", cycles, i+1, exe_clean);
                             if cfg!(target_os = "windows") {
                                 let focus_script = format!(r#"
 $p = Get-Process -Name '{}' -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -2400,7 +2952,7 @@ public class WinFocus {{
                                 let focus_result = execute_tool_async("run_script".to_string(), serde_json::json!({
                                     "script": focus_script,
                                     "capture_output": true
-                                }), storage_dir, &[], stop.clone()).await;
+                                }), storage_dir, &[], stop.clone(), Some(&msg_tx)).await;
                                 let focused = focus_result.ok().flatten()
                                     .map(|o| o.contains("focused")).unwrap_or(false);
                                 if focused {
@@ -2439,6 +2991,7 @@ public class WinFocus {{
                                 storage_dir,
                                 &[],
                                 stop.clone(),
+                                None,
                             ).await;
                             if let Ok(Some(out)) = check_result {
                                 let out_lower = out.to_lowercase();
@@ -2459,14 +3012,14 @@ public class WinFocus {{
                         }
                     }
                     notify_media_generation_if_needed(tool_name, &params, &msg_tx).await;
-                    let result = execute_tool_async(tool_name.to_string(), params.clone(), storage_dir, &screen_elements, stop.clone()).await;
+                    let result = execute_tool_async(tool_name.to_string(), params.clone(), storage_dir, &screen_elements, stop.clone(), Some(&msg_tx)).await;
                     let _ = db::log_action(&conn, session_id, tool_name, &params.to_string(), None);
                     match result {
                         Ok(out) => {
                             // Fingerprint this action
                             same_action_count = track_action_repetition(tool_name, &params, &mut recent_action_hashes);
                             if let Some(ref o) = out {
-                                dbg_log!("[cycle {} step {}] output: {}", cycles, i+1, truncate_tool_output(o));
+                                crate::dbg_log!("[cycle {} step {}] output: {}", cycles, i+1, truncate_tool_output(o));
 
                                 let exit_code = parse_exit_code(o);
                                 let stderr_text = parse_stderr(o);
@@ -2493,7 +3046,7 @@ public class WinFocus {{
                                             }
                                         )
                                     };
-                                    dbg_log!("[cycle {} step {}] HARD FAIL exit={:?} stderr='{}'",
+                                    crate::dbg_log!("[cycle {} step {}] HARD FAIL exit={:?} stderr='{}'",
                                         cycles, i+1, exit_code, stderr_text);
                                     messages.push(ChatMessage::text("user", &format!(
                                         "Command output:\n{}", truncate_tool_output(o)
@@ -2511,12 +3064,14 @@ public class WinFocus {{
                                     "Command output:\n{}", truncate_tool_output(o)
                                 )));
                             } else {
-                                dbg_log!("[cycle {} step {}] output: (none)", cycles, i+1);
+                                crate::dbg_log!("[cycle {} step {}] output: (none)", cycles, i+1);
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms.max(2500))).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                effective_step_delay(delay_ms, tool_name, true),
+                            )).await;
                         }
                         Err(e) => {
-                            dbg_log!("[cycle {} step {}] FAILED: {}", cycles, i+1, e);
+                            crate::dbg_log!("[cycle {} step {}] FAILED: {}", cycles, i+1, e);
                             failed = Some((i, e.to_string()));
                             break;
                         }
@@ -2542,7 +3097,7 @@ public class WinFocus {{
 
                     if !screen_changed && i > 0 {
                         no_screen_change_count += 1;
-                        dbg_log!("[cycle {} step {}] SCREEN UNCHANGED (count={})",
+                        crate::dbg_log!("[cycle {} step {}] SCREEN UNCHANGED (count={})",
                             cycles, i+1, no_screen_change_count);
                     } else {
                         no_screen_change_count = 0;
@@ -2683,7 +3238,7 @@ public class WinFocus {{
                         }
 
                         if !points.is_empty() {
-                            dbg_log!("[VERIFICATION] Starting visual verification for spatial tool '{}' at {:?}", tool_name, points);
+                            crate::dbg_log!("[VERIFICATION] Starting visual verification for spatial tool '{}' at {:?}", tool_name, points);
                             let _ = msg_tx.send("Verifying screen...".to_string()).await;
                             
                             if let Ok(overlay_png) = crate::screenshot::capture_with_overlay(patterns, &points) {
@@ -2706,14 +3261,14 @@ public class WinFocus {{
                                 verify_history.push(verify_msg);
                                 if let Ok(resp) = provider.chat(verify_history, Some(150)).await {
                                     let resp_text = resp.content.trim();
-                                    dbg_log!("[VERIFICATION] Response from model: {}", resp_text);
+                                    crate::dbg_log!("[VERIFICATION] Response from model: {}", resp_text);
                                     let clean_json = crate::json_utils::clean_if_json(resp_text);
                                     if let Ok(verify_val) = serde_json::from_str::<Value>(&clean_json) {
                                         let status = verify_val.get("status").and_then(|s| s.as_str()).unwrap_or("");
                                         if status == "execute" {
-                                            dbg_log!("[VERIFICATION] Model confirmed coordinates.");
+                                            crate::dbg_log!("[VERIFICATION] Model confirmed coordinates.");
                                         } else if status == "adjust" {
-                                            dbg_log!("[VERIFICATION] Model requested coordinate adjustment.");
+                                            crate::dbg_log!("[VERIFICATION] Model requested coordinate adjustment.");
                                             let adj_x = verify_val.get("x").and_then(|v| v.as_i64());
                                             let adj_y = verify_val.get("y").and_then(|v| v.as_i64());
                                             let adj_from_x = verify_val.get("from_x").and_then(|v| v.as_i64());
@@ -2732,7 +3287,7 @@ public class WinFocus {{
                                             };
 
                                             if is_suspicious {
-                                                dbg_log!("[VERIFICATION] Ignored suspicious top-left coordinate adjustment: x={:?}, y={:?}, from_x={:?}, from_y={:?}", adj_x, adj_y, adj_from_x, adj_from_y);
+                                                crate::dbg_log!("[VERIFICATION] Ignored suspicious top-left coordinate adjustment: x={:?}, y={:?}, from_x={:?}, from_y={:?}", adj_x, adj_y, adj_from_x, adj_from_y);
                                             } else {
                                                 if let Some(x) = adj_x { final_params["x"] = serde_json::json!(x); }
                                                 if let Some(y) = adj_y { final_params["y"] = serde_json::json!(y); }
@@ -2749,14 +3304,14 @@ public class WinFocus {{
                     }
 
                     notify_media_generation_if_needed(tool_name, &final_params, &msg_tx).await;
-                    let result = execute_tool_async(tool_name.to_string(), final_params.clone(), storage_dir, &screen_elements, stop.clone()).await;
+                    let result = execute_tool_async(tool_name.to_string(), final_params.clone(), storage_dir, &screen_elements, stop.clone(), Some(&msg_tx)).await;
                     let _ = db::log_action(&conn, session_id, tool_name, &final_params.to_string(), None);
                     match result {
                         Ok(out) => {
                             // Fingerprint this action
                             same_action_count = track_action_repetition(tool_name, &params, &mut recent_action_hashes);
                             if let Some(ref o) = out {
-                                dbg_log!("[cycle {} step {}] output: {}", cycles, i+1, truncate_tool_output(o));
+                                crate::dbg_log!("[cycle {} step {}] output: {}", cycles, i+1, truncate_tool_output(o));
                                 messages.push(ChatMessage::text("user", &format!("Command output:\n{}", truncate_tool_output(o))));
 
                                 if tool_name == "run_command" || tool_name == "run_script" {
@@ -2785,7 +3340,7 @@ public class WinFocus {{
                                                 }
                                             )
                                         };
-                                        dbg_log!("[cycle {} step {}] HARD FAIL exit={:?} stderr='{}'",
+                                        crate::dbg_log!("[cycle {} step {}] HARD FAIL exit={:?} stderr='{}'",
                                             cycles, i+1, exit_code, stderr_text);
                                         messages.push(ChatMessage::text("user", &diag_prompt));
                                         failed = Some((i, format!(
@@ -2795,14 +3350,29 @@ public class WinFocus {{
                                         )));
                                         break;
                                     }
+                                } else if is_media_tool(tool_name) && media_output_failed(o) {
+                                    crate::dbg_log!(
+                                        "[cycle {} step {}] media tool '{}' failed: {}",
+                                        cycles,
+                                        i + 1,
+                                        tool_name,
+                                        truncate_tool_output(o)
+                                    );
+                                    failed_attempts.push(format!(
+                                        "{} -> {}",
+                                        tool_name,
+                                        truncate_tool_output(o)
+                                    ));
+                                    failed = Some((i, truncate_tool_output(o)));
+                                    break;
                                 }
                             } else {
-                                dbg_log!("[cycle {} step {}] output: (none)", cycles, i+1);
+                                crate::dbg_log!("[cycle {} step {}] output: (none)", cycles, i+1);
                             }
                             // Wait for app to appear before maximizing
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms.max(2500))).await;
-
-                            // Auto-maximize: use run_script with P/Invoke for real maximize
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                effective_step_delay(delay_ms, tool_name, is_launch),
+                            )).await;
                             // Win+Up only snaps, not maximizes on Windows
                             if is_launch {
                                 let maximize_result = if cfg!(target_os = "windows") {
@@ -2820,17 +3390,17 @@ $hwnd = [Win32]::GetForegroundWindow()
 [Win32]::ShowWindow($hwnd, 3) | Out-Null
 "#,
                                         "capture_output": false
-                                    }), storage_dir, &[], stop.clone()).await
+                                    }), storage_dir, &[], stop.clone(), None).await
                                 } else if cfg!(target_os = "macos") {
                                     execute_tool_async("run_script".to_string(), serde_json::json!({
                                         "script": "osascript -e 'tell application \"System Events\" to set frontmost of first process whose frontmost is true to true'",
                                         "capture_output": false
-                                    }), storage_dir, &[], stop.clone()).await
+                                    }), storage_dir, &[], stop.clone(), None).await
                                 } else {
                                     execute_tool_async("run_script".to_string(), serde_json::json!({
                                         "script": "wmctrl -r :ACTIVE: -b add,maximized_vert,maximized_horz 2>/dev/null || true",
                                         "capture_output": false
-                                    }), storage_dir, &[], stop.clone()).await
+                                    }), storage_dir, &[], stop.clone(), None).await
                                 };
                                 let _ = maximize_result;
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2851,18 +3421,54 @@ $hwnd = [Win32]::GetForegroundWindow()
         }
 
         if let Some((fi, err)) = failed {
-            dbg_log!("[cycle {}] plan failed at step {}/{}: {}", cycles, fi+1, steps.len(), err);
+            crate::dbg_log!("[cycle {}] plan failed at step {}/{}: {}", cycles, fi+1, steps.len(), err);
             let _ = msg_tx.try_send("Adjusting actions...".to_string());
+            let step = &steps[fi];
+            let tool_name = step["tool"].as_str().unwrap_or("");
+            if is_media_tool(tool_name) && is_unrecoverable_media_error(&err) {
+                media_failures += 1;
+                last_media_error = err.clone();
+                crate::dbg_log!(
+                    "[cycle {}] unrecoverable media error (count={}): {}",
+                    cycles,
+                    media_failures,
+                    truncate_tool_output(&err)
+                );
+                // #region agent log
+                crate::debug_log::session_log(
+                    "executor.rs:media_fail",
+                    "unrecoverable media generation failure",
+                    serde_json::json!({
+                        "tool": tool_name,
+                        "count": media_failures,
+                        "error": truncate_tool_output(&err),
+                        "prompt": english_prompt,
+                    }),
+                    "H3",
+                    "pre-fix",
+                );
+                // #endregion
+                if media_failures >= 2 {
+                    let user_msg = media_failure_user_message(&err);
+                    return Ok(prepend_search_context(&user_msg, &performed_searches, &all_search_images));
+                }
+            }
             let msg = format!("Step {}/{} failed: {err}. Reply with a corrected plan.", fi + 1, steps.len());
             
             // Add failed attempt memory
-            let step = &steps[fi];
-            let tool_name = step["tool"].as_str().unwrap_or("");
             let params = &step["params"];
             failed_attempts.push(format!("{} with params {} -> {}", tool_name, params, err));
 
             db::insert_message(&conn, session_id, "user", &msg)?;
             messages.push(ChatMessage::text("user", &msg));
+            if is_media_tool(tool_name) && is_unrecoverable_media_error(&err) {
+                messages.push(ChatMessage::text(
+                    "user",
+                    "STOP retrying generate_image. LocalAI's gRPC model loader is not ready. \
+                     Do NOT call screenshot, clipboard_set, mouse_move, or task_complete. \
+                     Reply with a JSON plan containing ONLY task_complete and explain the service is unavailable.",
+                ));
+            }
             continue 'cgae;
         }
 
@@ -2872,7 +3478,7 @@ $hwnd = [Win32]::GetForegroundWindow()
             zero_output_cycles = 0;
             recent_action_hashes.clear();
             circuit_breaker_count += 1;
-            dbg_log!("[cycle {}] CIRCUIT BREAKER: same action repeated 3x (count={})", cycles, circuit_breaker_count);
+            crate::dbg_log!("[cycle {}] CIRCUIT BREAKER: same action repeated 3x (count={})", cycles, circuit_breaker_count);
             if circuit_breaker_count >= 3 {
                 return Ok(prepend_search_context("Task aborted: Agent got stuck in a repetition loop and could not proceed.", &performed_searches, &all_search_images));
             }
@@ -2904,7 +3510,7 @@ $hwnd = [Win32]::GetForegroundWindow()
 
         if zero_output_cycles >= 3 {
             zero_output_cycles = 0;
-            dbg_log!("[cycle {}] ZERO-OUTPUT CIRCUIT BREAKER fired", cycles);
+            crate::dbg_log!("[cycle {}] ZERO-OUTPUT CIRCUIT BREAKER fired", cycles);
             messages.retain(|m| {
                 !(m.role == "system" && m.content.as_str()
                     .map(|s| s.starts_with("[ZERO-OUTPUT BREAKER]")).unwrap_or(false))
@@ -2920,22 +3526,89 @@ $hwnd = [Win32]::GetForegroundWindow()
         }
 
         if let Some(done_msg) = early_done {
-            dbg_log!("[cycle {}] task_complete: {}", cycles, done_msg);
+            crate::dbg_log!("[cycle {}] task_complete: {}", cycles, done_msg);
             return Ok(prepend_search_context(&done_msg, &performed_searches, &all_search_images));
+        }
+
+        if failed.is_none() {
+            let media_success = messages.iter().rev().find_map(|m| {
+                m.content.as_str().and_then(|s| {
+                    let body = s
+                        .strip_prefix("Command output:\n")
+                        .or_else(|| s.strip_prefix("Output:\n"))
+                        .unwrap_or(s);
+                    if media_output_succeeded(body) {
+                        Some(body.to_string())
+                    } else {
+                        None
+                    }
+                })
+            });
+            if let Some(output) = media_success {
+                crate::dbg_log!(
+                    "[cycle {}] media generation succeeded — completing without vision loop: {}",
+                    cycles,
+                    truncate_tool_output(&output)
+                );
+                return Ok(prepend_search_context(&plan_summary, &performed_searches, &all_search_images));
+            }
+        }
+
+        if failed.is_none()
+            && crate::intent::is_non_visual_task(&english_prompt)
+            && !executed_attempts.is_empty()
+        {
+            let last_success = messages.iter().rev().any(|m| {
+                m.role == "user"
+                    && m.content.as_str()
+                        .map(|s| {
+                            s.starts_with("Output:") && !s.contains("exit_code: 1") && !s.to_lowercase().contains("error")
+                        })
+                        .unwrap_or(false)
+            });
+            if last_success || has_task_complete {
+                crate::dbg_log!("[cycle {}] non-visual task completed without screenshot verification", cycles);
+                // #region agent log
+                crate::debug_log::session_log(
+                    "executor.rs:cgae",
+                    "non-visual task auto-complete",
+                    serde_json::json!({ "prompt": prompt, "cycles": cycles, "plan_summary": plan_summary }),
+                    "H5",
+                    "pre-fix",
+                );
+                // #endregion
+                return Ok(prepend_search_context(&plan_summary, &performed_searches, &all_search_images));
+            }
         }
 
         if !vision_capable {
             if has_task_complete {
+                if media_failures > 0 && is_unrecoverable_media_error(&last_media_error) {
+                    let user_msg = media_failure_user_message(&last_media_error);
+                    return Ok(prepend_search_context(&user_msg, &performed_searches, &all_search_images));
+                }
                 return Ok(prepend_search_context(&plan_summary, &performed_searches, &all_search_images));
             } else {
                 continue 'cgae;
             }
         }
+        if has_task_complete
+            && media_failures > 0
+            && is_unrecoverable_media_error(&last_media_error)
+            && crate::intent::is_media_generation_task(&english_prompt)
+        {
+            crate::dbg_log!(
+                "[cycle {}] skipping vision loop after unrecoverable media failure",
+                cycles
+            );
+            let user_msg = media_failure_user_message(&last_media_error);
+            return Ok(prepend_search_context(&user_msg, &performed_searches, &all_search_images));
+        }
         // After plan completes, take one screenshot and re-enter loop so AI sees real state
         if vision_capable && failed.is_none() && early_done.is_none() {
             if let Ok((img, elements)) = take_screenshot_with_elements(patterns, prompt).await {
                 screen_elements = elements;
-                dbg_log!("[cycle {}] post-plan screenshot injected", cycles);
+                crate::dbg_log!("[cycle {}] post-plan screenshot injected", cycles);
                 let new_hash = screenshot_hash(&img);
                 let screen_changed = last_screenshot_hash
                     .map(|old| old != new_hash)
@@ -2954,7 +3627,7 @@ $hwnd = [Win32]::GetForegroundWindow()
                     )
                 } else if !screen_changed {
                     no_screen_change_count += 1;
-                    dbg_log!("[cycle {}] post-plan screen UNCHANGED (count={})",
+                    crate::dbg_log!("[cycle {}] post-plan screen UNCHANGED (count={})",
                         cycles, no_screen_change_count);
                     format!(
                         "WARNING: The screen is IDENTICAL to before your last action. \
@@ -3224,34 +3897,323 @@ fn resolve_app_command(script: &str) -> Option<String> {
     None
 }
 
-async fn generate_image_async(prompt: &str, storage_dir: &Path) -> Result<String> {
+async fn generate_speech_async(text: &str, storage_dir: &Path) -> Result<String> {
     let cfg = crate::config::load(storage_dir)?;
-    if cfg.localai_models.images.is_empty() {
-        anyhow::bail!("No active LocalAI model configured for image generation. Please set this up in settings -> models.");
+    if cfg.localai_models.speaking.is_empty() {
+        anyhow::bail!("No active LocalAI model configured for speech synthesis. Please set this up in settings -> models.");
     }
     if !crate::ai::localai::is_running().await {
-        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured model is installed.");
+        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured TTS model is installed.");
     }
-    let model = cfg.localai_models.images.clone();
 
     let active_port = crate::ai::localai::get_active_port();
     let base_url = format!("http://127.0.0.1:{}", active_port);
-
+    let voice = if cfg.localai_voice.is_empty() {
+        "af_sky".to_string()
+    } else {
+        cfg.localai_voice.clone()
+    };
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let payload = serde_json::json!({
-        "prompt": prompt,
-        "model": model
+        "model": cfg.localai_models.speaking,
+        "input": text,
+        "voice": voice
     });
 
-    let res = client.post(format!("{}/v1/images/generations", base_url))
+    let res = client
+        .post(format!("{}/v1/audio/speech", base_url))
         .json(&payload)
         .send()
         .await?;
 
     if !res.status().is_success() {
-        anyhow::bail!("Image generation failed with HTTP status {}", res.status());
+        anyhow::bail!("Speech synthesis failed with HTTP status {}", res.status());
+    }
+
+    let bytes = res.bytes().await?;
+    let filename = format!("localai_speech_{}.wav", uuid::Uuid::new_v4());
+    let temp_path = std::env::temp_dir().join(filename);
+    tokio::fs::write(&temp_path, bytes).await?;
+
+    let path_str = temp_path.to_string_lossy().replace('\\', "/");
+    Ok(format!(
+        "<audio src=\"file:///{}\" controls autoplay style=\"width:100%; margin-top:8px;\"></audio>",
+        path_str
+    ))
+}
+
+async fn generate_image_async(
+    prompt: &str,
+    storage_dir: &Path,
+    msg_tx: Option<&tokio::sync::mpsc::Sender<String>>,
+    progress_prompt: &str,
+) -> Result<String> {
+    const TOTAL_STEPS: u32 = 15;
+    let started = std::time::Instant::now();
+    let cfg = crate::config::load(storage_dir)?;
+    if cfg.localai_models.images.is_empty() {
+        anyhow::bail!("No active LocalAI model configured for image generation. Please set this up in settings -> models.");
+    }
+
+    let model = cfg.localai_models.images.clone();
+    crate::ai::localai::verify_image_model_weights(storage_dir, &model)?;
+
+    if let Some(tx) = msg_tx {
+        send_media_gen_indeterminate(
+            tx,
+            "image",
+            progress_prompt,
+            "preparing",
+            "Preparing image generation…",
+        );
+    }
+
+    // #region agent log
+    crate::debug_log::session_log(
+        "executor.rs:generate_image",
+        "skipping unsupported backends install CLI (v2.26 loads backends at server startup)",
+        serde_json::json!({ "model": model }),
+        "H1",
+        "post-fix",
+    );
+    // #endregion
+
+    if !crate::ai::localai::is_running().await {
+        let _ = crate::ai::localai::start_server(storage_dir).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if !crate::ai::localai::is_running().await {
+        anyhow::bail!("LocalAI is not running. Please start the LocalAI engine and ensure the configured model is installed.");
+    }
+
+    let repaired = crate::ai::localai::repair_model_yaml(storage_dir, &model).unwrap_or(false);
+    crate::dbg_log!(
+        "[generate_image] model='{}' yaml_repaired={} (+{}ms)",
+        model,
+        repaired,
+        started.elapsed().as_millis()
+    );
+    if repaired {
+        crate::dbg_log!("[generate_image] restarting LocalAI after YAML config fix");
+        crate::ai::localai::stop_server().await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let _ = crate::ai::localai::start_server(storage_dir).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    let active_port = crate::ai::localai::get_active_port();
+    let base_url = format!("http://127.0.0.1:{}", active_port);
+    crate::dbg_log!(
+        "[generate_image] start model='{}' prompt='{}' base_url={}",
+        model,
+        prompt,
+        base_url
+    );
+
+    let probe = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    match probe.get(format!("{}/v1/models", base_url)).send().await {
+        Ok(res) => {
+            crate::dbg_log!(
+                "[generate_image] models probe status={} (+{}ms)",
+                res.status(),
+                started.elapsed().as_millis()
+            );
+        }
+        Err(e) => {
+            crate::dbg_log!(
+                "[generate_image] models probe failed (+{}ms): {}",
+                started.elapsed().as_millis(),
+                e
+            );
+        }
+    }
+
+    const MAX_ATTEMPTS: u32 = 2;
+    let mut last_err = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        if let Some(tx) = msg_tx {
+            send_media_gen_indeterminate(
+                tx,
+                "image",
+                progress_prompt,
+                "generating",
+                "Generating image…",
+            );
+        }
+
+        let log_watcher = if let Some(tx) = msg_tx {
+            Some(spawn_localai_log_progress_watcher(
+                storage_dir,
+                tx.clone(),
+                "image",
+                progress_prompt,
+            ))
+        } else {
+            None
+        };
+
+        let _ = crate::ai::localai::cleanup_incompatible_wsl_libraries().await;
+        let result = generate_image_request(prompt, &model, &base_url, TOTAL_STEPS).await;
+        if let Some(handle) = log_watcher {
+            handle.abort();
+        }
+
+        match result {
+            Ok(markdown) => {
+                if let Some(tx) = msg_tx {
+                    send_media_gen_progress(tx, "image", progress_prompt, TOTAL_STEPS, TOTAL_STEPS);
+                }
+                crate::debug_log::session_log(
+                    "executor.rs:generate_image",
+                    "image generation succeeded",
+                    serde_json::json!({
+                        "model": model,
+                        "attempt": attempt,
+                        "yaml_repaired": repaired,
+                        "elapsed_ms": started.elapsed().as_millis(),
+                    }),
+                    "H1",
+                    "post-fix",
+                );
+                return Ok(markdown);
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                let retryable = last_err.to_lowercase().contains("grpc service not ready")
+                    || last_err.to_lowercase().contains("backend not found");
+                crate::dbg_log!(
+                    "[generate_image] attempt {}/{} failed (+{}ms): {}",
+                    attempt,
+                    MAX_ATTEMPTS,
+                    started.elapsed().as_millis(),
+                    last_err
+                );
+                if retryable && attempt < MAX_ATTEMPTS {
+                    crate::dbg_log!("[generate_image] retry: restarting LocalAI after transient backend error");
+                    crate::ai::localai::stop_server().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let _ = crate::ai::localai::start_server(storage_dir).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let log_tail = crate::ai::localai::tail_localai_log(storage_dir, 12);
+    if !log_tail.is_empty() {
+        crate::dbg_log!("[generate_image] localai log tail:\n{}", strip_ansi_codes(&log_tail));
+    }
+    // Log raw error details internally for debugging, but only pass humanized message to user
+    crate::dbg_log!("[generate_image] final error (raw): {}", last_err);
+    Err(anyhow::anyhow!(humanize_api_error_detail(&last_err)))
+}
+
+fn parse_step_from_log_line(line: &str) -> Option<(u32, u32)> {
+    let lower = line.to_lowercase();
+    if !(lower.contains("step") || lower.contains("sampling") || lower.contains('/')) {
+        return None;
+    }
+    for token in line.split_whitespace() {
+        let token = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '/');
+        if let Some((cur_s, total_s)) = token.split_once('/') {
+            if let (Ok(cur), Ok(total)) = (cur_s.parse::<u32>(), total_s.parse::<u32>()) {
+                if (5..=200).contains(&total) && cur > 0 && cur <= total {
+                    return Some((cur, total));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn spawn_localai_log_progress_watcher(
+    storage_dir: &Path,
+    msg_tx: tokio::sync::mpsc::Sender<String>,
+    media_type: &'static str,
+    prompt: &str,
+) -> tokio::task::JoinHandle<()> {
+    let log_path = storage_dir.join("localai.log");
+    let prompt = prompt.to_string();
+    let mut offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let mut last_step = 0u32;
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let content = match std::fs::read_to_string(&log_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if (content.len() as u64) < offset {
+                offset = 0;
+            }
+            let new_bytes = &content[offset as usize..];
+            offset = content.len() as u64;
+            for line in new_bytes.lines() {
+                if let Some((step, total)) = parse_step_from_log_line(line) {
+                    if step >= last_step {
+                        last_step = step;
+                        send_media_gen_progress(&msg_tx, media_type, &prompt, step, total);
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn generate_image_request(
+    prompt: &str,
+    model: &str,
+    base_url: &str,
+    steps: u32,
+) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()?;
+    let payload = serde_json::json!({
+        "prompt": prompt,
+        "model": model,
+        "size": "512x512",
+        "step": steps
+    });
+
+    crate::dbg_log!("[generate_image] sending POST /v1/images/generations model='{}'", model);
+    let res = client
+        .post(format!("{}/v1/images/generations", base_url))
+        .json(&payload)
+        .send()
+        .await?;
+    crate::dbg_log!("[generate_image] response status={}", res.status());
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        // Log full body to debug log for developers
+        crate::dbg_log!(
+            "[generate_image] HTTP {} for model '{}' body={}",
+            status,
+            model,
+            if body.len() > 500 { format!("{}...", &body[..500]) } else { body.clone() }
+        );
+        // Extract a clean error message from JSON body if possible
+        let clean_msg = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+            parsed["error"]["message"].as_str()
+                .or_else(|| parsed["message"].as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        if !clean_msg.is_empty() {
+            anyhow::bail!("HTTP status {}: {}", status, clean_msg);
+        } else {
+            anyhow::bail!("Image generation failed with HTTP status {}", status);
+        }
     }
 
     let json_res: serde_json::Value = res.json().await?;
@@ -3261,7 +4223,12 @@ async fn generate_image_async(prompt: &str, storage_dir: &Path) -> Result<String
     let full_url = if url_val.starts_with("http://") || url_val.starts_with("https://") {
         url_val.to_string()
     } else {
-        format!("{}{}{}", base_url, if url_val.starts_with('/') { "" } else { "/" }, url_val)
+        format!(
+            "{}{}{}",
+            base_url,
+            if url_val.starts_with('/') { "" } else { "/" },
+            url_val
+        )
     };
 
     let img_res = client.get(&full_url).send().await?;
@@ -3272,8 +4239,7 @@ async fn generate_image_async(prompt: &str, storage_dir: &Path) -> Result<String
     tokio::fs::write(&temp_path, bytes).await?;
 
     let path_str = temp_path.to_string_lossy().replace('\\', "/");
-    let markdown = format!("![Image](file:///{})", path_str);
-    Ok(markdown)
+    Ok(format!("![Image](file:///{})", path_str))
 }
 
 async fn generate_video_async(prompt: &str, storage_dir: &Path) -> Result<String> {
@@ -3370,12 +4336,21 @@ async fn generate_music_async(prompt: &str, storage_dir: &Path) -> Result<String
 }
 
 async fn notify_media_generation_if_needed(tool_name: &str, params: &serde_json::Value, msg_tx: &tokio::sync::mpsc::Sender<String>) {
-    if tool_name == "generate_image" || tool_name == "generate_video" || tool_name == "generate_music" {
-        let prompt = params["prompt"].as_str().unwrap_or("").to_string();
+    if tool_name == "generate_image"
+        || tool_name == "generate_video"
+        || tool_name == "generate_music"
+        || tool_name == "generate_speech"
+    {
+        let prompt = params["prompt"]
+            .as_str()
+            .or_else(|| params["text"].as_str())
+            .unwrap_or("")
+            .to_string();
         let media_type = match tool_name {
             "generate_image" => "image",
             "generate_video" => "video",
             "generate_music" => "music",
+            "generate_speech" => "speech",
             _ => "unknown",
         };
         let _ = msg_tx.send(format!("JSON_MEDIA_GEN:{}", serde_json::json!({
@@ -3392,13 +4367,21 @@ async fn execute_tool_async(
     storage_dir: &Path,
     screen_elements: &[Element],
     stop: StopFlag,
+    msg_tx: Option<&tokio::sync::mpsc::Sender<String>>,
 ) -> Result<Option<String>> {
     match tool.as_str() {
         "generate_image" => {
             let prompt = params["prompt"].as_str().unwrap_or("").to_string();
-            let res = generate_image_async(&prompt, storage_dir).await.unwrap_or_else(|e| {
-                format!("Error generating image: {e}")
-            });
+            let result = generate_image_async(&prompt, storage_dir, msg_tx, &prompt).await;
+            if let Some(tx) = msg_tx {
+                match &result {
+                    Ok(output) if media_output_succeeded(output) => {
+                        send_media_gen_complete(tx, "image", &prompt);
+                    }
+                    _ => send_media_gen_failed(tx, "image", &prompt),
+                }
+            }
+            let res = result.unwrap_or_else(|e| format!("Error generating image: {e}"));
             return Ok(Some(res));
         }
         "generate_video" => {
@@ -3412,6 +4395,17 @@ async fn execute_tool_async(
             let prompt = params["prompt"].as_str().unwrap_or("").to_string();
             let res = generate_music_async(&prompt, storage_dir).await.unwrap_or_else(|e| {
                 format!("Error generating music/sound: {e}")
+            });
+            return Ok(Some(res));
+        }
+        "generate_speech" => {
+            let text = params["text"]
+                .as_str()
+                .or_else(|| params["prompt"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let res = generate_speech_async(&text, storage_dir).await.unwrap_or_else(|e| {
+                format!("Error generating speech: {e}")
             });
             return Ok(Some(res));
         }
@@ -3438,14 +4432,14 @@ async fn execute_tool_async(
                 if let Some(x) = obj.get("x").and_then(|v| v.as_i64()) {
                     let clamped = x.max(0).min(max_x as i64 - 1);
                     if clamped != x {
-                        dbg_log!("COORD CLAMP x: {} -> {}", x, clamped);
+                        crate::dbg_log!("COORD CLAMP x: {} -> {}", x, clamped);
                         obj.insert("x".to_string(), serde_json::json!(clamped));
                     }
                 }
                 if let Some(y) = obj.get("y").and_then(|v| v.as_i64()) {
                     let clamped = y.max(0).min(max_y as i64 - 1);
                     if clamped != y {
-                        dbg_log!("COORD CLAMP y: {} -> {}", y, clamped);
+                        crate::dbg_log!("COORD CLAMP y: {} -> {}", y, clamped);
                         obj.insert("y".to_string(), serde_json::json!(clamped));
                     }
                 }

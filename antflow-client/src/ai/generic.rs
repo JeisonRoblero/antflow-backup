@@ -43,11 +43,10 @@ impl GenericProvider {
 #[async_trait]
 impl AiProvider for GenericProvider {
     async fn chat(&self, messages: Vec<ChatMessage>, max_tokens: Option<u32>) -> Result<AiResponse> {
+        let clean_messages: Vec<serde_json::Value> = messages.iter().map(|m| m.to_clean_json()).collect();
         // For Anthropic: inject cache_control on system message for prompt caching (~60% input savings).
         let messages_val = if self.provider_name == "anthropic" {
-            let mut msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-                serde_json::json!({ "role": m.role, "content": m.content })
-            }).collect();
+            let mut msgs = clean_messages.clone();
             if let Some(first) = msgs.first_mut() {
                 if first["role"] == "system" {
                     if let Some(content_str) = first["content"].as_str() {
@@ -61,7 +60,7 @@ impl AiProvider for GenericProvider {
             }
             serde_json::Value::Array(msgs)
         } else {
-            serde_json::to_value(&messages).unwrap_or(serde_json::Value::Array(vec![]))
+            serde_json::Value::Array(clean_messages)
         };
 
         let body = json!({
@@ -71,6 +70,8 @@ impl AiProvider for GenericProvider {
         });
 
         let url = format!("{}/chat/completions", self.base_url);
+        crate::dbg_log!("[ai:{}] Sending non-stream chat request to model '{}' (url: {})", self.provider_name, self.model, url);
+        let start_time = std::time::Instant::now();
 
         let mut req = self.client
             .post(&url)
@@ -82,12 +83,19 @@ impl AiProvider for GenericProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", "prompt-caching-2024-07-31");
         }
-        let resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to reach {} API", self.provider_name))?;
+        let resp_res = req.send().await;
+
+        let duration = start_time.elapsed().as_millis();
+        let resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:{}] Request failed after {}ms: {}", self.provider_name, duration, e);
+                return Err(anyhow::anyhow!(e).context(format!("Failed to reach {} API", self.provider_name)));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:{}] Received response headers in {}ms (status: {})", self.provider_name, duration, status);
         let text = resp.text().await?;
 
         if !status.is_success() {
@@ -142,11 +150,10 @@ impl AiProvider for GenericProvider {
         max_tokens: Option<u32>,
         tx: tokio::sync::mpsc::Sender<String>,
     ) -> Result<AiResponse> {
+        let clean_messages: Vec<serde_json::Value> = messages.iter().map(|m| m.to_clean_json()).collect();
         // For Anthropic: inject cache_control on system message for prompt caching (~60% input savings).
         let messages_val = if self.provider_name == "anthropic" {
-            let mut msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-                serde_json::json!({ "role": m.role, "content": m.content })
-            }).collect();
+            let mut msgs = clean_messages.clone();
             if let Some(first) = msgs.first_mut() {
                 if first["role"] == "system" {
                     if let Some(content_str) = first["content"].as_str() {
@@ -160,7 +167,7 @@ impl AiProvider for GenericProvider {
             }
             serde_json::Value::Array(msgs)
         } else {
-            serde_json::to_value(&messages).unwrap_or(serde_json::Value::Array(vec![]))
+            serde_json::Value::Array(clean_messages)
         };
 
         let body = json!({
@@ -171,6 +178,8 @@ impl AiProvider for GenericProvider {
         });
 
         let url = format!("{}/chat/completions", self.base_url);
+        crate::dbg_log!("[ai:{}] Sending stream chat request to model '{}' (url: {})", self.provider_name, self.model, url);
+        let start_time = std::time::Instant::now();
 
         let mut req = self.client
             .post(&url)
@@ -182,12 +191,20 @@ impl AiProvider for GenericProvider {
                 .header("anthropic-version", "2023-06-01")
                 .header("anthropic-beta", "prompt-caching-2024-07-31");
         }
-        let mut resp = req
-            .send()
-            .await
-            .with_context(|| format!("Failed to reach {} API", self.provider_name))?;
+        let resp_res = req.send().await;
+
+        let duration = start_time.elapsed().as_millis();
+        let mut resp = match resp_res {
+            Ok(r) => r,
+            Err(e) => {
+                crate::dbg_log!("[ai:{}] Stream request failed after {}ms: {}", self.provider_name, duration, e);
+                return Err(anyhow::anyhow!(e).context(format!("Failed to reach {} API", self.provider_name)));
+            }
+        };
 
         let status = resp.status();
+        crate::dbg_log!("[ai:{}] Received stream response headers in {}ms (status: {})", self.provider_name, duration, status);
+
         if !status.is_success() {
             let text = resp.text().await?;
             let code = status.as_u16();
@@ -238,6 +255,9 @@ impl AiProvider for GenericProvider {
                 }
             }
         }
+
+        let total_duration = start_time.elapsed().as_millis();
+        crate::dbg_log!("[ai:{}] Stream completed in {}ms", self.provider_name, total_duration);
 
         let is_tool_call = full_content.trim_start().starts_with('{');
         Ok(AiResponse { content: full_content, is_tool_call })

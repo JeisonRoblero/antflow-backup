@@ -2277,43 +2277,78 @@ fn draw_clarification(f: &mut Frame, app: &App, area: Rect) {
         chunks[0],
     );
 
-    let items: Vec<ListItem> = app.clarification_options.iter().enumerate().map(|(i, opt)| {
-        let selected = i == app.clarification_cursor;
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                if selected { "  ▶ " } else { "    " },
-                Style::default().fg(ACCENT),
-            ),
-            Span::styled(
-                opt.clone(),
-                Style::default()
-                    .fg(if selected { Color::White } else { Color::Rgb(160, 170, 190) })
-                    .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
-            ),
-        ]))
-    }).collect();
+    if app.clarification_typing {
+        let typing_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(0),
+            ])
+            .split(chunks[1]);
 
-    let mut state = ListState::default();
-    state.select(Some(app.clarification_cursor));
+        let input_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(ACCENT))
+            .title(Span::styled(" Type custom answer ", Style::default().fg(ACCENT)));
+        let inner_input = input_block.inner(typing_chunks[0]);
+        f.render_widget(input_block, typing_chunks[0]);
 
-    f.render_stateful_widget(
-        List::new(items)
-            .highlight_style(Style::default().bg(Color::Rgb(25, 35, 58))),
-        chunks[1],
-        &mut state,
-    );
+        let cursor_screen_pos = inner_input.x + app.cursor_pos as u16;
+        f.render_widget(
+            Paragraph::new(app.input.as_str())
+                .style(Style::default().fg(Color::White)),
+            inner_input,
+        );
+        f.set_cursor(cursor_screen_pos.min(inner_input.x + inner_input.width - 1), inner_input.y);
 
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" ↑↓ ", Style::default().fg(ACCENT)),
-            Span::styled("select  ", Style::default().fg(DIM)),
-            Span::styled("Enter ", Style::default().fg(ACCENT)),
-            Span::styled("confirm  ", Style::default().fg(DIM)),
-            Span::styled("Esc ", Style::default().fg(ACCENT)),
-            Span::styled("cancel", Style::default().fg(DIM)),
-        ])),
-        chunks[2],
-    );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" Enter ", Style::default().fg(ACCENT)),
+                Span::styled("submit  ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(ACCENT)),
+                Span::styled("back to list", Style::default().fg(DIM)),
+            ])),
+            chunks[2],
+        );
+    } else {
+        let items: Vec<ListItem> = app.clarification_options.iter().enumerate().map(|(i, opt)| {
+            let selected = i == app.clarification_cursor;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if selected { "  ▶ " } else { "    " },
+                    Style::default().fg(ACCENT),
+                ),
+                Span::styled(
+                    opt.clone(),
+                    Style::default()
+                        .fg(if selected { Color::White } else { Color::Rgb(160, 170, 190) })
+                        .add_modifier(if selected { Modifier::BOLD } else { Modifier::empty() }),
+                ),
+            ]))
+        }).collect();
+
+        let mut state = ListState::default();
+        state.select(Some(app.clarification_cursor));
+
+        f.render_stateful_widget(
+            List::new(items)
+                .highlight_style(Style::default().bg(Color::Rgb(25, 35, 58))),
+            chunks[1],
+            &mut state,
+        );
+
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" ↑↓ ", Style::default().fg(ACCENT)),
+                Span::styled("select  ", Style::default().fg(DIM)),
+                Span::styled("Enter ", Style::default().fg(ACCENT)),
+                Span::styled("confirm  ", Style::default().fg(DIM)),
+                Span::styled("Esc ", Style::default().fg(ACCENT)),
+                Span::styled("cancel", Style::default().fg(DIM)),
+            ])),
+            chunks[2],
+        );
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

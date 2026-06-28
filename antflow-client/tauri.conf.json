@@ -3,7 +3,15 @@
   "version": "0.1.0",
   "identifier": "com.antflow.app",
   "build": {
-    "frontendDist": "src-tauri/frontend",
+    "frontendDist": "dist",
+    "beforeBuildCommand": {
+      "script": "node obfuscate.js --prod",
+      "cwd": "."
+    },
+    "beforeDevCommand": {
+      "script": "node obfuscate.js --dev",
+      "cwd": "."
+    },
     "features": ["gui"]
   },
   "app": {
@@ -26,12 +34,13 @@
         "focus": true,
         "shadow": false,
         "browserExtensionsEnabled": false,
-        "userAgent": "Mozilla/5.0 (compatible; Antflow)"
+        "userAgent": "Mozilla/5.0 (compatible; Antflow)",
+        "devtools": false
       }
     ],
     "macOSPrivateApi": true,
     "security": {
-      "csp": null,
+      "csp": "default-src 'self' tauri: asset:; script-src 'self' 'unsafe-inline' 'unsafe-eval' tauri: asset:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' tauri: asset: http://127.0.0.1:* http://localhost:* https://huggingface.co https://*.huggingface.co; img-src 'self' asset: data:;",
       "dangerousDisableAssetCspModification": true,
       "assetProtocol": {
         "enable": true,

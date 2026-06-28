@@ -22,6 +22,8 @@ use crate::executor::{self, StopFlag};
 use crate::json_utils::clean_if_json;
 use crate::redact::RedactPatterns;
 use tauri::{Emitter, Manager};
+use obfstr::obfstr;
+use chrono::Utc;
 
 pub struct ActiveSessionState {
     pub stop_flag: StopFlag,
@@ -95,6 +97,14 @@ pub struct TaskInfo {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+fn is_expired() -> bool {
+    if let Ok(ts) = obfstr!("1798761600").parse::<i64>() {
+        Utc::now().timestamp() > ts
+    } else {
+        false
+    }
+}
 
 pub async fn run(
     _cfg: AppConfig,
@@ -188,6 +198,12 @@ pub async fn run(
     tauri::Builder::default()
         .manage(state)
         .on_window_event(|window, event| {
+            if window.label() == "expired" {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    std::process::exit(0);
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<AppState>();
                 let mut run_bg = true;
@@ -205,11 +221,92 @@ pub async fn run(
             }
         })
         .setup(|app| {
-            if let Some(w) = app.get_webview_window("main") {
+            if is_expired() {
+                let _ = tauri::WebviewWindowBuilder::new(
+                    app,
+                    "expired",
+                    tauri::WebviewUrl::App("expired.html".into())
+                )
+                .title("Update Required")
+                .resizable(false)
+                .inner_size(420.0, 200.0)
+                .build();
+
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.close();
+                }
+            } else if let Some(w) = app.get_webview_window("main") {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 {
-                    let _ = w.set_shadow(false);
-                    let _ = w.set_maximizable(false);
+                    let _ = w.set_shadow(true);
+                    let _ = w.set_maximizable(true);
+
+                    let w_clone = w.clone();
+                    w.on_window_event(move |event| {
+                        if let tauri::WindowEvent::DragDrop(drag_drop_event) = event {
+                            match drag_drop_event {
+                                tauri::DragDropEvent::Over { .. } => {
+                                    let _ = w_clone.emit("drag-over", ());
+                                }
+                                tauri::DragDropEvent::Drop { paths, .. } => {
+                                    let paths_str: Vec<String> = paths.iter()
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .collect();
+                                    let _ = w_clone.emit("drag-drop", paths_str);
+                                }
+                                tauri::DragDropEvent::Leave => {
+                                    let _ = w_clone.emit("drag-leave", ());
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
+
+                    let app_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state = app_handle.state::<AppState>();
+                        let storage_dir = state.storage_dir.lock().await.clone();
+                        let cfg = state.cfg.lock().await.clone();
+                        
+                        let has_local_model = !cfg.localai_models.chat.is_empty()
+                            || !cfg.localai_models.listening.is_empty()
+                            || !cfg.localai_models.speaking.is_empty()
+                            || !cfg.localai_models.images.is_empty()
+                            || !cfg.localai_models.video.is_empty()
+                            || !cfg.localai_models.music.is_empty();
+                            
+                        if has_local_model && crate::ai::localai::is_installed(&storage_dir).await {
+                            let _ = crate::ai::localai::start_server(&storage_dir).await;
+                        }
+                    });
+
+                    #[cfg(target_os = "windows")]
+                    {
+                        use windows_sys::Win32::UI::WindowsAndMessaging::{
+                            SetWindowLongPtrW, SetWindowLongW, GWLP_WNDPROC, GWL_WNDPROC
+                        };
+                        if let Ok(hwnd_wrapper) = w.hwnd() {
+                            let hwnd = hwnd_wrapper.0 as windows_sys::Win32::Foundation::HWND;
+                            unsafe {
+                                #[cfg(target_pointer_width = "64")]
+                                {
+                                    ORIGINAL_WNDPROC = Some(std::mem::transmute(SetWindowLongPtrW(
+                                        hwnd,
+                                        GWLP_WNDPROC,
+                                        custom_wndproc as *const () as isize,
+                                    )));
+                                }
+                                #[cfg(target_pointer_width = "32")]
+                                {
+                                    ORIGINAL_WNDPROC = Some(std::mem::transmute(SetWindowLongW(
+                                        hwnd,
+                                        GWL_WNDPROC,
+                                        custom_wndproc as *const () as i32,
+                                    )));
+                                }
+                            }
+                        }
+                    }
 
                     // Load and set window icon programmatically to bypass Windows taskbar cache
                     let icon_bytes = include_bytes!("../icons/icon.png");
@@ -250,6 +347,8 @@ pub async fn run(
             set_always_on_top,
             close_window,
             minimize_window,
+            set_shadow_enabled,
+            set_window_theme,
             start_dragging,
             is_ollama_installed,
             toggle_maximize,
@@ -294,6 +393,7 @@ pub async fn run(
             switch_localai_model,
             save_localai_voice,
             get_localai_voices,
+            synthesize_text_to_speech,
             verify_api_key,
             search_online_models,
             show_window,
@@ -303,6 +403,7 @@ pub async fn run(
             start_voice_session,
             stop_voice_session,
             send_voice_chunk,
+            transcribe_audio_chunk,
             is_window_maximized,
             is_mobile,
             open_app_settings,
@@ -310,6 +411,7 @@ pub async fn run(
             open_assistant_settings,
             check_mobile_permissions,
             request_mobile_notification_permission,
+            request_mobile_microphone_permission,
             open_mobile_notification_settings,
             get_mobile_audio_devices,
             enter_pip_mode,
@@ -318,6 +420,7 @@ pub async fn run(
             cancel_mobile_local_ai_download,
             get_mobile_local_ai_download_progress,
             read_local_model_file,
+            read_file_for_attachment,
         ])
         .run(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri error: {}", e))?;
@@ -325,11 +428,35 @@ pub async fn run(
     Ok(())
 }
 
+pub fn is_creator_query(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("creo")
+        || t.contains("crear")
+        || t.contains("creado")
+        || t.contains("creador")
+        || t.contains("create")
+        || t.contains("creator")
+        || t.contains("who made")
+        || t.contains("quien eres")
+        || t.contains("quién eres")
+        || t.contains("who are you")
+        || t.contains("author")
+        || t.contains("autor")
+        || t.contains("nombre")
+        || t.contains("name")
+        || t.contains("desarrollador")
+        || t.contains("desarrollo")
+        || t.contains("desarrolló")
+        || t.contains("developed")
+        || t.contains("developer")
+        || t.contains("maker")
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn get_language_instruction(system_language: &str) -> Option<String> {
+pub fn get_language_instruction(system_language: &str) -> Option<String> {
     let (is_auto, base_lang) = if system_language.starts_with("auto:") {
         (true, system_language.trim_start_matches("auto:").to_string())
     } else if system_language == "auto" {
@@ -916,6 +1043,39 @@ async fn minimize_window(app_handle: tauri::AppHandle) -> std::result::Result<()
 }
 
 #[tauri::command(rename_all = "snake_case")]
+async fn set_shadow_enabled(
+    app_handle: tauri::AppHandle,
+    enabled: bool,
+) -> std::result::Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if let Some(w) = app_handle.get_webview_window("main") {
+            let _ = w.set_shadow(enabled);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn set_window_theme(
+    theme: String,
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<(), String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if let Some(w) = app_handle.get_webview_window("main") {
+            let tauri_theme = match theme.as_str() {
+                "light" => Some(tauri::Theme::Light),
+                "dark" => Some(tauri::Theme::Dark),
+                _ => None,
+            };
+            let _ = w.set_theme(tauri_theme);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "snake_case")]
 async fn start_dragging(app_handle: tauri::AppHandle) -> std::result::Result<(), String> {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
@@ -1017,9 +1177,63 @@ async fn open_assistant_settings() -> std::result::Result<(), String> {
 
 
 #[cfg(target_os = "windows")]
+static mut ORIGINAL_WNDPROC: Option<unsafe extern "system" fn(windows_sys::Win32::Foundation::HWND, u32, usize, isize) -> isize> = None;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn custom_wndproc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use windows_sys::Win32::Foundation::RECT;
+
+    if msg == WM_NCHITTEST {
+        let x = (lparam & 0xffff) as i16;
+        let y = ((lparam >> 16) & 0xffff) as i16;
+
+        let mut rect: RECT = std::mem::zeroed();
+        if GetWindowRect(hwnd, &mut rect) != 0 {
+            let width = rect.right - rect.left;
+            let height = rect.bottom - rect.top;
+            
+            let pt_x = x as i32 - rect.left;
+            let pt_y = y as i32 - rect.top;
+
+            // Restored/maximized window mode check
+            if height > 200 && pt_y >= 0 && pt_y <= 32 {
+                // Close button: width - 46 to width
+                if pt_x >= width - 46 && pt_x < width {
+                    return HTCLOSE as isize;
+                }
+                // Maximize/Restore button: width - 92 to width - 46
+                if pt_x >= width - 92 && pt_x < width - 46 {
+                    return HTMAXBUTTON as isize;
+                }
+                // Minimize button: width - 138 to width - 92
+                if pt_x >= width - 138 && pt_x < width - 92 {
+                    return HTMINBUTTON as isize;
+                }
+                // Drag caption area: pt.x < width - 138
+                if pt_x < width - 138 {
+                    return HTCAPTION as isize;
+                }
+            }
+        }
+    }
+
+    if let Some(orig) = ORIGINAL_WNDPROC {
+        orig(hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn set_restore_dimensions(w: &tauri::WebviewWindow, width: f64, height: f64) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowPlacement, SetWindowPlacement, WINDOWPLACEMENT
+        GetWindowPlacement, SetWindowPlacement, WINDOWPLACEMENT, GetWindowRect
     };
     if let Ok(hwnd_wrapper) = w.hwnd() {
         let hwnd = hwnd_wrapper.0 as *mut std::ffi::c_void;
@@ -1860,6 +2074,9 @@ async fn switch_localai_model(
 
     if !model_name.is_empty() && crate::ai::localai::is_installed(&storage_dir).await {
         let _ = crate::ai::localai::start_server(&storage_dir).await;
+        if category == "images" {
+            let _ = crate::ai::localai::repair_model_yaml(&storage_dir, &model_name);
+        }
     }
 
     Ok(())
@@ -1877,6 +2094,31 @@ async fn save_localai_voice(
     *state.cfg.lock().await = cfg;
     Ok(())
 }
+
+#[tauri::command(rename_all = "snake_case")]
+async fn synthesize_text_to_speech(
+    text: String,
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<String, String> {
+    let cfg = state.cfg.lock().await.clone();
+    let (provider_id, api_key) = (
+        cfg.ai.provider.clone(),
+        cfg.ai.api_key.clone(),
+    );
+
+    match crate::voice::synthesize_tts(&text, &provider_id, &api_key, &app_handle).await {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return Err("Empty audio returned".to_string());
+            }
+            let b64 = crate::voice::base64_encode(&bytes);
+            Ok(b64)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 
 #[tauri::command(rename_all = "snake_case")]
 async fn install_ollama(
@@ -2246,13 +2488,34 @@ async fn run_chat(
     let cfg = state.cfg.lock().await.clone();
     let provider = crate::ai::provider_for_config(&cfg.ai);
     let mut history = state.history.lock().await.clone();
-    history.push(crate::ai::ChatMessage::text("user", &prompt));
+
+    // Inject system prompt first
+    let device_info = state.device_info.clone();
+    let vision_capable = cfg.ai.vision_capable;
+    let system_prompt = crate::prompt::build_system_prompt_with_vision(&device_info, vision_capable, Some(&prompt));
+    history.insert(0, crate::ai::ChatMessage::text("system", &system_prompt));
 
     // Dynamic system language injection
     let lang = system_language.unwrap_or_else(|| "auto".to_string());
     if let Some(lang_instruction) = get_language_instruction(&lang) {
-        history.insert(0, crate::ai::ChatMessage::text("system", &lang_instruction));
+        history.insert(1, crate::ai::ChatMessage::text("system", &lang_instruction));
     }
+
+    let mut final_prompt = prompt.clone();
+    if is_creator_query(&prompt) {
+        final_prompt = format!(
+            "[System Reminder: You are Antflow, a helpful AI assistant. You were created by engineer Jeison Roblero in Antflow labs. You must reply conforming to this identity. Never say you were created by Google, OpenAI, or anyone else. State clearly that you were created by engineer Jeison Roblero in Antflow labs. Respond strictly in the language of the user's query.]\nUser Query: {}",
+            prompt
+        );
+    }
+
+    let parsed_prompt: serde_json::Value = serde_json::from_str(&final_prompt)
+        .unwrap_or_else(|_| serde_json::Value::String(final_prompt.clone()));
+
+    history.push(crate::ai::ChatMessage {
+        role: "user".to_string(),
+        content: parsed_prompt,
+    });
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
     let app = app_handle.clone();
@@ -3076,9 +3339,10 @@ async fn get_context_tokens(
 
 #[tauri::command(rename_all = "snake_case")]
 async fn start_voice_session(
+    preferred_language: Option<String>,
     app_handle: tauri::AppHandle,
 ) -> std::result::Result<(), String> {
-    crate::voice::start_session(app_handle).await.map_err(|e| e.to_string())
+    crate::voice::start_session(app_handle, preferred_language).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3091,6 +3355,32 @@ async fn send_voice_chunk(
     chunk: String,
 ) -> std::result::Result<(), String> {
     crate::voice::receive_chunk(chunk).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn transcribe_audio_chunk(
+    chunk: String,
+    preferred_language: Option<String>,
+    app_handle: tauri::AppHandle,
+) -> std::result::Result<String, String> {
+    let raw_bytes = match crate::voice::base64_decode(&chunk) {
+        Some(b) => b,
+        None => return Err("Invalid base64 chunk".to_string()),
+    };
+
+    if raw_bytes.len() % 2 != 0 {
+        return Err("Odd bytes length".to_string());
+    }
+
+    let mut samples = Vec::with_capacity(raw_bytes.len() / 2);
+    for c in raw_bytes.chunks_exact(2) {
+        let sample = i16::from_le_bytes([c[0], c[1]]);
+        samples.push(sample);
+    }
+
+    crate::voice::transcribe_samples(&app_handle, samples, preferred_language)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -3159,6 +3449,20 @@ async fn request_mobile_notification_permission() -> std::result::Result<(), Str
     {
         use std::sync::atomic::Ordering;
         PENDING_ACTION.store(10, Ordering::Relaxed);
+        Ok(())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(())
+    }
+}
+
+#[tauri::command(rename_all = "snake_case")]
+async fn request_mobile_microphone_permission() -> std::result::Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        use std::sync::atomic::Ordering;
+        PENDING_ACTION.store(12, Ordering::Relaxed);
         Ok(())
     }
     #[cfg(not(target_os = "android"))]
@@ -3428,10 +3732,38 @@ async fn read_local_model_file(
     let local_data = app_handle.path().app_local_data_dir()
         .map_err(|e| e.to_string())?;
     
-    // Resolve: app_local_data_dir/llama_model/filename
-    let path = local_data.join("llama_model").join(&filename);
+    let mut path = local_data.join("llama_model").join(&filename);
+    
+    #[cfg(target_os = "android")]
+    {
+        if !path.exists() {
+            if let Some(parent) = local_data.parent() {
+                // Check if it's in the parent directory (e.g. if local_data is /data/.../files/package_id)
+                let alt_path = parent.join("llama_model").join(&filename);
+                if alt_path.exists() {
+                    path = alt_path;
+                } else {
+                    // Check if parent directory has a 'files' subdirectory (e.g. if local_data is /data/.../cache)
+                    let alt_path2 = parent.join("files").join("llama_model").join(&filename);
+                    if alt_path2.exists() {
+                        path = alt_path2;
+                    } else if let Some(grandparent) = parent.parent() {
+                        // Check grandparent's 'files' subdirectory
+                        let alt_path3 = grandparent.join("files").join("llama_model").join(&filename);
+                        if alt_path3.exists() {
+                            path = alt_path3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
     if !path.exists() {
-        return Err(format!("Local file '{}' not found in cache", filename));
+        return Err(format!(
+            "Local file '{}' not found in cache (resolved path: {:?})", 
+            filename, path
+        ));
     }
     
     std::fs::read(&path).map_err(|e| e.to_string())
@@ -3486,6 +3818,76 @@ pub fn update_app_icon(app_handle: &tauri::AppHandle, executing: bool) {
             }
         }
     }
+}
+
+#[derive(serde::Serialize)]
+pub struct AttachmentInfo {
+    pub name: String,
+    pub mime_type: String,
+    pub content: String,
+    pub is_image: bool,
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub async fn read_file_for_attachment(path: String) -> std::result::Result<AttachmentInfo, String> {
+    let path_buf = std::path::PathBuf::from(&path);
+    let name = path_buf.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    
+    let content_bytes = std::fs::read(&path_buf)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+        
+    let ext = path_buf.extension()
+        .map(|e| e.to_string_lossy().to_string().to_lowercase())
+        .unwrap_or_default();
+        
+    let mime_type = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "js" => "text/javascript",
+        "ts" => "text/typescript",
+        "py" => "text/x-python",
+        "rs" => "text/rust",
+        "go" => "text/x-go",
+        "c" => "text/x-c",
+        "cpp" => "text/x-c++",
+        "h" => "text/x-h",
+        "css" => "text/css",
+        "html" => "text/html",
+        "json" => "application/json",
+        "yaml" | "yml" => "text/yaml",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "toml" => "text/toml",
+        _ => "application/octet-stream"
+    };
+    
+    let is_image = mime_type.starts_with("image/");
+    let is_text = mime_type.starts_with("text/") || 
+                  matches!(ext.as_str(), "json" | "toml" | "xml" | "yaml" | "yml");
+                  
+    let content = if is_text {
+        match String::from_utf8(content_bytes.clone()) {
+            Ok(s) => s,
+            Err(_) => crate::screenshot::to_base64(&content_bytes)
+        }
+    } else {
+        crate::screenshot::to_base64(&content_bytes)
+    };
+    
+    Ok(AttachmentInfo {
+        name,
+        mime_type: mime_type.to_string(),
+        content,
+        is_image,
+    })
 }
 
 

@@ -396,6 +396,8 @@ const state = {
   ttsStreamFinished: false,
   selectedGgufPath: null,
   selectedGgufName: '',
+  currentModelCategory: null,
+  currentSettingsCategory: null,
   windowAiAvailable: false,
   finalTranscript: '',
   forceExpanded: false,
@@ -2229,6 +2231,7 @@ function cleanTextForSpeech(text) {
 
 let ttsSafetyTimeout = null;
 let ttsKeepAliveInterval = null;
+let localTtsTimeout = null;
 
 function splitTextIntoSpeechChunks(text, maxLength) {
   if (text.length <= maxLength) return [text];
@@ -2290,7 +2293,8 @@ function handleSpeakBtnClick(btn, text) {
 }
 
 function speakText(text) {
-  if (!window.speechSynthesis) return;
+  const localVoiceActive = !!(state.cfg?.localai_models?.speaking);
+  if (!window.speechSynthesis && !localVoiceActive) return;
   cancelTtsQueue();
   
   state.ttsActiveText = text;
@@ -2313,7 +2317,8 @@ function speakText(text) {
 }
 
 function queueSentenceToSpeak(sentence) {
-  if (!window.speechSynthesis) return;
+  const localVoiceActive = !!(state.cfg?.localai_models?.speaking);
+  if (!window.speechSynthesis && !localVoiceActive) return;
   const clean = cleanTextForSpeech(sentence);
   if (!clean) return;
 
@@ -2330,12 +2335,16 @@ function queueSentenceToSpeak(sentence) {
 }
 
 function speakNextQueueItem() {
-  if (!window.speechSynthesis) return;
-
   if (ttsSafetyTimeout) {
     clearTimeout(ttsSafetyTimeout);
     ttsSafetyTimeout = null;
   }
+  if (localTtsTimeout) {
+    clearTimeout(localTtsTimeout);
+    localTtsTimeout = null;
+  }
+
+  const localVoiceActive = !!(state.cfg?.localai_models?.speaking);
 
   if (state.ttsQueue.length === 0) {
     if (ttsKeepAliveInterval) {
@@ -2361,6 +2370,47 @@ function speakNextQueueItem() {
   state.ttsSpeaking = true;
   state.currentSpokenText = text;
   state.accumulatedSpokenText += ' ' + text;
+
+  if (localVoiceActive) {
+    updateAllTtsButtons();
+    state.voiceState = 'speaking';
+    updateVoiceVisuals('speaking');
+    state.finalTranscript = '';
+    if (state.listening && recognition) {
+      try { recognition.stop(); } catch(_) {}
+    }
+
+    invoke('synthesize_text_to_speech', { text })
+      .then(async (b64Audio) => {
+        if (!b64Audio) {
+          state.ttsSpeaking = false;
+          speakNextQueueItem();
+          return;
+        }
+
+        if (!botAudioPlayer) {
+          botAudioPlayer = new AudioStreamPlayer();
+        }
+        await botAudioPlayer.init();
+
+        const duration = await botAudioPlayer.playChunk(b64Audio);
+        const playTimeMs = (duration || 0) * 1000;
+
+        localTtsTimeout = setTimeout(() => {
+          localTtsTimeout = null;
+          state.ttsSpeaking = false;
+          speakNextQueueItem();
+        }, playTimeMs + 100);
+      })
+      .catch((err) => {
+        console.error("Local TTS synthesis failed:", err);
+        state.ttsSpeaking = false;
+        speakNextQueueItem();
+      });
+    return;
+  }
+
+  if (!window.speechSynthesis) return;
 
   const utterance = new SpeechSynthesisUtterance(text);
   utterance.lang = detectLanguage(text);
@@ -2435,6 +2485,13 @@ function speakNextQueueItem() {
 function cancelTtsQueue() {
   if (window.speechSynthesis) {
     try { window.speechSynthesis.cancel(); } catch(_) {}
+  }
+  if (botAudioPlayer) {
+    try { botAudioPlayer.stop(); } catch(_) {}
+  }
+  if (localTtsTimeout) {
+    clearTimeout(localTtsTimeout);
+    localTtsTimeout = null;
   }
   state.ttsQueue = [];
   state.ttsActiveUtterance = null;
@@ -2620,10 +2677,13 @@ function createMediaSkeletonLoader(type, prompt) {
             <div class="media-skeleton-title">Generating local ${typeLabel}...</div>
             <div class="media-skeleton-desc">Creating AI synthesis, this may take a moment.</div>
           </div>
+          <div class="media-skeleton-percent hidden">0%</div>
         </div>
         <div class="media-skeleton-body">
-          ${loaderVisual}
-          <div class="media-skeleton-prompt">"${escHtml(prompt)}"</div>
+          <div class="media-skeleton-body-content">
+            ${loaderVisual}
+            <div class="media-skeleton-prompt">"${escHtml(prompt)}"</div>
+          </div>
         </div>
         <div class="media-skeleton-progress-container">
           <div class="media-skeleton-progress-line"></div>
@@ -2657,29 +2717,64 @@ function createThinkingElement(secs, stepsList) {
   
   const stepsContainer = el.querySelector(`#${uniqueId}-steps`);
   if (Array.isArray(stepsList)) {
+    const mediaChips = {};
     stepsList.forEach(step => {
-      const chip = document.createElement('div');
-      chip.className = 'think-step-chip';
-      
-      if (step.startsWith('JSON_SEARCH:')) {
-        try {
-          const payload = JSON.parse(step.substring(12));
-          chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
-          renderRichMediaInElement(chip);
-        } catch(_) {
-          chip.textContent = step;
-        }
-      } else if (step.startsWith('JSON_MEDIA_GEN:')) {
+      if (step.startsWith('JSON_MEDIA_GEN:')) {
         try {
           const payload = JSON.parse(step.substring(15));
-          chip.innerHTML = `<span style="color:var(--accent); font-weight:600">Generating ${payload.type}:</span> <span style="font-style:italic">"${escHtml(payload.prompt)}"</span>`;
+          mediaChips[payload.type] = payload;
+        } catch(_) {}
+      }
+    });
+
+    stepsList.forEach(step => {
+      if (step.startsWith('JSON_MEDIA_GEN:')) {
+        try {
+          const payload = JSON.parse(step.substring(15));
+          if (mediaChips[payload.type]) {
+            const latestPayload = mediaChips[payload.type];
+            delete mediaChips[payload.type];
+
+            const chip = document.createElement('div');
+            chip.className = 'think-step-chip';
+            chip.dataset.mediaType = latestPayload.type;
+
+            let statusStr = '';
+            if (latestPayload.status === 'progress') {
+              statusStr = ` - Step ${latestPayload.step}/${latestPayload.total_steps} (${latestPayload.percent}%)`;
+            } else if (latestPayload.status === 'complete') {
+              statusStr = ' - Complete';
+            } else if (latestPayload.status === 'failed') {
+              statusStr = ' - Failed';
+            } else if (latestPayload.message) {
+              statusStr = ` - ${latestPayload.message}`;
+            }
+
+            chip.innerHTML = `<span style="color:var(--accent); font-weight:600">Generating ${latestPayload.type}:</span> <span style="font-style:italic">"${escHtml(latestPayload.prompt)}"</span><span class="media-chip-status" style="opacity: 0.8; font-size: 11px;">${statusStr}</span>`;
+            stepsContainer.appendChild(chip);
+          }
         } catch(_) {
+          const chip = document.createElement('div');
+          chip.className = 'think-step-chip';
           chip.textContent = step;
+          stepsContainer.appendChild(chip);
         }
       } else {
-        chip.textContent = step;
+        const chip = document.createElement('div');
+        chip.className = 'think-step-chip';
+        if (step.startsWith('JSON_SEARCH:')) {
+          try {
+            const payload = JSON.parse(step.substring(12));
+            chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
+            renderRichMediaInElement(chip);
+          } catch(_) {
+            chip.textContent = step;
+          }
+        } else {
+          chip.textContent = step;
+        }
+        stepsContainer.appendChild(chip);
       }
-      stepsContainer.appendChild(chip);
     });
   }
   
@@ -2770,6 +2865,7 @@ function createMessageElement(text, role = 'assistant') {
 
   let displayWord = text;
   let userImages = [];
+  let userFiles = [];
 
   if (role === 'user' && typeof text === 'string') {
     let trimmed = text.trim();
@@ -2783,8 +2879,20 @@ function createMessageElement(text, role = 'assistant') {
               textParts.push(part.text);
             } else if (part.type === 'image_url') {
               if (part.image_url && part.image_url.url) {
-                userImages.push(part.image_url.url);
+                userImages.push({
+                  name: part.name || 'image.png',
+                  type: 'image/png',
+                  url: part.image_url.url
+                });
               }
+            } else if (part.type === 'file') {
+              userFiles.push({
+                name: part.name,
+                type: part.mime || part.type || 'application/octet-stream',
+                path: part.path || '',
+                dataUrl: part.dataUrl || null,
+                content: part.content || ''
+              });
             }
           });
           displayWord = textParts.join('\n');
@@ -2857,30 +2965,57 @@ function createMessageElement(text, role = 'assistant') {
     textNode.className = 'user-msg-text';
     textNode.textContent = displayWord;
     bubble.innerHTML = '';
-    bubble.appendChild(textNode);
-
-    if (userImages.length > 0) {
-      const gallery = document.createElement('div');
-      gallery.className = 'user-msg-gallery';
-      userImages.forEach(imgUrl => {
+    
+    if (userImages.length > 0 || userFiles.length > 0) {
+      const attachmentsArea = document.createElement('div');
+      attachmentsArea.className = 'msg-attachments-area';
+      
+      userImages.forEach(img => {
         const imgContainer = document.createElement('div');
         imgContainer.className = 'user-msg-img-container';
         
-        const img = document.createElement('img');
-        img.src = imgUrl;
-        img.className = 'user-msg-img';
-        img.alt = 'Attached Image';
+        const imgEl = document.createElement('img');
+        imgEl.src = img.url;
+        imgEl.className = 'user-msg-img';
+        imgEl.alt = img.name;
         
-        img.addEventListener('click', (e) => {
+        imgEl.addEventListener('click', (e) => {
           e.stopPropagation();
-          openLightbox(imgUrl);
+          openGalleryPreview(img.name, 'image', img.url);
         });
         
-        imgContainer.appendChild(img);
-        gallery.appendChild(imgContainer);
+        imgContainer.appendChild(imgEl);
+        attachmentsArea.appendChild(imgContainer);
       });
-      bubble.appendChild(gallery);
+
+      userFiles.forEach(file => {
+        const fileChip = document.createElement('div');
+        fileChip.className = 'user-msg-file-chip';
+        
+        let iconHtml = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
+        
+        fileChip.innerHTML = `
+          ${iconHtml}
+          <span class="file-chip-name" title="${escAttr(file.name)}">${escHtml(file.name)}</span>
+        `;
+        
+        fileChip.addEventListener('click', (e) => {
+          e.stopPropagation();
+          let previewType = 'file';
+          let previewData = file.content;
+          if (file.type.startsWith('text/') || /\.(txt|js|ts|py|rs|go|c|cpp|h|css|html|json|yaml|yml|md|csv|ini|toml|sh|bat|ps1|conf)$/i.test(file.name)) {
+            previewType = 'text';
+          }
+          openGalleryPreview(file.name, previewType, previewData, file.type);
+        });
+        
+        attachmentsArea.appendChild(fileChip);
+      });
+
+      bubble.appendChild(attachmentsArea);
     }
+
+    bubble.appendChild(textNode);
   }
   el.appendChild(bubble);
 
@@ -3343,6 +3478,10 @@ window.obChooseMobileBuiltIn = async function() {
 };
 
 function addMsgStream(role = 'assistant') {
+  // Reset per-message TTS tracking — otherwise stale state from the previous
+  // reply causes live speech to skip or cut off early starting on turn 2+.
+  state.ttsProcessedIndex = 0;
+  state.ttsStreamFinished = false;
   const el = document.createElement('div');
   el.className = `msg ${role}`;
   const bubble = document.createElement('div');
@@ -3593,7 +3732,58 @@ function updateThinkingLabel(msg) {
   }
   
   if (steps && msg) {
-    // Check if the last step chip has the same message to avoid duplicates
+    if (msg.startsWith('JSON_MEDIA_GEN:')) {
+      try {
+        const payload = JSON.parse(msg.substring(15));
+        let existingChip = steps.querySelector(`.think-step-chip[data-media-type="${payload.type}"]`);
+
+        let statusStr = '';
+        if (payload.status === 'progress') {
+          statusStr = ` - Step ${payload.step}/${payload.total_steps} (${payload.percent}%)`;
+        } else if (payload.status === 'complete') {
+          statusStr = ' - Complete';
+        } else if (payload.status === 'failed') {
+          statusStr = ' - Failed';
+        } else if (payload.message) {
+          statusStr = ` - ${payload.message}`;
+        }
+
+        const html = `<span style="color:var(--accent); font-weight:600">Generating ${payload.type}:</span> <span style="font-style:italic">"${escHtml(payload.prompt)}"</span><span class="media-chip-status" style="opacity: 0.8; font-size: 11px;">${statusStr}</span>`;
+
+        if (existingChip) {
+          existingChip.innerHTML = html;
+          if (!state.thinkingSteps) {
+            state.thinkingSteps = [];
+          }
+          const idx = state.thinkingSteps.findIndex(s => {
+            if (!s.startsWith('JSON_MEDIA_GEN:')) return false;
+            try {
+              return JSON.parse(s.substring(15)).type === payload.type;
+            } catch(_) { return false; }
+          });
+          if (idx !== -1) {
+            state.thinkingSteps[idx] = msg;
+          } else {
+            state.thinkingSteps.push(msg);
+          }
+          return;
+        }
+
+        const chip = document.createElement('div');
+        chip.className = 'think-step-chip';
+        chip.dataset.mediaType = payload.type;
+        chip.innerHTML = html;
+        steps.appendChild(chip);
+        steps.scrollTop = steps.scrollHeight;
+
+        if (!state.thinkingSteps) {
+          state.thinkingSteps = [];
+        }
+        state.thinkingSteps.push(msg);
+        return;
+      } catch(_) {}
+    }
+
     const lastChip = steps.lastElementChild;
     if (lastChip && lastChip.textContent.trim() === msg.trim()) {
       return;
@@ -3606,13 +3796,6 @@ function updateThinkingLabel(msg) {
         const payload = JSON.parse(msg.substring(12));
         chip.innerHTML = formatSearchWidget(payload.query, payload.results, payload.images);
         renderRichMediaInElement(chip);
-      } catch(_) {
-        chip.textContent = msg;
-      }
-    } else if (msg.startsWith('JSON_MEDIA_GEN:')) {
-      try {
-        const payload = JSON.parse(msg.substring(15));
-        chip.innerHTML = `<span style="color:var(--accent); font-weight:600">Generating ${payload.type}:</span> <span style="font-style:italic">"${escHtml(payload.prompt)}"</span>`;
       } catch(_) {
         chip.textContent = msg;
       }
@@ -3738,49 +3921,79 @@ async function sendMessage(text) {
     return;
   }
 
-  const images = state.attachments ? state.attachments.filter(att => att.type.startsWith('image/')) : [];
-  if (images.length > 0 && !state.cfg.ai?.vision_capable) {
-    toast('Warning: Selected model may not support images. Trying anyway...', 3000);
-  }
-
   // Format prompt for sending
   let promptText = inputPrompt;
-  if (state.attachments) {
-    state.attachments.filter(att => !att.type.startsWith('image/')).forEach(att => {
-      promptText += `\n\n### File: ${att.name}\n\`\`\`\n${att.content}\n\`\`\``;
-    });
+  if (!promptText && hasAttachments) {
+    promptText = `Please analyze the attached file(s).`;
   }
 
-  let promptPayload;
-  if (images.length > 0) {
-    const parts = [
-      { type: 'text', text: promptText }
-    ];
-    images.forEach(img => {
-      const dataUrl = `data:${img.type};base64,${img.content}`;
-      parts.push({
-        type: 'image_url',
-        image_url: {
-          url: dataUrl
+  // Build JSON parts payload
+  const parts = [
+    { type: 'text', text: promptText }
+  ];
+  
+  // Build system note and attachment metadata separately to keep user bubble text clean
+  let systemNote = "";
+  if (state.attachments && state.attachments.length > 0) {
+    systemNote += `\n\n[System Note: The user may reference the attached files inline in their message using '@filename' (e.g. '@${state.attachments[0].name}'). These '@' references correspond directly to the file attachments detailed in the blocks below.]`;
+    
+    state.attachments.forEach(att => {
+      const isImage = att.type.startsWith('image/');
+      const isText = att.type.startsWith('text/') || /\.(txt|js|ts|py|rs|go|c|cpp|h|css|html|json|yaml|yml|md|csv|ini|toml|sh|bat|ps1|conf)$/i.test(att.name);
+      
+      systemNote += `\n\n### Attached File: ${att.name}`;
+      if (att.path) {
+        systemNote += `\nPath: ${att.path}`;
+      }
+      systemNote += `\nType: ${att.type}`;
+      
+      if (isImage) {
+        if (state.cfg.ai?.vision_capable) {
+          systemNote += `\n(Sent natively as image payload to your vision system)`;
+        } else {
+          systemNote += `\nWarning: Vision is disabled or not supported natively. You MUST use your internal tools (like reading the file, or taking screenshot/running script) to inspect it if possible.`;
         }
-      });
+      } else if (isText) {
+        if (att.content && att.content.length < 50000) {
+          systemNote += `\nContent:\n\`\`\`\n${att.content}\n\`\`\``;
+        } else {
+          systemNote += `\nContent is too large to inline. You MUST use the \`read_file\` tool to read this file.`;
+        }
+      } else {
+        systemNote += `\nThis is a binary file. You MUST use your internal tools (such as the \`read_file\` tool, command line tools, or running a python script) to inspect and parse its contents. Do not assume or hallucinate the content without using your tools first.`;
+      }
     });
-    promptPayload = JSON.stringify(parts);
-  } else {
-    promptPayload = promptText;
   }
 
-  // Add message to chat list
-  let chatBubbleText = inputPrompt;
-  if (images.length > 0) {
-    chatBubbleText += `\n[Attached ${images.length} image(s)]`;
+  if (systemNote) {
+    parts.push({ type: 'system_note', text: systemNote });
   }
+  
   if (state.attachments) {
-    const textAtts = state.attachments.filter(att => !att.type.startsWith('image/'));
-    if (textAtts.length > 0) {
-      chatBubbleText += `\n[Attached ${textAtts.length} text file(s)]`;
-    }
+    state.attachments.forEach(att => {
+      const isImage = att.type.startsWith('image/');
+      if (isImage && state.cfg.ai?.vision_capable) {
+        parts.push({
+          type: 'image_url',
+          name: att.name,
+          image_url: {
+            url: att.dataUrl
+          }
+        });
+      } else {
+        parts.push({
+          type: 'file',
+          name: att.name,
+          type: att.type,
+          path: att.path,
+          dataUrl: att.dataUrl || null,
+          content: att.content
+        });
+      }
+    });
   }
+  
+  const promptPayload = JSON.stringify(parts);
 
   // Clear inputs
   input.value = '';
@@ -4465,6 +4678,24 @@ function showMicPermissionDialog() {
 async function ensureMicPermission() {
   if (micPermissionGranted) return true;
 
+  try {
+    if (navigator.permissions && navigator.permissions.query) {
+      const permissionStatus = await navigator.permissions.query({ name: 'microphone' });
+      if (permissionStatus.state === 'granted') {
+        micPermissionGranted = true;
+        return true;
+      }
+    }
+  } catch(e) {
+    console.warn("navigator.permissions.query check failed:", e);
+  }
+
+  const allowed = await showMicPermissionDialog();
+  if (!allowed) {
+    micPermissionGranted = false;
+    return false;
+  }
+
   const startTime = Date.now();
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -4583,8 +4814,10 @@ class AudioStreamPlayer {
       };
 
       this.nextStartTime += duration;
+      return duration;
     } catch (e) {
       console.error('Error decoding audio chunk:', e);
+      return 0;
     }
   }
 
@@ -4723,9 +4956,11 @@ async function startVoiceMode() {
   updateVoiceVisuals('listening');
   startVisualizer();
 
-  // Try continuous Web Speech API SpeechRecognition
+  // Try continuous Web Speech API SpeechRecognition if no local STT model is active
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (SR) {
+  const localSttActive = !!(state.cfg?.localai_models?.listening);
+  const isTauri = !!window.__TAURI__;
+  if (SR && !localSttActive) {
     console.log("Web Speech API SpeechRecognition is supported natively!");
     recognition = new SR();
     recognition.continuous = true;
@@ -4822,8 +5057,8 @@ async function startVoiceMode() {
 
     recognition.start();
   } else {
-    // Web Speech API fallback to Rust voice session
-    console.warn("Web Speech API not supported. Falling back to Rust voice pipeline.");
+    // Fallback or explicit use of Rust voice session
+    console.log(localSttActive ? "Using local model for Speech Recognition via Rust voice pipeline." : "Web Speech API not supported. Falling back to Rust voice pipeline.");
     
     processorNode = recCtx.createScriptProcessor(2048, 1, 1);
     source.connect(processorNode);
@@ -4838,7 +5073,8 @@ async function startVoiceMode() {
     };
 
     try {
-      await invoke('start_voice_session');
+      const lang = getVoiceLanguage() || null;
+      await invoke('start_voice_session', { preferredLanguage: lang });
     } catch (e) {
       console.error('Failed to start voice session in backend:', e);
       toast('Failed to start voice session: ' + e);
@@ -5037,19 +5273,20 @@ function handleWakeWord() {
 // ── Action button logic ─────────────────────────────────────────────────
 function updateActionBtn() {
   const hasText = input.value.trim().length > 0;
+  const shortcuts = getShortcuts();
 
   if (state.thinking || state.forceStopButton) {
     actionBtn.className = 'stop';
-    actionBtn.title = 'Stop';
+    actionBtn.title = `Stop (${getFormattedShortcut(shortcuts.toggle_voice)})`;
     actionIcon.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:16px;height:16px;"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>`;
   } else if (state.listening) {
     if (state.voiceState === 'thinking' || state.voiceState === 'speaking') {
       actionBtn.className = state.voiceState;
-      actionBtn.title = 'Stop';
+      actionBtn.title = `Stop (${getFormattedShortcut(shortcuts.toggle_voice)})`;
       actionIcon.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="width:16px;height:16px;"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>`;
     } else {
       actionBtn.className = 'listening';
-      actionBtn.title = 'Stop listening';
+      actionBtn.title = `Stop listening (${getFormattedShortcut(shortcuts.toggle_voice)})`;
       actionIcon.innerHTML = `
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" style="width:18px;height:18px;">
           <path d="M12 2v20M17 5v14M7 5v14M22 9v6M2 9v6"/>
@@ -5058,11 +5295,11 @@ function updateActionBtn() {
     }
   } else if (hasText) {
     actionBtn.className = '';
-    actionBtn.title = 'Send';
+    actionBtn.title = 'Send (Enter)';
     actionIcon.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" style="width:18px;height:18px;"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>`;
   } else {
     actionBtn.className = '';
-    actionBtn.title = 'Voice input';
+    actionBtn.title = `Voice input (${getFormattedShortcut(shortcuts.toggle_voice)})`;
     actionIcon.innerHTML = `
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" style="width:18px;height:18px;">
         <path d="M12 2v20M17 5v14M7 5v14M22 9v6M2 9v6"/>
@@ -5211,12 +5448,18 @@ onDOMContentLoaded(() => {
     input.style.height = '32px';
     input.style.height = `${Math.min(input.scrollHeight, 120)}px`;
     
-    // Toggle has-input-text class to collapse model selector pill when typing (mobile only)
-    if (isMobile && input.value.trim().length > 0) {
+    // Toggle has-input-text class to collapse model selector pill when typing (all narrow viewports)
+    if ((isMobile || window.innerWidth <= 768) && input.value.trim().length > 0) {
       barShell.classList.add('has-input-text');
     } else {
       barShell.classList.remove('has-input-text');
     }
+
+
+    
+
+    
+
     
     syncWindowSize();
   });
@@ -5320,7 +5563,7 @@ async function fetchWelcomeGreeting() {
 async function syncWindowSize() {
   updateWelcomeState();
   updateCtxBar();
-  if (isMaximized) return; // Exit early if maximized!
+  if (isMaximized || document.body.classList.contains('maximized')) return; // Exit early if maximized or in workspace view!
   const hasMessages = Array.from(msgs.children).some(el => !el.classList.contains('system') && !el.classList.contains('welcome-state'));
   const hasOverlay = !!document.querySelector('.overlay.open');
   const hasOnboarding = $('onboarding')?.classList.contains('open');
@@ -5343,7 +5586,7 @@ async function syncWindowSize() {
   if (expanded) {
     document.body.classList.add('expanded');
     w = 520;
-    h = 560;
+    h = 700;
   } else if (isMouseOverBar) {
     document.body.classList.remove('expanded');
     w = 520;
@@ -5435,8 +5678,13 @@ function updateMaximizedState(isMax) {
 
   const maxGlobalBtn = $('hbtn-max-global');
   if (maxGlobalBtn) {
-    maxGlobalBtn.title = 'Restore';
-    maxGlobalBtn.innerHTML = `<svg viewBox="0 0 24 24"><rect x="4" y="9" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="9" y="4" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
+    if (isMax) {
+      maxGlobalBtn.title = 'Restore';
+      maxGlobalBtn.innerHTML = `<svg viewBox="0 0 24 24"><rect x="4" y="9" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/><rect x="9" y="4" width="11" height="11" rx="1.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
+    } else {
+      maxGlobalBtn.title = 'Maximize';
+      maxGlobalBtn.innerHTML = `<svg viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/></svg>`;
+    }
   }
 
   const tb = $('talkbar');
@@ -5451,8 +5699,14 @@ function updateMaximizedState(isMax) {
   if (isMax) {
     document.body.classList.add('maximized');
     document.body.classList.add('window-maximized');
+    localStorage.setItem('lastViewMode', 'maximized');
   } else {
-    document.body.classList.remove('maximized');
+    if (unmaximizeToCompact) {
+      document.body.classList.remove('maximized');
+      localStorage.setItem('lastViewMode', 'compact');
+    } else {
+      localStorage.setItem('lastViewMode', 'restored');
+    }
     document.body.classList.remove('window-maximized');
     syncWindowSize();
   }
@@ -5464,20 +5718,51 @@ async function toggleMaximize() {
   window._cww = null;
   window._cwh = null;
   try {
-    const nextMax = !isMaximized;
-    if (!nextMax) {
-      unmaximizeTriggeredByButton = true;
-      unmaximizeToCompact = false;
-      state.forceExpanded = true;
+    if (window.__TAURI__ && window.__TAURI__.window) {
+      const appWindow = window.__TAURI__.window.getCurrentWindow();
+      const isMax = await appWindow.isMaximized();
+      if (isMax) {
+        unmaximizeTriggeredByButton = true;
+        unmaximizeToCompact = false;
+        state.forceExpanded = true;
+        try { await invoke('set_shadow_enabled', { enabled: true }); } catch(_) {}
+        await appWindow.unmaximize();
+        try {
+          let hasSavedSize = !!localStorage.getItem('workspace_width');
+          let savedW = parseInt(localStorage.getItem('workspace_width') || '950');
+          let savedH = parseInt(localStorage.getItem('workspace_height') || '700');
+          if (savedW < 600 || savedH < 400) {
+            savedW = 950;
+            savedH = 700;
+            hasSavedSize = false;
+          }
+          await appWindow.setSize(new window.__TAURI__.dpi.LogicalSize(savedW, savedH));
+          if (!hasSavedSize) {
+            await appWindow.center();
+          }
+        } catch (e) {
+          console.error("Failed to set window size:", e);
+        }
+        updateMaximizedState(false);
+        try { await invoke('set_always_on_top', { enabled: state.pinned }); } catch(_) {}
+      } else {
+        state.forceExpanded = false;
+        try { await invoke('set_shadow_enabled', { enabled: true }); } catch(_) {}
+        await appWindow.maximize();
+        updateMaximizedState(true);
+        try { await invoke('set_always_on_top', { enabled: false }); } catch(_) {}
+      }
     } else {
-      state.forceExpanded = false;
-    }
-    await invoke('toggle_maximize', { maximize: nextMax });
-    updateMaximizedState(nextMax);
-    if (nextMax) {
-      try { await invoke('set_always_on_top', { enabled: false }); } catch(_) {}
-    } else {
-      try { await invoke('set_always_on_top', { enabled: state.pinned }); } catch(_) {}
+      // Browser fallback
+      const nextMax = !isMaximized;
+      if (!nextMax) {
+        unmaximizeTriggeredByButton = true;
+        unmaximizeToCompact = false;
+        state.forceExpanded = true;
+      } else {
+        state.forceExpanded = false;
+      }
+      updateMaximizedState(nextMax);
     }
   } catch(e) { console.error(e); }
 }
@@ -5490,6 +5775,8 @@ async function toggleCompactView() {
     unmaximizeToCompact = true;
     state.forceExpanded = false;
     closeAllOverlays();
+    localStorage.setItem('lastViewMode', 'compact');
+    try { await invoke('set_shadow_enabled', { enabled: false }); } catch(_) {}
     await invoke('toggle_maximize', { maximize: false });
     updateMaximizedState(false);
     try { await invoke('set_always_on_top', { enabled: state.pinned }); } catch(_) {}
@@ -5523,7 +5810,10 @@ function openOverlay(name) {
     }
     if (name === 'conv') renderConvList();
     if (name === 'tasks') renderTasks();
-    if (name === 'settings') renderSettings();
+    if (name === 'settings') {
+      state.currentSettingsCategory = null;
+      renderSettings();
+    }
     syncWindowSize();
     updateBackButtonVisibility();
   }
@@ -5620,7 +5910,7 @@ document.addEventListener('click', e => {
     closeAllOverlays();
   }
   // Close sidebar on mobile when clicking outside it
-  if (document.body.classList.contains('is-mobile') && isSidebarOpen) {
+  if ((document.body.classList.contains('is-mobile') || window.innerWidth <= 768) && isSidebarOpen) {
     const sidebar = $('max-sidebar');
     const toggleBtn = $('sidebar-toggle');
     if (sidebar && !sidebar.contains(e.target) && toggleBtn && !toggleBtn.contains(e.target)) {
@@ -5630,9 +5920,15 @@ document.addEventListener('click', e => {
 });
 
 function updateBackButtonVisibility() {
-  const isMobile = document.body.classList.contains('is-mobile');
+  const isMobile = document.body.classList.contains('is-mobile') || window.innerWidth <= 768;
   document.querySelectorAll('.panel-back').forEach(btn => {
-    if (isMobile) {
+    const isModelPanelBack = btn.closest('#overlay-model') !== null;
+    const isSettingsPanelBack = btn.closest('#overlay-settings') !== null;
+    if (isModelPanelBack && state.currentModelCategory) {
+      btn.style.setProperty('display', 'flex', 'important');
+    } else if (isSettingsPanelBack && state.currentSettingsCategory) {
+      btn.style.setProperty('display', 'flex', 'important');
+    } else if (isMobile) {
       btn.style.setProperty('display', 'flex', 'important');
     } else if (overlayHistory.length === 0) {
       btn.style.setProperty('display', 'none', 'important');
@@ -5791,6 +6087,7 @@ function createCustomSelect(containerEl, options, currentValue, onChange) {
   
   const trigger = document.createElement('div');
   trigger.className = 'custom-select-trigger';
+  trigger.setAttribute('tabindex', '0');
   trigger.innerHTML = `
     <span>${escHtml(selectedOpt.label)}</span>
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
@@ -5820,6 +6117,7 @@ function createCustomSelect(containerEl, options, currentValue, onChange) {
       const isSelected = opt.value === activeValue;
       const optionEl = document.createElement('div');
       optionEl.className = `custom-select-option${isSelected ? ' selected' : ''}`;
+      optionEl.setAttribute('tabindex', '0');
       optionEl.textContent = opt.label;
       optionEl.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -6029,6 +6327,87 @@ function isVisionModelName(name) {
       || lower.includes('qwen2.5vl');
 }
 
+function getModelCategories(m) {
+  const name = m.name.toLowerCase();
+  const categories = [];
+
+  // Default category from Rust backend
+  if (m.category && m.category !== 'chat') {
+    categories.push(m.category);
+  }
+
+  // Check name/keywords or properties for other categories
+  if (name.includes('kokoro') || name.includes('tts') || name.includes('speech-synthesis') || name.includes('speaking')) {
+    if (!categories.includes('speaking')) categories.push('speaking');
+  }
+  if (name.includes('whisper') || name.includes('stt') || name.includes('speech-recognition') || name.includes('listening')) {
+    if (!categories.includes('listening')) categories.push('listening');
+  }
+  if (name.includes('musicgen') || name.includes('music') || name.includes('sound')) {
+    if (!categories.includes('music')) categories.push('music');
+  }
+  if (name.includes('animatediff') || name.includes('video')) {
+    if (!categories.includes('video')) categories.push('video');
+  }
+  if (name.includes('stablediffusion') || name.includes('stable-diffusion') || name.includes('diffusion') || name.includes('flux') || name.includes('midjourney') || name.includes('dall-e') || name.includes('imagen')) {
+    if (!categories.includes('images')) categories.push('images');
+  }
+
+  // Pure media models
+  const isPureMedia = (
+    name.includes('stablediffusion') ||
+    name.includes('stable-diffusion') ||
+    name.includes('animatediff') ||
+    name.includes('kokoro') ||
+    name.includes('musicgen') ||
+    name.includes('whisper')
+  );
+
+  if (!isPureMedia || name.includes('llama') || name.includes('gemma') || name.includes('instruct') || name.includes('chat') || m.vision || categories.length === 0) {
+    if (!categories.includes('chat')) {
+      categories.unshift('chat');
+    }
+  }
+
+  return categories;
+}
+
+function handleModelPanelBack() {
+  if (state.currentModelCategory) {
+    state.currentModelCategory = null;
+    const searchEl = $('model-search');
+    if (searchEl) {
+      searchEl.value = '';
+      searchEl.placeholder = 'Search models...';
+    }
+    onlineSearchResults = [];
+    renderModelList(true);
+    updateBackButtonVisibility();
+  } else {
+    goBackOverlay('model');
+  }
+}
+window.handleModelPanelBack = handleModelPanelBack;
+
+function selectModelCategory(catId) {
+  state.currentModelCategory = catId;
+  const searchEl = $('model-search');
+  if (searchEl) {
+    const labels = {
+      chat: 'Chat & Reasoning',
+      images: 'Image Generation',
+      video: 'Video Generation',
+      music: 'Music/Sound Gen',
+      speaking: 'Speech Synthesis (TTS)',
+      listening: 'Speech Recognition (STT)'
+    };
+    searchEl.placeholder = `Search ${labels[catId] || 'models'}...`;
+  }
+  renderModelList();
+  updateBackButtonVisibility();
+}
+window.selectModelCategory = selectModelCategory;
+
 async function renderModelList(skipLoading = false) {
   const list = $('model-list');
   if (!skipLoading && (!list.innerHTML || list.querySelector('.model-row') === null)) {
@@ -6076,10 +6455,38 @@ async function renderModelList(skipLoading = false) {
     }
   }
 
-  const search = $('model-search').value.toLowerCase();
-  const filtered = models.filter(m =>
-    !search || m.name.toLowerCase().includes(search) || m.provider.toLowerCase().includes(search)
-  );
+  const searchEl = $('model-search');
+  const search = searchEl ? searchEl.value.toLowerCase() : '';
+  
+  // Set panel title dynamically
+  const titleEl = $('model-panel-title');
+  if (titleEl) {
+    if (state.currentModelCategory) {
+      const labels = {
+        chat: 'Chat & Reasoning',
+        images: 'Image Generation',
+        video: 'Video Generation',
+        music: 'Music/Sound Gen',
+        speaking: 'Speech Synthesis (TTS)',
+        listening: 'Speech Recognition (STT)'
+      };
+      titleEl.textContent = labels[state.currentModelCategory] || 'Switch Model';
+    } else {
+      titleEl.textContent = 'Switch Model';
+    }
+  }
+
+  const filtered = models.filter(m => {
+    const matchesSearch = !search || m.name.toLowerCase().includes(search) || 
+                          m.provider.toLowerCase().includes(search);
+    if (!matchesSearch) return false;
+    
+    if (state.currentModelCategory) {
+      const cats = getModelCategories(m);
+      return cats.includes(state.currentModelCategory);
+    }
+    return true;
+  });
 
   const providerColors = {
     openai:'#10A37F', anthropic:'#CD5C5C', gemini:'#4285F4',
@@ -6126,10 +6533,51 @@ async function renderModelList(skipLoading = false) {
   // Sort recents to match recentsList order
   recentModels.sort((a, b) => recentsList.indexOf(a.name) - recentsList.indexOf(b.name));
 
+  if (!search && !state.currentModelCategory) {
+    const slots = [
+      { id: 'chat', label: 'Chat & Reasoning', value: cfg.ai?.model, color: '#34D399', desc: 'General purpose LLMs & Multimodal input', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>` },
+      { id: 'images', label: 'Image Generation', value: cfg.localai_models?.images, color: '#FF8C00', desc: 'Generate or edit images locally', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>` },
+      { id: 'video', label: 'Video Generation', value: cfg.localai_models?.video, color: '#F05078', desc: 'Create short videos or animations', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>` },
+      { id: 'music', label: 'Music/Sound Gen', value: cfg.localai_models?.music, color: '#EAB308', desc: 'Synthesize audio tracks & sound FX', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>` },
+      { id: 'speaking', label: 'Speech Synthesis (TTS)', value: cfg.localai_models?.speaking, color: '#4285F4', desc: 'High-quality text-to-speech', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>` },
+      { id: 'listening', label: 'Speech Recognition (STT)', value: cfg.localai_models?.listening, color: '#8B5CF6', desc: 'Transcribe voice/speech to text', icon: `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 1v11a3 3 0 0 0 3-3V4a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>` }
+    ];
+
+    let html = `
+      <div class="active-capabilities-title" style="padding: 4px 6px 12px; font-weight:700; color:var(--text-primary); display:flex; align-items:center; gap:8px;">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="var(--accent)" stroke-width="2.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+        Model Capabilities
+      </div>
+      <div class="capabilities-grid">
+    `;
+
+    slots.forEach(s => {
+      const isConfigured = !!s.value;
+      const cardClass = isConfigured ? 'capability-card' : 'capability-card not-configured';
+      const activeValue = s.value ? escHtml(s.value) : '<span class="capability-active-model-value not-set">Not configured</span>';
+      html += `
+        <div class="${cardClass}" tabindex="0" onclick="selectModelCategory('${s.id}')">
+          <div class="capability-icon-wrapper" style="--icon-color: ${s.color}; color: var(--icon-color)">
+            ${s.icon}
+          </div>
+          <div class="capability-label">${s.label}</div>
+          <div class="capability-subtitle">${s.desc}</div>
+          <div class="capability-active-model-label">Active Model</div>
+          <div class="capability-active-model-value">${activeValue}</div>
+        </div>
+      `;
+    });
+
+    html += '</div>';
+
+    list.innerHTML = html;
+    return;
+  }
+
   let html = '';
 
   let activeSummaryHtml = '';
-  if (!search) {
+  if (!search && !state.currentModelCategory) {
     const slots = [
       { label: 'Chat & Reasoning', value: cfg.ai?.model, color: '#34D399' },
       { label: 'Image Generation', value: cfg.localai_models?.images, color: '#FF8C00' },
@@ -6200,25 +6648,41 @@ async function renderModelList(skipLoading = false) {
     let inlineProgress = '';
     
     const badgeList = [];
-    if (m.vision) badgeList.push('<span class="badge vision"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>vision</span>');
+    if (m.vision) badgeList.push('<span class="badge vision"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><span class="badge-text">vision</span></span>');
     if (m.size_gb && m.size_gb > 0) {
       badgeList.push(`<span class="badge size">${m.size_gb.toFixed(1)} GB</span>`);
     }
     if (m.provider === 'ollama' || m.provider === 'localai') {
       if (!dl) {
         if (m.installed) {
-          badgeList.push('<span class="badge local"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" style="display:inline-block;vertical-align:-1px;margin-right:3px"><polyline points="20 6 9 17 4 12"/></svg>Installed</span>');
+          badgeList.push('<span class="badge local"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3" style="display:inline-block;vertical-align:-1px;margin-right:3px"><polyline points="20 6 9 17 4 12"/></svg><span class="badge-text">Installed</span></span>');
         } else {
-          badgeList.push('<span class="badge download-ready"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>Download</span>');
+          badgeList.push('<span class="badge download-ready"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg><span class="badge-text">Download</span></span>');
         }
       }
-      if (m.provider === 'localai' && m.category) {
-        const capCat = m.category.charAt(0).toUpperCase() + m.category.slice(1);
-        badgeList.push(`<span class="badge cat-${m.category}">${capCat}</span>`);
-      }
     } else {
-      badgeList.push('<span class="badge cloud"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg>cloud</span>');
+      badgeList.push('<span class="badge cloud"><svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></svg><span class="badge-text">cloud</span></span>');
     }
+
+    const cats = getModelCategories(m);
+    cats.forEach(cat => {
+      const capCat = cat.charAt(0).toUpperCase() + cat.slice(1);
+      let catIcon = '';
+      if (cat === 'chat') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/></svg>`;
+      } else if (cat === 'images') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>`;
+      } else if (cat === 'video') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg>`;
+      } else if (cat === 'music') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+      } else if (cat === 'speaking') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`;
+      } else if (cat === 'listening') {
+        catIcon = `<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.5" style="display:inline-block;vertical-align:-1px;margin-right:3px"><path d="M12 1v11a3 3 0 0 0 3-3V4a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>`;
+      }
+      badgeList.push(`<span class="badge cat-${cat}" title="${capCat} capability">${catIcon}<span class="badge-text">${capCat}</span></span>`);
+    });
     
     // Add specific active badges for each slot
     if (activeSlots.length > 0) {
@@ -6227,7 +6691,7 @@ async function renderModelList(skipLoading = false) {
         if (slot === 'listening') return 'STT';
         return slot.toUpperCase();
       });
-      badgeList.push(`<span class="badge active-mark" style="background:rgba(91,159,255,0.15);border:1px solid rgba(91,159,255,0.3);color:#93c5fd;font-weight:700;letter-spacing:0.5px">● Active (${activeLabels.join(', ')})</span>`);
+      badgeList.push(`<span class="badge active-mark" style="background:rgba(91,159,255,0.15);border:1px solid rgba(91,159,255,0.3);color:#93c5fd;font-weight:700;letter-spacing:0.5px"><span class="badge-dot" style="background:#93c5fd"></span><span class="badge-text">Active (${activeLabels.join(', ')})</span></span>`);
     }
     
     badges = badgeList.join('');
@@ -6257,7 +6721,7 @@ async function renderModelList(skipLoading = false) {
       `;
     }
     
-    const onclickHandler = dl ? '' : `onclick="switchModel('${escAttr(m.name)}','${escAttr(m.provider)}','${escAttr(m.base_url||'')}',${m.vision},${m.installed})"`;
+    const onclickHandler = dl ? '' : `onclick="switchModel('${escAttr(m.name)}','${escAttr(m.provider)}','${escAttr(m.base_url||'')}',${m.vision},${m.installed}, state.currentModelCategory ? '${escAttr(state.currentModelCategory)}' : null)"`;
     const styleAttr = indent ? 'style="margin-left:16px"' : '';
     
     let deleteBtnHtml = '';
@@ -6275,7 +6739,7 @@ async function renderModelList(skipLoading = false) {
     }
     
     return `
-      <div class="${rowClass}" data-model="${escAttr(m.name)}" ${onclickHandler} ${styleAttr}>
+      <div class="${rowClass}" tabindex="0" data-model="${escAttr(m.name)}" ${onclickHandler} ${styleAttr}>
         <span class="model-provider-dot" style="background:${col}"></span>
         <span class="model-name">${escHtml(m.name)}</span>
         <div class="model-badges">${badges}</div>
@@ -6882,7 +7346,7 @@ function showPrompt(title, message, defaultValue = '') {
 
 window.showPrompt = showPrompt;
 
-async function switchModel(name, provider, baseUrl, vision, installed) {
+async function switchModel(name, provider, baseUrl, vision, installed, targetCategory = null) {
   const isMobilePlatform = isMobile || 
                            document.body.classList.contains('is-mobile') || 
                            /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
@@ -6969,15 +7433,16 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
   }
 
   let m = (_cachedModels || []).find(x => x.name === name);
-  let category = m ? m.category : 'chat';
+  const cats = m ? getModelCategories(m) : ['chat'];
+  let category = targetCategory || (cats.includes('chat') ? 'chat' : (cats[0] || 'chat'));
 
-  if (provider === 'localai' && category !== 'chat') {
+  if (category !== 'chat') {
     dismissToast();
     _cachedModels = null;
     try {
       await invoke('switch_localai_model', { category, model_name: name });
       closeAllOverlays();
-      toast(`Active LocalAI ${category} model set to: ${name}`);
+      toast(`Active ${category} model set to: ${name}`);
       
       const hasChat = state.cfg?.ai?.model;
       if (!hasChat) {
@@ -6985,7 +7450,7 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
       }
       await loadConfig();
     } catch(e) {
-      toast('Failed to switch LocalAI model: ' + e);
+      toast('Failed to switch model: ' + e);
     }
     return;
   }
@@ -7042,6 +7507,19 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
             });
             // Switch model on success
             await invoke('switch_model', { name, provider, base_url: baseUrl || '', vision });
+            
+            // Automatically synchronize other capabilities if this is a local multifunction model
+            if (provider === 'localai' || provider === 'ollama') {
+              const cats = m ? getModelCategories(m) : ['chat'];
+              for (const c of cats) {
+                if (c !== 'chat') {
+                  try {
+                    await invoke('switch_localai_model', { category: c, model_name: name });
+                  } catch(_) {}
+                }
+              }
+            }
+
             addRecentModel(name);
             closeAllOverlays();
             toast(`Successfully configured and switched to ${name}`);
@@ -7060,6 +7538,21 @@ async function switchModel(name, provider, baseUrl, vision, installed) {
   _cachedModels = null;
   try {
     await invoke('switch_model', { name, provider, base_url: baseUrl || '', vision });
+    
+    // Automatically synchronize other capabilities if this is a local multifunction model
+    if (provider === 'localai' || provider === 'ollama') {
+      const cats = m ? getModelCategories(m) : ['chat'];
+      for (const c of cats) {
+        if (c !== 'chat') {
+          try {
+            await invoke('switch_localai_model', { category: c, model_name: name });
+          } catch(err) {
+            console.warn(`Failed to sync capability ${c} for local model:`, err);
+          }
+        }
+      }
+    }
+
     addRecentModel(name);
     closeAllOverlays();
     toast(`Switched to ${name}`);
@@ -7180,6 +7673,7 @@ async function verifyAndSaveKey() {
 async function renderConvList() {
   const list = $('conv-list');
   if (!list) return;
+  list.innerHTML = `<div class="sidebar-loader-wrapper"><span class="sidebar-loader"></span></div>`;
 
   const query = ($('conv-search')?.value || '').trim();
   let convs = [];
@@ -7208,7 +7702,7 @@ async function renderConvList() {
     const spinnerHtml = isRunning ? `<span class="conv-row-spinner"></span>` : '';
     const dateHtml = `<span class="conv-date-hover">${escHtml(formatShortDate(c.last_message_at))}</span>`;
 
-    return `<div class="conv-row${isActive?' active':''}" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
+    return `<div class="conv-row${isActive?' active':''}" tabindex="0" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
       <span class="conv-title">${escHtml(displayName)}</span>
       <div class="conv-meta-actions">
         ${dateHtml}
@@ -7419,6 +7913,9 @@ function applyTheme(theme) {
     systemThemeListener = null;
   }
 
+  // Set native window DWM theme as well to align snapping border color!
+  invoke('set_window_theme', { theme }).catch(console.error);
+
   if (theme === 'light') {
     body.classList.add('theme-light');
   } else if (theme === 'dark') {
@@ -7457,6 +7954,208 @@ function setTheme(theme) {
 }
 
 // ── Settings panel ──────────────────────────────────────────────────────
+function handleSettingsPanelBack() {
+  if (state.currentSettingsCategory) {
+    state.currentSettingsCategory = null;
+    renderSettings();
+    updateBackButtonVisibility();
+  } else {
+    goBackOverlay('settings');
+  }
+}
+window.handleSettingsPanelBack = handleSettingsPanelBack;
+
+function selectSettingsCategory(catId) {
+  state.currentSettingsCategory = catId;
+  renderSettings();
+  updateBackButtonVisibility();
+}
+window.selectSettingsCategory = selectSettingsCategory;
+
+function getShortcuts() {
+  const defaults = {
+    focus_input: '/',
+    toggle_sidebar: 'control+b',
+    open_settings: 'control+,',
+    open_models: 'control+m',
+    toggle_voice: 'control+shift+v',
+    clear_chat: 'control+l',
+    toggle_maximize: 'alt+enter',
+    switch_compact: 'control+alt+c',
+    switch_workspace: 'control+alt+w'
+  };
+  try {
+    const saved = localStorage.getItem('customShortcuts');
+    if (saved) {
+      return { ...defaults, ...JSON.parse(saved) };
+    }
+  } catch(_) {}
+  return defaults;
+}
+window.getShortcuts = getShortcuts;
+
+function getFormattedShortcut(shortcutStr) {
+  if (!shortcutStr) return '';
+  const isMac = navigator.userAgent.includes('Mac') || navigator.platform.includes('Mac');
+  return shortcutStr.split('+').map(part => {
+    const p = part.trim().toLowerCase();
+    if (p === 'control' || p === 'ctrl') return isMac ? 'Cmd' : 'Ctrl';
+    if (p === 'alt') return isMac ? 'Opt' : 'Alt';
+    if (p === 'meta') return isMac ? 'Cmd' : 'Win';
+    if (p === 'shift') return 'Shift';
+    if (p === 'enter') return 'Enter';
+    return p.toUpperCase();
+  }).join(' + ');
+}
+window.getFormattedShortcut = getFormattedShortcut;
+
+function updateTooltipsWithShortcuts() {
+  const shortcuts = getShortcuts();
+
+  // 1. Sidebar toggle
+  const sidebarToggle = $('sidebar-toggle');
+  if (sidebarToggle) {
+    sidebarToggle.setAttribute('title', `Toggle Sidebar (${getFormattedShortcut(shortcuts.toggle_sidebar)})`);
+  }
+
+  // 2. Settings buttons
+  const settingsBtn = $('hbtn-settings');
+  if (settingsBtn) {
+    settingsBtn.setAttribute('title', `Settings (${getFormattedShortcut(shortcuts.open_settings)})`);
+  }
+  const brandBtn = $('brand-btn');
+  if (brandBtn) {
+    brandBtn.setAttribute('title', 'Antflow');
+  }
+
+  // 3. Model selector
+  const modelSelect = $('talkbar-model-select');
+  if (modelSelect) {
+    modelSelect.setAttribute('title', `Switch Model (${getFormattedShortcut(shortcuts.open_models)})`);
+  }
+
+  // 4. Voice input
+  const actionBtnEl = $('action-btn');
+  if (actionBtnEl) {
+    let titleText = 'Voice input';
+    const hasText = input && input.value.trim().length > 0;
+    if (state.thinking || state.forceStopButton || (state.listening && (state.voiceState === 'thinking' || state.voiceState === 'speaking'))) {
+      titleText = 'Stop';
+    } else if (state.listening) {
+      titleText = 'Stop listening';
+    } else if (hasText) {
+      titleText = 'Send';
+    }
+    
+    if (titleText === 'Send') {
+      actionBtnEl.setAttribute('title', 'Send (Enter)');
+    } else if (titleText === 'Stop') {
+      actionBtnEl.setAttribute('title', `Stop (${getFormattedShortcut(shortcuts.toggle_voice)})`);
+    } else if (titleText === 'Stop listening') {
+      actionBtnEl.setAttribute('title', `Stop listening (${getFormattedShortcut(shortcuts.toggle_voice)})`);
+    } else {
+      actionBtnEl.setAttribute('title', `Voice input (${getFormattedShortcut(shortcuts.toggle_voice)})`);
+    }
+  }
+
+  // 5. Maximize/Restore
+  const maxBtn = $('hbtn-max');
+  if (maxBtn) {
+    maxBtn.setAttribute('title', `Maximize Workspace (${getFormattedShortcut(shortcuts.toggle_maximize)})`);
+  }
+  const maxGlobalBtn = $('hbtn-max-global');
+  if (maxGlobalBtn) {
+    maxGlobalBtn.setAttribute('title', `Restore Window (${getFormattedShortcut(shortcuts.toggle_maximize)})`);
+  }
+
+  // 6. New conversation buttons
+  const newConvSidebar = document.querySelector('.new-conversation-btn');
+  if (newConvSidebar) {
+    newConvSidebar.setAttribute('title', `New conversation (${getFormattedShortcut(shortcuts.clear_chat)})`);
+  }
+  const newConvBtn = $('new-conv-btn');
+  if (newConvBtn) {
+    newConvBtn.setAttribute('title', `New conversation (${getFormattedShortcut(shortcuts.clear_chat)})`);
+  }
+}
+window.updateTooltipsWithShortcuts = updateTooltipsWithShortcuts;
+
+function matchShortcut(e, shortcutStr) {
+  if (!shortcutStr) return false;
+  const parts = shortcutStr.toLowerCase().split('+');
+  let needsCtrl = false;
+  let needsMeta = false;
+  let needsShift = false;
+  let needsAlt = false;
+  let key = '';
+  for (const part of parts) {
+    if (part === 'control' || part === 'ctrl') needsCtrl = true;
+    else if (part === 'meta' || part === 'cmd' || part === 'command') needsMeta = true;
+    else if (part === 'shift') needsShift = true;
+    else if (part === 'alt') needsAlt = true;
+    else key = part;
+  }
+  
+  const hasModifier = (needsCtrl || needsMeta);
+  const pressModifier = (e.ctrlKey || e.metaKey);
+  if (hasModifier !== pressModifier) return false;
+  
+  if (!hasModifier) {
+    if (e.ctrlKey || e.metaKey) return false;
+  }
+  
+  if (needsShift !== e.shiftKey) return false;
+  if (needsAlt !== e.altKey) return false;
+  
+  let eventKey = e.key.toLowerCase();
+  return eventKey === key;
+}
+
+let currentListeningShortcutAction = null;
+function startEditShortcut(action) {
+  currentListeningShortcutAction = action;
+  renderSettings();
+}
+window.startEditShortcut = startEditShortcut;
+
+function renderShortcutsHTML() {
+  const shortcuts = getShortcuts();
+  const descriptions = {
+    focus_input: 'Focus Chat Input Box',
+    toggle_sidebar: 'Toggle Conversations Sidebar',
+    open_settings: 'Open Application Settings Overlay',
+    open_models: 'Open AI Model Selection Panel',
+    toggle_voice: 'Toggle Hands-Free Voice Mode',
+    clear_chat: 'Clear Chat History',
+    toggle_maximize: 'Toggle Maximized/Fullscreen View',
+    switch_compact: 'Switch to Compact Talkbar View',
+    switch_workspace: 'Switch to Restored Workspace View'
+  };
+  return `
+    <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">Custom Key Bindings</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:20px;line-height:1.5">
+      Click on any action to customize its shortcut. Press the desired key combination (e.g. <code>Control+K</code>) while listening to save. Press <code>Escape</code> to cancel.
+    </div>
+    <div class="shortcuts-settings-list" style="display:flex;flex-direction:column;gap:12px">
+      ${Object.entries(shortcuts).map(([action, keys]) => {
+        const isListening = currentListeningShortcutAction === action;
+        const btnText = isListening ? 'Press keys...' : keys.toUpperCase().replace('CONTROL', 'CTRL');
+        return `
+          <div class="setting-row" style="align-items:center">
+            <div>
+              <div class="setting-label">${descriptions[action] || action}</div>
+              <div class="setting-sub" style="font-family: 'DM Mono', monospace; color: var(--accent); font-weight: bold">${keys.toUpperCase()}</div>
+            </div>
+            <button class="change-model-btn${isListening ? ' listening-btn' : ''}" onclick="startEditShortcut('${action}')" style="${isListening ? 'background:var(--accent)!important;color:#fff!important;' : ''}">
+              ${btnText}
+            </button>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
 function getSystemVoiceOptions() {
   if (!window.speechSynthesis) return [];
   const voices = window.speechSynthesis.getVoices() || [];
@@ -7560,384 +8259,518 @@ if (speakers.length === 0) {
   }
 }
   const body = $('settings-body');
-  body.innerHTML = `
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Current Model</div>
-        <div class="setting-sub">${escHtml(cfg.ai?.model || 'not configured')}</div>
-      </div>
-      <button class="change-model-btn" onclick="openOverlay('model')">Change</button>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Agent Mode</div>
-        <div class="setting-sub">Choose when to trigger task execution vs conversation</div>
-      </div>
-      <div id="mode-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Theme</div>
-        <div class="setting-sub">Choose app appearance</div>
-      </div>
-      <div id="theme-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Storage Mode</div>
-        <div class="setting-sub">Choose between Portable (App Path) and System (Default System Path) storage</div>
-      </div>
-      <div id="storage-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Preferred Language</div>
-        <div class="setting-sub">Choose preferred language for AI responses</div>
-      </div>
-      <div id="language-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">App Language</div>
-        <div class="setting-sub">Choose language for the app interface</div>
-      </div>
-      <div id="app-language-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Graphics & Animations</div>
-        <div class="setting-sub">Choose animation intensity</div>
-      </div>
-      <div id="anim-profile-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Microphone</div>
-        <div class="setting-sub">Choose audio input device</div>
-      </div>
-      <div id="mic-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Speakers / Output</div>
-        <div class="setting-sub">Choose audio output device</div>
-      </div>
-      <div id="speaker-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Voice / Speaker</div>
-        <div class="setting-sub">${cfg.localai_models?.speaking ? 'Choose speaker voice character for TTS (Kokoro)' : 'Choose browser system voice for TTS'}</div>
-      </div>
-      <div id="voice-select-container"></div>
-    </div>
-    <div class="setting-row has-select">
-      <div>
-        <div class="setting-label">Ollama Concurrency</div>
-        <div class="setting-sub">Configure max parallel local generation processes</div>
-      </div>
-      <div id="parallel-select-container"></div>
-    </div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Session Memory</div>
-        <div class="setting-sub">Remember conversations between sessions</div>
-      </div>
-      <div class="toggle${cfg.session?.remember_sessions?' on':''}" id="toggle-memory" onclick="toggleMemory()">
-        <div class="toggle-thumb"></div>
-      </div>
-    </div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Wake Word</div>
-        <div class="setting-sub">Say "Antflow" to activate</div>
-      </div>
-      <div class="toggle${localStorage.getItem('wakeWordEnabled') === '1' ? ' on' : ''}" id="toggle-wake" onclick="toggleWakeWord()">
-        <div class="toggle-thumb"></div>
-      </div>
-    </div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Run in background when closed</div>
-        <div class="setting-sub">Keep listening for wake word in background</div>
-      </div>
-      <div class="toggle${cfg.run_in_background ? ' on' : ''}" id="toggle-bg-wake" onclick="toggleRunInBackground()">
-        <div class="toggle-thumb"></div>
-      </div>
-    </div>
-    <div class="setting-row mobile-only">
-      <div>
-        <div class="setting-label">System Permissions (Microphone, etc.)</div>
-        <div class="setting-sub">Configure audio recording and other core permissions</div>
-      </div>
-      <button class="change-model-btn" onclick="openSystemPermissions()">Configure</button>
-    </div>
-    <div class="setting-row mobile-only">
-      <div>
-        <div class="setting-label">Always on Top Overlay Permission</div>
-        <div class="setting-sub">Allow Antflow to draw over other apps (floating talkbar)</div>
-      </div>
-      <button class="change-model-btn" onclick="openOverlayPermissions()">Configure</button>
-    </div>
-    <div class="setting-row mobile-only">
-      <div>
-        <div class="setting-label">Default Digital Assistant</div>
-        <div class="setting-sub">Substitute Siri or Google Assistant with Antflow</div>
-      </div>
-      <button class="change-model-btn" onclick="openAssistantSettings()">Configure</button>
-    </div>
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Storage</div>
-        <div class="setting-sub">${escHtml(cfg.storage || 'Portable')}</div>
-      </div>
-    </div>
-    ${(!isLaInstalled) ? `
-      <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-top:20px;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Engine</div>
+  
+  // Update header title span
+  const titleEl = $('settings-panel-title');
+  if (titleEl) {
+    if (state.currentSettingsCategory) {
+      const labels = {
+        general: 'General Settings',
+        audio: 'Audio & Voice',
+        language: 'Language Settings',
+        system: 'System & Storage',
+        localai: 'Local AI Engine',
+        mobile: 'Mobile Permissions',
+        shortcuts: 'Keyboard Shortcuts'
+      };
+      titleEl.textContent = labels[state.currentSettingsCategory] || 'Settings';
+    } else {
+      titleEl.textContent = 'Settings';
+    }
+  }
+
+  if (!state.currentSettingsCategory) {
+    let dashboardHtml = `
+      <div class="settings-grid">
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('general')">
+          <div class="setting-card-icon-wrapper" style="color:#34D399">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </div>
+          <div class="setting-card-title">General Settings</div>
+          <div class="setting-card-desc">Theme, agent mode, background run, session memory.</div>
+        </div>
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('audio')">
+          <div class="setting-card-icon-wrapper" style="color:#4285F4">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 1v11a3 3 0 0 0 3-3V4a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/></svg>
+          </div>
+          <div class="setting-card-title">Audio & Voice</div>
+          <div class="setting-card-desc">Microphone, speakers, TTS voice, wake word.</div>
+        </div>
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('language')">
+          <div class="setting-card-icon-wrapper" style="color:#EAB308">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </div>
+          <div class="setting-card-title">Languages</div>
+          <div class="setting-card-desc">Preferred translator, interface language.</div>
+        </div>
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('system')">
+          <div class="setting-card-icon-wrapper" style="color:#8B5CF6">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          </div>
+          <div class="setting-card-title">System & Storage</div>
+          <div class="setting-card-desc">Storage mode, path, concurrency, system specs.</div>
+        </div>
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('localai')">
+          <div class="setting-card-icon-wrapper" style="color:#FF8C00">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="15" x2="23" y2="15"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="15" x2="4" y2="15"/></svg>
+          </div>
+          <div class="setting-card-title">Local AI Engine</div>
+          <div class="setting-card-desc">Download & configure offline media / audio models.</div>
+        </div>
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('shortcuts')">
+          <div class="setting-card-icon-wrapper" style="color:#00D2FF">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="6" y1="8" x2="6.01" y2="8"/><line x1="10" y1="8" x2="10.01" y2="8"/><line x1="14" y1="8" x2="14.01" y2="8"/><line x1="18" y1="8" x2="18.01" y2="8"/><line x1="6" y1="12" x2="6.01" y2="12"/><line x1="10" y1="12" x2="10.01" y2="12"/><line x1="14" y1="12" x2="14.01" y2="12"/><line x1="18" y1="12" x2="18.01" y2="12"/><line x1="7" y1="16" x2="17" y2="16"/></svg>
+          </div>
+          <div class="setting-card-title">Keyboard Shortcuts</div>
+          <div class="setting-card-desc">Configure global key bindings for hands-free navigation.</div>
+        </div>
+    `;
+    if (isMobile) {
+      dashboardHtml += `
+        <div class="setting-card" tabindex="0" onclick="selectSettingsCategory('mobile')">
+          <div class="setting-card-icon-wrapper" style="color:#F05078">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+          </div>
+          <div class="setting-card-title">Permissions</div>
+          <div class="setting-card-desc">Microphone, overlay and assistant settings.</div>
+        </div>
+      `;
+    }
+    dashboardHtml += '</div>';
+    body.innerHTML = dashboardHtml;
+    return;
+  }
+
+  let html = '';
+
+  if (state.currentSettingsCategory === 'general') {
+    html = `
       <div class="setting-row">
         <div>
-          <div class="setting-label">LocalAI Engine</div>
-          <div class="setting-sub">${(state.downloads && state.downloads['LocalAI']) ? 'Downloading LocalAI binary...' : 'Install local engine for free offline Images, Video, Speech and Music.'}</div>
+          <div class="setting-label">Current Model</div>
+          <div class="setting-sub">${escHtml(cfg.ai?.model || 'not configured')}</div>
         </div>
-        ${(state.downloads && state.downloads['LocalAI']) ? '' : '<button class="change-model-btn" onclick="startLocalAiDownloadFlow()">Install Engine</button>'}
-      </div>
-    ` : `
-      <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-top:20px;margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Media & Voice Settings</div>
-      <div class="setting-row has-select">
-        <div>
-          <div class="setting-label">Local Images Model</div>
-          <div class="setting-sub">Generate pictures locally using Stable Diffusion</div>
-        </div>
-        <div id="localai-images-select-container"></div>
+        <button class="change-model-btn" onclick="openOverlay('model')">Change</button>
       </div>
       <div class="setting-row has-select">
         <div>
-          <div class="setting-label">Local Video Model</div>
-          <div class="setting-sub">Create short videos locally using AnimateDiff</div>
+          <div class="setting-label">Agent Mode</div>
+          <div class="setting-sub">Choose when to trigger task execution vs conversation</div>
         </div>
-        <div id="localai-video-select-container"></div>
+        <div id="mode-select-container"></div>
       </div>
       <div class="setting-row has-select">
         <div>
-          <div class="setting-label">Local Speaking Model</div>
-          <div class="setting-sub">Text-to-speech voice generation using Kokoro</div>
+          <div class="setting-label">Theme</div>
+          <div class="setting-sub">Choose app appearance</div>
         </div>
-        <div id="localai-speaking-select-container"></div>
+        <div id="theme-select-container"></div>
       </div>
       <div class="setting-row has-select">
         <div>
-          <div class="setting-label">Local Listening Model</div>
-          <div class="setting-sub">Speech-to-text transcription using Whisper</div>
+          <div class="setting-label">Graphics & Animations</div>
+          <div class="setting-sub">Choose animation intensity</div>
         </div>
-        <div id="localai-listening-select-container"></div>
+        <div id="anim-profile-select-container"></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Session Memory</div>
+          <div class="setting-sub">Remember conversations between sessions</div>
+        </div>
+        <div class="toggle${cfg.session?.remember_sessions?' on':''}" tabindex="0" id="toggle-memory" onclick="toggleMemory()">
+          <div class="toggle-thumb"></div>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Run in background when closed</div>
+          <div class="setting-sub">Keep listening for wake word in background</div>
+        </div>
+        <div class="toggle${cfg.run_in_background ? ' on' : ''}" tabindex="0" id="toggle-bg-wake" onclick="toggleRunInBackground()">
+          <div class="toggle-thumb"></div>
+        </div>
+      </div>
+    `;
+  } else if (state.currentSettingsCategory === 'audio') {
+    html = `
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Microphone</div>
+          <div class="setting-sub">Choose audio input device</div>
+        </div>
+        <div id="mic-select-container"></div>
       </div>
       <div class="setting-row has-select">
         <div>
-          <div class="setting-label">Local Music Model</div>
-          <div class="setting-sub">Generate music and sounds using MusicGen</div>
+          <div class="setting-label">Speakers / Output</div>
+          <div class="setting-sub">Choose audio output device</div>
         </div>
-        <div id="localai-music-select-container"></div>
+        <div id="speaker-select-container"></div>
       </div>
-    `}
-    <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
-      <div class="setting-label">System Info</div>
-      <div style="font-size:11px;font-family:'DM Mono',monospace;color:var(--text-dim);line-height:1.7" id="sys-info">
-        Loading...
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Voice / Speaker</div>
+          <div class="setting-sub">${cfg.localai_models?.speaking ? 'Choose speaker voice character for TTS (Kokoro)' : 'Choose browser system voice for TTS'}</div>
+        </div>
+        <div id="voice-select-container"></div>
       </div>
-    </div>
-  `;
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Speech Recognition (STT)</div>
+          <div class="setting-sub">Choose engine for speech-to-text recognition</div>
+        </div>
+        <div id="stt-engine-select-container"></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Wake Word</div>
+          <div class="setting-sub">Say "Antflow" to activate</div>
+        </div>
+        <div class="toggle${localStorage.getItem('wakeWordEnabled') === '1' ? ' on' : ''}" tabindex="0" id="toggle-wake" onclick="toggleWakeWord()">
+          <div class="toggle-thumb"></div>
+        </div>
+      </div>
+    `;
+  } else if (state.currentSettingsCategory === 'language') {
+    html = `
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Preferred Language</div>
+          <div class="setting-sub">Choose preferred language for AI responses</div>
+        </div>
+        <div id="language-select-container"></div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">App Language</div>
+          <div class="setting-sub">Choose language for the app interface</div>
+        </div>
+        <div id="app-language-select-container"></div>
+      </div>
+    `;
+  } else if (state.currentSettingsCategory === 'system') {
+    html = `
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Storage Mode</div>
+          <div class="setting-sub">Choose between Portable (App Path) and System (Default System Path) storage</div>
+        </div>
+        <div id="storage-select-container"></div>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Storage Path</div>
+          <div class="setting-sub">${escHtml(cfg.storage || 'Portable')}</div>
+        </div>
+      </div>
+      <div class="setting-row has-select">
+        <div>
+          <div class="setting-label">Ollama Concurrency</div>
+          <div class="setting-sub">Configure max parallel local generation processes</div>
+        </div>
+        <div id="parallel-select-container"></div>
+      </div>
+      <div class="setting-row" style="flex-direction:column;align-items:flex-start;gap:8px">
+        <div class="setting-label">System Info</div>
+        <div style="font-size:11px;font-family:'DM Mono',monospace;color:var(--text-dim);line-height:1.7" id="sys-info">
+          Loading...
+        </div>
+      </div>
+    `;
+  } else if (state.currentSettingsCategory === 'localai') {
+    html = `
+      ${(!isLaInstalled) ? `
+        <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Engine</div>
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">LocalAI Engine</div>
+            <div class="setting-sub">${(state.downloads && state.downloads['LocalAI']) ? 'Downloading LocalAI binary...' : 'Install local engine for free offline Images, Video, Speech and Music.'}</div>
+          </div>
+          ${(state.downloads && state.downloads['LocalAI']) ? '' : '<button class="change-model-btn" onclick="startLocalAiDownloadFlow()">Install Engine</button>'}
+        </div>
+      ` : `
+        <div style="font-size:12px;font-weight:700;color:var(--text-primary);margin-bottom:10px;text-transform:uppercase;letter-spacing:0.5px">LocalAI Media & Voice Settings</div>
+        <div class="setting-row has-select">
+          <div>
+            <div class="setting-label">Local Images Model</div>
+            <div class="setting-sub">Generate pictures locally using Stable Diffusion</div>
+          </div>
+          <div id="localai-images-select-container"></div>
+        </div>
+        <div class="setting-row has-select">
+          <div>
+            <div class="setting-label">Local Video Model</div>
+            <div class="setting-sub">Create short videos locally using AnimateDiff</div>
+          </div>
+          <div id="localai-video-select-container"></div>
+        </div>
+        <div class="setting-row has-select">
+          <div>
+            <div class="setting-label">Local Speaking Model</div>
+            <div class="setting-sub">Text-to-speech voice generation using Kokoro</div>
+          </div>
+          <div id="localai-speaking-select-container"></div>
+        </div>
+        <div class="setting-row has-select">
+          <div>
+            <div class="setting-label">Local Listening Model</div>
+            <div class="setting-sub">Speech-to-text transcription using Whisper</div>
+          </div>
+          <div id="localai-listening-select-container"></div>
+        </div>
+        <div class="setting-row has-select">
+          <div>
+            <div class="setting-label">Local Music Model</div>
+            <div class="setting-sub">Generate music and sounds using MusicGen</div>
+          </div>
+          <div id="localai-music-select-container"></div>
+        </div>
+      `}
+    `;
+  } else if (state.currentSettingsCategory === 'mobile') {
+    html = `
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">System Permissions (Microphone, etc.)</div>
+          <div class="setting-sub">Configure audio recording and other core permissions</div>
+        </div>
+        <button class="change-model-btn" onclick="openSystemPermissions()">Configure</button>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Always on Top Overlay Permission</div>
+          <div class="setting-sub">Allow Antflow to draw over other apps (floating talkbar)</div>
+        </div>
+        <button class="change-model-btn" onclick="openOverlayPermissions()">Configure</button>
+      </div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Default Digital Assistant</div>
+          <div class="setting-sub">Substitute Siri or Google Assistant with Antflow</div>
+        </div>
+        <button class="change-model-btn" onclick="openAssistantSettings()">Configure</button>
+      </div>
+    `;
+  } else if (state.currentSettingsCategory === 'shortcuts') {
+    html = renderShortcutsHTML();
+  }
 
-  // Sync toggles and selects
+
+  body.innerHTML = html;
+
+  // Sync toggles and selects (only if they are present on the current screen)
   const wt = $('toggle-wake');
-  if (wt) wt.classList.toggle('on', wakeListening);
+  if (wt) {
+    wt.classList.toggle('on', wakeListening);
+  }
 
-  const currentTheme = localStorage.getItem('theme') || 'system';
-  createCustomSelect(
-    $('theme-select-container'),
-    [
-      { value: 'system', label: 'System Default' },
-      { value: 'light', label: 'Light' },
-      { value: 'dark', label: 'Dark' }
-    ],
-    currentTheme,
-    (val) => {
-      setTheme(val);
-    }
-  );
-
-  const currentConcurrency = String(cfg.num_parallel || 4);
-  createCustomSelect(
-    $('parallel-select-container'),
-    [
-      { value: '1', label: '1 (Single-threaded)' },
-      { value: '2', label: '2 Parallel' },
-      { value: '3', label: '3 Parallel' },
-      { value: '4', label: '4 Parallel' },
-      { value: '6', label: '6 Parallel' },
-      { value: '8', label: '8 Parallel' }
-    ],
-    currentConcurrency,
-    async (val) => {
-      try {
-        const num = parseInt(val, 10);
-        await invoke('set_concurrency', { value: num });
-        state.cfg.num_parallel = num;
-        toast('Ollama concurrency set to ' + num);
-      } catch (e) {
-        toast('Failed to change concurrency: ' + e);
+  const themeContainer = $('theme-select-container');
+  if (themeContainer) {
+    const currentTheme = localStorage.getItem('theme') || 'system';
+    createCustomSelect(
+      themeContainer,
+      [
+        { value: 'system', label: 'System Default' },
+        { value: 'light', label: 'Light' },
+        { value: 'dark', label: 'Dark' }
+      ],
+      currentTheme,
+      (val) => {
+        setTheme(val);
       }
-    }
-  );
+    );
+  }
 
-  const currentMode = cfg.mode === 'chat' ? 'chat' : 'auto';
-  createCustomSelect(
-    $('mode-select-container'),
-    [
-      { value: 'auto', label: 'Task (AI gate dynamic verify)' },
-      { value: 'chat', label: 'Chat (No automation)' }
-    ],
-    currentMode,
-    async (val) => {
-      try {
-        await invoke('set_app_mode', { mode: val });
-        state.cfg.mode = val;
-        toast('Agent mode changed to: ' + (val === 'chat' ? 'Chat' : 'Task'));
-      } catch (e) {
-        toast('Failed to change agent mode: ' + e);
-      }
-    }
-  );
-
-  const currentStorage = (cfg.storage || 'Portable').toLowerCase();
-  createCustomSelect(
-    $('storage-select-container'),
-    [
-      { value: 'portable', label: 'Portable Mode (App folder)' },
-      { value: 'global', label: 'System Mode (Default system folder)' }
-    ],
-    currentStorage,
-    async (val) => {
-      try {
-        await invoke('set_storage_location', { location: val });
-        toast('Storage mode changed. Please restart the app and Ollama for full alignment.', 4000);
-      } catch (e) {
-        toast('Failed to change storage: ' + e);
-      }
-    }
-  );
-
-  const sysLang = navigator.language || 'en';
-  const langCode = sysLang.split('-')[0].toLowerCase();
-  const langNames = {
-    'en': 'English',
-    'es': 'Spanish',
-    'fr': 'French',
-    'de': 'German',
-    'it': 'Italian',
-    'pt': 'Portuguese',
-    'ja': 'Japanese',
-    'zh': 'Chinese',
-    'ru': 'Russian'
-  };
-  const detectedName = langNames[langCode] || sysLang;
-  const autoLabel = `Auto-detect (${detectedName})`;
-
-  const currentLang = localStorage.getItem('preferredLanguage') || 'auto';
-  createCustomSelect(
-    $('language-select-container'),
-    [
-      { value: 'auto', label: autoLabel },
-      { value: 'en', label: 'English' },
-      { value: 'es', label: 'Spanish' },
-      { value: 'fr', label: 'French' },
-      { value: 'de', label: 'German' },
-      { value: 'it', label: 'Italian' },
-      { value: 'pt', label: 'Portuguese' },
-      { value: 'ja', label: 'Japanese' },
-      { value: 'zh', label: 'Chinese' },
-      { value: 'ru', label: 'Russian' }
-    ],
-    currentLang,
-    (val) => {
-      localStorage.setItem('preferredLanguage', val);
-      toast("Preferred language updated");
-      const userLang = getVoiceLanguage();
-      if (recognition) {
+  const parallelContainer = $('parallel-select-container');
+  if (parallelContainer) {
+    const currentConcurrency = String(cfg.num_parallel || 4);
+    createCustomSelect(
+      parallelContainer,
+      [
+        { value: '1', label: '1 (Single-threaded)' },
+        { value: '2', label: '2 Parallel' },
+        { value: '3', label: '3 Parallel' },
+        { value: '4', label: '4 Parallel' },
+        { value: '6', label: '6 Parallel' },
+        { value: '8', label: '8 Parallel' }
+      ],
+      currentConcurrency,
+      async (val) => {
         try {
-          recognition.stop();
-          recognition.lang = userLang;
-          if (state.listening && !state.ttsSpeaking) {
-            recognition.start();
-          }
-        } catch(_) {}
-      }
-      if (wakeRecognition) {
-        try {
-          wakeRecognition.stop();
-          wakeRecognition.lang = userLang;
-          if (wakeListening) {
-            wakeRecognition.start();
-          }
-        } catch(_) {}
-      }
-    }
-  );
-
-  const currentAppLang = localStorage.getItem('appLanguage') || 'en';
-  createCustomSelect(
-    $('app-language-select-container'),
-    [
-      { value: 'en', label: 'English' }
-    ],
-    currentAppLang,
-    (val) => {
-      localStorage.setItem('appLanguage', val);
-      toast("App language updated");
-    }
-  );
-
-  const currentProfile = localStorage.getItem('animProfile') || 'full';
-  createCustomSelect(
-    $('anim-profile-select-container'),
-    [
-      { value: 'full', label: 'Full Animations' },
-      { value: 'medium', label: 'Medium (No Glow/Blur)' },
-      { value: 'none', label: 'None' }
-    ],
-    currentProfile,
-    (val) => {
-      setAnimationProfile(val);
-    }
-  );
-
-  const currentMic = localStorage.getItem('selectedMicrophoneId') || 'default';
-  createCustomSelect(
-    $('mic-select-container'),
-    micOptions,
-    currentMic,
-    (val) => {
-      localStorage.setItem('selectedMicrophoneId', val);
-      toast("Microphone updated");
-    }
-  );
-
-  const currentSpeaker = localStorage.getItem('selectedSpeakerId') || 'default';
-  createCustomSelect(
-    $('speaker-select-container'),
-    speakerOptions,
-    currentSpeaker,
-    async (val) => {
-      localStorage.setItem('selectedSpeakerId', val);
-      toast("Speaker output updated");
-      if (botAudioPlayer && botAudioPlayer.audioCtx && typeof botAudioPlayer.audioCtx.setSinkId === 'function') {
-        try {
-          await botAudioPlayer.audioCtx.setSinkId(val);
+          const num = parseInt(val, 10);
+          await invoke('set_concurrency', { value: num });
+          state.cfg.num_parallel = num;
+          toast('Ollama concurrency set to ' + num);
         } catch (e) {
-          console.warn("Failed to update active speaker sink:", e);
+          toast('Failed to change concurrency: ' + e);
         }
       }
-    }
-  );
+    );
+  }
+
+  const modeContainer = $('mode-select-container');
+  if (modeContainer) {
+    const currentMode = cfg.mode === 'chat' ? 'chat' : 'auto';
+    createCustomSelect(
+      modeContainer,
+      [
+        { value: 'auto', label: 'Task (AI gate dynamic verify)' },
+        { value: 'chat', label: 'Chat (No automation)' }
+      ],
+      currentMode,
+      async (val) => {
+        try {
+          await invoke('set_app_mode', { mode: val });
+          state.cfg.mode = val;
+          toast('Agent mode changed to: ' + (val === 'chat' ? 'Chat' : 'Task'));
+        } catch (e) {
+          toast('Failed to change agent mode: ' + e);
+        }
+      }
+    );
+  }
+
+  const storageContainer = $('storage-select-container');
+  if (storageContainer) {
+    const currentStorage = (cfg.storage || 'Portable').toLowerCase();
+    createCustomSelect(
+      storageContainer,
+      [
+        { value: 'portable', label: 'Portable Mode (App folder)' },
+        { value: 'global', label: 'System Mode (Default system folder)' }
+      ],
+      currentStorage,
+      async (val) => {
+        try {
+          await invoke('set_storage_location', { location: val });
+          toast('Storage mode changed. Please restart the app and Ollama for full alignment.', 4000);
+        } catch (e) {
+          toast('Failed to change storage: ' + e);
+        }
+      }
+    );
+  }
+
+  const langContainer = $('language-select-container');
+  if (langContainer) {
+    const sysLang = navigator.language || 'en';
+    const langCode = sysLang.split('-')[0].toLowerCase();
+    const langNames = {
+      'en': 'English', 'es': 'Spanish', 'fr': 'French', 'de': 'German',
+      'it': 'Italian', 'pt': 'Portuguese', 'ja': 'Japanese', 'zh': 'Chinese', 'ru': 'Russian'
+    };
+    const detectedName = langNames[langCode] || sysLang;
+    const autoLabel = `Auto-detect (${detectedName})`;
+    const currentLang = localStorage.getItem('preferredLanguage') || 'auto';
+    createCustomSelect(
+      langContainer,
+      [
+        { value: 'auto', label: autoLabel },
+        { value: 'en', label: 'English' },
+        { value: 'es', label: 'Spanish' },
+        { value: 'fr', label: 'French' },
+        { value: 'de', label: 'German' },
+        { value: 'it', label: 'Italian' },
+        { value: 'pt', label: 'Portuguese' },
+        { value: 'ja', label: 'Japanese' },
+        { value: 'zh', label: 'Chinese' },
+        { value: 'ru', label: 'Russian' }
+      ],
+      currentLang,
+      (val) => {
+        localStorage.setItem('preferredLanguage', val);
+        toast("Preferred language updated");
+        const userLang = getVoiceLanguage();
+        if (recognition) {
+          try {
+            recognition.stop();
+            recognition.lang = userLang;
+            if (state.listening && !state.ttsSpeaking) {
+              recognition.start();
+            }
+          } catch(_) {}
+        }
+        if (wakeRecognition) {
+          try {
+            wakeRecognition.stop();
+            wakeRecognition.lang = userLang;
+            if (wakeListening) {
+              wakeRecognition.start();
+            }
+          } catch(_) {}
+        }
+      }
+    );
+  }
+
+  const appLangContainer = $('app-language-select-container');
+  if (appLangContainer) {
+    const currentAppLang = localStorage.getItem('appLanguage') || 'en';
+    createCustomSelect(
+      appLangContainer,
+      [
+        { value: 'en', label: 'English' }
+      ],
+      currentAppLang,
+      (val) => {
+        localStorage.setItem('appLanguage', val);
+        toast("App language updated");
+      }
+    );
+  }
+
+  const animContainer = $('anim-profile-select-container');
+  if (animContainer) {
+    const currentProfile = localStorage.getItem('animProfile') || 'full';
+    createCustomSelect(
+      animContainer,
+      [
+        { value: 'full', label: 'Full Animations' },
+        { value: 'medium', label: 'Medium (No Glow/Blur)' },
+        { value: 'none', label: 'None' }
+      ],
+      currentProfile,
+      (val) => {
+        setAnimationProfile(val);
+      }
+    );
+  }
+
+  const micContainer = $('mic-select-container');
+  if (micContainer) {
+    const currentMic = localStorage.getItem('selectedMicrophoneId') || 'default';
+    createCustomSelect(
+      micContainer,
+      micOptions,
+      currentMic,
+      (val) => {
+        localStorage.setItem('selectedMicrophoneId', val);
+        toast("Microphone updated");
+      }
+    );
+  }
+
+  const speakerContainer = $('speaker-select-container');
+  if (speakerContainer) {
+    const currentSpeaker = localStorage.getItem('selectedSpeakerId') || 'default';
+    createCustomSelect(
+      speakerContainer,
+      speakerOptions,
+      currentSpeaker,
+      async (val) => {
+        localStorage.setItem('selectedSpeakerId', val);
+        toast("Speaker output updated");
+        if (botAudioPlayer && botAudioPlayer.audioCtx && typeof botAudioPlayer.audioCtx.setSinkId === 'function') {
+          try {
+            await botAudioPlayer.audioCtx.setSinkId(val);
+          } catch (e) {
+            console.warn("Failed to update active speaker sink:", e);
+          }
+        }
+      }
+    );
+  }
 
   const voiceContainer = $('voice-select-container');
   if (voiceContainer) {
@@ -7950,6 +8783,8 @@ if (speakers.length === 0) {
           try {
             await invoke('save_localai_voice', { voice: val });
             toast("Voice character updated to: " + val);
+            await loadConfig();
+            renderSettings();
           } catch(e) { toast('Error saving voice: ' + e); }
         }
       );
@@ -7980,41 +8815,82 @@ if (speakers.length === 0) {
     }
   }
 
+  const sttEngineContainer = $('stt-engine-select-container');
+  if (sttEngineContainer) {
+    const isLaInstalled = await invoke('is_localai_installed').catch(() => false);
+    let sttModels = [];
+    if (isLaInstalled) {
+      const laModels = await invoke('list_localai_models').catch(() => []);
+      sttModels = laModels.filter(m => {
+        const cats = typeof getModelCategories === 'function' ? getModelCategories(m) : [];
+        return cats.includes('listening') && m.installed;
+      });
+    }
+
+    const sttOptions = [
+      { value: 'native', label: 'Native Browser API (Online)' }
+    ];
+    sttModels.forEach(m => {
+      sttOptions.push({ value: m.name, label: `Local Model (${m.name})` });
+    });
+
+    const activeStt = cfg.localai_models?.listening || 'native';
+
+    createCustomSelect(
+      sttEngineContainer,
+      sttOptions,
+      activeStt,
+      async (val) => {
+        try {
+          const modelName = val === 'native' ? '' : val;
+          await invoke('switch_localai_model', { category: 'listening', model_name: modelName });
+          toast("Speech recognition engine updated to: " + (val === 'native' ? 'Native Browser API' : val));
+          await loadConfig();
+          renderSettings();
+        } catch(e) {
+          toast('Error updating speech engine: ' + e);
+        }
+      }
+    );
+  }
+
   const bgWake = $('toggle-bg-wake');
   if (bgWake) {
     bgWake.classList.toggle('on', state.cfg.run_in_background || false);
   }
 
-// Load sys info
-try {
-const info = await invoke('get_device_info');
-const sysEl = $('sys-info');
-if (sysEl && info) {
-const screenWidth = window.screen.width * window.devicePixelRatio;
-const screenHeight = window.screen.height * window.devicePixelRatio;
-const scale = window.devicePixelRatio;
-sysEl.textContent =
-`OS: ${info.os_name} ${info.os_version}\n` +
-`CPU: ${info.cpu_model} (${info.cpu_cores} cores)\n` +
-`RAM: ${Math.round(info.ram_mb/1024)}GB\n` +
-`GPU: ${info.gpu}\n` +
-`Screen: ${Math.round(screenWidth)}x${Math.round(screenHeight)} (Scale: ${scale.toFixed(1)}x)`;
-}
-} catch(_) {}
-
-// Query mobile permissions asynchronously if on mobile
-if (isMobile) {
-  setTimeout(async () => {
+  // Load sys info
+  const sysEl = $('sys-info');
+  if (sysEl) {
     try {
-      const perms = await invoke('check_mobile_permissions');
-      updateMobilePermissionsUI(perms);
-    } catch (e) {
-      console.warn("Failed to check mobile permissions:", e);
-    }
-  }, 50);
-}
+      const info = await invoke('get_device_info');
+      if (sysEl && info) {
+        const screenWidth = window.screen.width * window.devicePixelRatio;
+        const screenHeight = window.screen.height * window.devicePixelRatio;
+        const scale = window.devicePixelRatio;
+        sysEl.textContent =
+          `OS: ${info.os_name} ${info.os_version}\n` +
+          `CPU: ${info.cpu_model} (${info.cpu_cores} cores)\n` +
+          `RAM: ${Math.round(info.ram_mb/1024)}GB\n` +
+          `GPU: ${info.gpu}\n` +
+          `Screen: ${Math.round(screenWidth)}x${Math.round(screenHeight)} (Scale: ${scale.toFixed(1)}x)`;
+      }
+    } catch(_) {}
+  }
 
-  if (isLaInstalled) {
+  // Query mobile permissions asynchronously if on mobile and permissions screen is active
+  if (isMobile && state.currentSettingsCategory === 'mobile') {
+    setTimeout(async () => {
+      try {
+        const perms = await invoke('check_mobile_permissions');
+        updateMobilePermissionsUI(perms);
+      } catch (e) {
+        console.warn("Failed to check mobile permissions:", e);
+      }
+    }, 50);
+  }
+
+  if (isLaInstalled && state.currentSettingsCategory === 'localai') {
     const imagesModels = laModels.filter(m => m.category === 'images');
     const videoModels = laModels.filter(m => m.category === 'video');
     const speakingModels = laModels.filter(m => m.category === 'speaking');
@@ -8040,6 +8916,7 @@ if (isMobile) {
             try {
               await invoke('switch_localai_model', { category, model_name: '' });
               toast(`Disabled local ${category} model`);
+              await loadConfig();
               renderSettings();
             } catch(e) { toast('Error: ' + e); }
           } else {
@@ -8057,8 +8934,6 @@ if (isMobile) {
     wireModelDropdown('localai-speaking-select-container', speakingModels, cfg.localai_models?.speaking || '', 'speaking');
     wireModelDropdown('localai-listening-select-container', listeningModels, cfg.localai_models?.listening || '', 'listening');
     wireModelDropdown('localai-music-select-container', musicModels, cfg.localai_models?.music || '', 'music');
-
-    // Voice select is now handled in the unified voice settings section.
   }
 }
 
@@ -8935,14 +9810,36 @@ async function setupEventListeners() {
   await listen('tauri://maximized', () => {
     updateMaximizedState(true);
   });
-  await listen('tauri://unmaximized', () => {
+  await listen('tauri://unmaximized', async () => {
     // Clear size cache to force re-evaluation of layout dimensions upon unmaximizing
     window._cww = null;
     window._cwh = null;
     state.forceExpanded = !unmaximizeToCompact;
     unmaximizeTriggeredByButton = false;
-    unmaximizeToCompact = false;
+    
+    // Restore last workspace size or default size if not going to compact mode
+    if (!unmaximizeToCompact && window.__TAURI__ && window.__TAURI__.window) {
+      try {
+        const appWindow = window.__TAURI__.window.getCurrentWindow();
+        let hasSavedSize = !!localStorage.getItem('workspace_width');
+        let savedW = parseInt(localStorage.getItem('workspace_width') || '950');
+        let savedH = parseInt(localStorage.getItem('workspace_height') || '700');
+        if (savedW < 600 || savedH < 400) {
+          savedW = 950;
+          savedH = 700;
+          hasSavedSize = false;
+        }
+        await appWindow.setSize(new window.__TAURI__.dpi.LogicalSize(savedW, savedH));
+        if (!hasSavedSize) {
+          await appWindow.center();
+        }
+      } catch (e) {
+        console.error("Failed to restore window size:", e);
+      }
+    }
+    
     updateMaximizedState(false);
+    unmaximizeToCompact = false;
     // Fallback: force size recalculation after OS drag settles
     setTimeout(() => {
       window._cww = null;
@@ -8951,7 +9848,7 @@ async function setupEventListeners() {
     }, 150);
   });
 
-  // Debounced fallback window resize listener for robust maximization tracking
+  // Debounced fallback window resize listener for robust maximization tracking and workspace size saving
   let resizeTimeout;
   window.addEventListener('resize', () => {
     clearTimeout(resizeTimeout);
@@ -8959,8 +9856,19 @@ async function setupEventListeners() {
       try {
         const isMax = await invoke('is_window_maximized');
         updateMaximizedState(isMax);
+        
+        // If in workspace view and not maximized, save the user's customized restored size!
+        if (!isMax && document.body.classList.contains('maximized')) {
+          const w = window.innerWidth;
+          const h = window.innerHeight;
+          // Only save valid sizes (larger than compact bar dimensions)
+          if (w > 600 && h > 400) {
+            localStorage.setItem('workspace_width', String(w));
+            localStorage.setItem('workspace_height', String(h));
+          }
+        }
       } catch (_) {}
-    }, 50);
+    }, 200);
   });
 
   // Voice transcription received
@@ -9013,16 +9921,70 @@ async function setupEventListeners() {
     if (msg && msg.startsWith('JSON_MEDIA_GEN:')) {
       try {
         const payload = JSON.parse(msg.substring(15));
-        const existing = msgs.querySelector(`.media-skeleton-loader[data-media-type="${payload.type}"]`);
+        let existing = msgs.querySelector(`.media-skeleton-loader[data-media-type="${payload.type}"]`);
+        
+        if (payload.status === 'failed' || payload.status === 'complete') {
+          if (existing) {
+            existing.remove();
+          }
+          return;
+        }
+
         if (!existing) {
-          const loader = createMediaSkeletonLoader(payload.type, payload.prompt);
+          existing = createMediaSkeletonLoader(payload.type, payload.prompt);
           if (state.thinkingEl) {
-            msgs.insertBefore(loader, state.thinkingEl);
+            msgs.insertBefore(existing, state.thinkingEl);
           } else {
-            msgs.appendChild(loader);
+            msgs.appendChild(existing);
           }
           msgs.scrollTop = msgs.scrollHeight;
           syncWindowSize();
+        }
+
+        const progressLine = existing.querySelector('.media-skeleton-progress-line');
+        const percentEl = existing.querySelector('.media-skeleton-percent');
+        const descEl = existing.querySelector('.media-skeleton-desc');
+
+        if (payload.status === 'progress') {
+          if (progressLine) {
+            progressLine.classList.remove('media-skeleton-indeterminate');
+            progressLine.style.width = payload.percent + '%';
+          }
+          if (percentEl) {
+            percentEl.textContent = payload.percent + '%';
+            percentEl.classList.remove('hidden');
+          }
+          if (descEl) {
+            descEl.textContent = `Step ${payload.step}/${payload.total_steps} (${payload.percent}%)`;
+          }
+        } else if (payload.status === 'complete') {
+          if (progressLine) {
+            progressLine.classList.remove('media-skeleton-indeterminate');
+            progressLine.style.width = '100%';
+          }
+          if (percentEl) {
+            percentEl.textContent = '100%';
+            percentEl.classList.remove('hidden');
+          }
+          if (descEl) {
+            descEl.textContent = 'Generation complete!';
+          }
+        } else if (payload.status === 'failed') {
+          if (descEl) {
+            descEl.textContent = 'Generation failed.';
+          }
+        } else {
+          if (progressLine) {
+            progressLine.classList.add('media-skeleton-indeterminate');
+            progressLine.style.width = '30%';
+          }
+          if (percentEl) {
+            percentEl.textContent = '';
+            percentEl.classList.add('hidden');
+          }
+          if (descEl) {
+            descEl.textContent = payload.message || 'Creating AI synthesis, this may take a moment.';
+          }
         }
       } catch (err) {
         console.error("Failed to parse JSON_MEDIA_GEN step", err);
@@ -9288,12 +10250,24 @@ async function setupEventListeners() {
     if (botAudioPlayer) {
       botAudioPlayer.stop();
     }
+    state.ttsSpeaking = false;
+    state.voiceState = state.listening ? 'listening' : null;
+    updateVoiceVisuals(state.voiceState || 'listening');
+    if (state.listening && recognition) {
+      try { recognition.start(); } catch(_) {}
+    }
   });
 
   await listen('voice-state', e => {
     const payload = e.payload || {};
     const newState = payload.state;
     state.voiceState = newState;
+    if (newState === 'listening') {
+      state.ttsSpeaking = false;
+      if (state.listening && recognition) {
+        try { recognition.start(); } catch(_) {}
+      }
+    }
     updateVoiceVisuals(newState);
   });
 }
@@ -9517,16 +10491,74 @@ async function boot() {
   // Set up IPC event listeners
   await setupEventListeners().catch(console.warn);
 
-  // Initialize maximized state class on boot
+  // Initialize maximized/workspace/compact state on boot
   try {
-    const isMax = await invoke('is_window_maximized');
-    if (isMax) {
-      document.body.classList.add('window-maximized');
+    if (window.__TAURI__ && window.__TAURI__.window) {
+      const appWindow = window.__TAURI__.window.getCurrentWindow();
+      const lastMode = localStorage.getItem('lastViewMode') || 'compact';
+      if (lastMode === 'maximized') {
+        isMaximized = true;
+        document.body.classList.add('maximized');
+        document.body.classList.add('window-maximized');
+        try { await invoke('set_shadow_enabled', { enabled: true }); } catch(_) {}
+        await appWindow.maximize();
+        try { await invoke('set_always_on_top', { enabled: false }); } catch(_) {}
+      } else if (lastMode === 'restored') {
+        isMaximized = false;
+        unmaximizeToCompact = false;
+        state.forceExpanded = true;
+        document.body.classList.add('maximized');
+        document.body.classList.remove('window-maximized');
+        
+        let savedW = parseInt(localStorage.getItem('workspace_width') || '950');
+        let savedH = parseInt(localStorage.getItem('workspace_height') || '700');
+        if (savedW < 600 || savedH < 400) {
+          savedW = 950;
+          savedH = 700;
+        }
+        try { await invoke('set_shadow_enabled', { enabled: true }); } catch(_) {}
+        await appWindow.unmaximize();
+        await appWindow.setSize(new window.__TAURI__.dpi.LogicalSize(savedW, savedH));
+        await appWindow.center();
+        try { await invoke('set_always_on_top', { enabled: state.pinned }); } catch(_) {}
+      } else {
+        isMaximized = false;
+        unmaximizeToCompact = true;
+        state.forceExpanded = false;
+        document.body.classList.remove('maximized');
+        document.body.classList.remove('window-maximized');
+        try { await invoke('set_shadow_enabled', { enabled: false }); } catch(_) {}
+        await appWindow.unmaximize();
+        try { await invoke('set_always_on_top', { enabled: state.pinned }); } catch(_) {}
+        await syncWindowSize();
+      }
+    } else {
+      const lastMode = localStorage.getItem('lastViewMode') || 'compact';
+      if (lastMode === 'maximized') {
+        isMaximized = true;
+        document.body.classList.add('maximized');
+        document.body.classList.add('window-maximized');
+      } else if (lastMode === 'restored') {
+        isMaximized = false;
+        unmaximizeToCompact = false;
+        state.forceExpanded = true;
+        document.body.classList.add('maximized');
+        document.body.classList.remove('window-maximized');
+      } else {
+        isMaximized = false;
+        unmaximizeToCompact = true;
+        state.forceExpanded = false;
+        document.body.classList.remove('maximized');
+        document.body.classList.remove('window-maximized');
+      }
     }
-  } catch(_) {}
+  } catch(e) {
+    console.error("Error restoring last view mode on boot:", e);
+  }
 
   // Load config
   await loadConfig();
+  updateTooltipsWithShortcuts();
 
   // Ensure welcome state is correctly initialized on boot
   updateWelcomeState();
@@ -9612,7 +10644,7 @@ function closeSidebar() {
 }
 
 async function renderSidebarContent() {
-  if (!isMaximized || !isSidebarOpen) return;
+  if (!isSidebarOpen) return;
   await renderSidebarConvs();
   await renderSidebarTasks();
   await renderSidebarSettings();
@@ -9622,6 +10654,7 @@ async function renderSidebarContent() {
 async function renderSidebarDevice() {
   const content = $('sidebar-device-content');
   if (!content) return;
+  content.innerHTML = `<div class="sidebar-loader-wrapper"><span class="sidebar-loader"></span></div>`;
 
   // Restore expanded/collapsed state from localStorage
   const isExpanded = localStorage.getItem('sidebarDeviceExpanded') === '1';
@@ -9751,6 +10784,10 @@ function cleanPreviewText(text) {
 }
 
 async function renderSidebarConvs() {
+  const list = $('sidebar-conv-list');
+  if (list) {
+    list.innerHTML = `<div class="sidebar-loader-wrapper"><span class="sidebar-loader"></span></div>`;
+  }
   const query = (state.sidebarConvSearchQuery || '').trim();
   let convs = [];
   try {
@@ -9759,8 +10796,6 @@ async function renderSidebarConvs() {
     console.error('[renderSidebarConvs] Failed to load conversations:', e);
   }
   state.conversations = convs;
-
-  const list = $('sidebar-conv-list');
   if (!list) return;
 
   const sorted = convs.sort((a, b) => {
@@ -9781,7 +10816,7 @@ async function renderSidebarConvs() {
     const spinnerHtml = isRunning ? `<span class="conv-row-spinner"></span>` : '';
     const dateHtml = `<span class="conv-date-hover">${escHtml(formatShortDate(c.last_message_at))}</span>`;
 
-    return `<div class="conv-row${isActive?' active':''}" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
+    return `<div class="conv-row${isActive?' active':''}" tabindex="0" data-id="${escAttr(c.id)}" onclick="loadConversation('${escAttr(c.id)}')">
       <span class="conv-title">${escHtml(displayName)}</span>
       <div class="conv-meta-actions">
         ${dateHtml}
@@ -9815,11 +10850,13 @@ async function deleteConversationSidebar(id) {
 }
 
 async function renderSidebarTasks() {
+  const list = $('sidebar-tasks-list');
+  if (list) {
+    list.innerHTML = `<div class="sidebar-loader-wrapper"><span class="sidebar-loader"></span></div>`;
+  }
   let tasks = [];
   try { tasks = await invoke('list_tasks'); } catch(_) {}
   state.tasks = tasks;
-
-  const list = $('sidebar-tasks-list');
   if (!list) return;
   if (!tasks.length) {
     list.innerHTML = '<div style="color:var(--text-dim);font-size:11px;padding:8px">No scheduled tasks.</div>';
@@ -9848,11 +10885,13 @@ async function deleteTaskSidebar(id) {
 }
 
 async function renderSidebarSettings() {
+  const content = $('sidebar-settings-content');
+  if (content) {
+    content.innerHTML = `<div class="sidebar-loader-wrapper"><span class="sidebar-loader"></span></div>`;
+  }
   let cfg = {};
   try { cfg = await invoke('get_config'); } catch(_) {}
   state.cfg = cfg;
-
-  const content = $('sidebar-settings-content');
   if (!content) return;
   content.innerHTML = `
     <div class="setting-row" style="padding: 6px 4px; gap: 8px;">
@@ -9933,7 +10972,7 @@ function toggleWakeWordSidebar() {
 }
 
 function updateSidebarIfOpen() {
-  if (isMaximized && isSidebarOpen) {
+  if (isSidebarOpen) {
     renderSidebarContent();
   }
 }
@@ -9964,37 +11003,114 @@ function toggleSidebarDevice() {
 window.toggleSidebarDevice = toggleSidebarDevice;
 
 // ── Attachments (Drag & Drop / Paste) ──────────────────────────────────
+function getUniqueAttachmentName(name) {
+  if (!state.attachments || state.attachments.length === 0) return name;
+  const extIndex = name.lastIndexOf('.');
+  const base = extIndex !== -1 ? name.slice(0, extIndex) : name;
+  const ext = extIndex !== -1 ? name.slice(extIndex) : '';
+  let finalName = name;
+  let counter = 2;
+  while (state.attachments.some(att => att.name.toLowerCase() === finalName.toLowerCase())) {
+    finalName = `${base}-${counter}${ext}`;
+    counter++;
+  }
+  return finalName;
+}
+
 function handleFiles(files) {
   if (!state.attachments) state.attachments = [];
   Array.from(files).forEach(file => {
     const reader = new FileReader();
-    if (file.type.startsWith('image/')) {
+    const filePath = file.path || '';
+    const uniqueName = getUniqueAttachmentName(file.name);
+    const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp|ico)$/i.test(file.name);
+    
+    const isText = file.type.startsWith('text/') || 
+                   /\.(txt|js|ts|py|rs|go|c|cpp|h|css|html|json|yaml|yml|md|csv|ini|toml|sh|bat|ps1|conf)$/i.test(file.name);
+
+    if (isImage) {
       reader.onload = (e) => {
         state.attachments.push({
-          name: file.name,
-          type: file.type,
+          name: uniqueName,
+          path: filePath,
+          type: file.type || 'image/png',
           dataUrl: e.target.result,
           content: e.target.result.split(',')[1] // base64 string
         });
         renderAttachments();
         syncWindowSize();
+        updateActionBtn();
       };
       reader.readAsDataURL(file);
-    } else {
+    } else if (isText) {
       reader.onload = (e) => {
         state.attachments.push({
-          name: file.name,
-          type: file.type,
+          name: uniqueName,
+          path: filePath,
+          type: file.type || 'text/plain',
           content: e.target.result, // plain text content
           dataUrl: null
         });
         renderAttachments();
         syncWindowSize();
+        updateActionBtn();
       };
       reader.readAsText(file);
+    } else {
+      // Binary file (PDF, docx, audio, video, zip, etc.)
+      reader.onload = (e) => {
+        state.attachments.push({
+          name: uniqueName,
+          path: filePath,
+          type: file.type || 'application/octet-stream',
+          content: e.target.result.split(',')[1], // base64 string
+          dataUrl: null
+        });
+        renderAttachments();
+        syncWindowSize();
+        updateActionBtn();
+      };
+      reader.readAsDataURL(file);
     }
   });
 }
+
+async function handleFilePaths(paths) {
+  if (!state.attachments) state.attachments = [];
+  for (const path of paths) {
+    try {
+      const alreadyExists = state.attachments.some(att => att.path === path);
+      if (alreadyExists) continue;
+
+      const info = await invoke('read_file_for_attachment', { path });
+      const uniqueName = getUniqueAttachmentName(info.name);
+
+      if (info.is_image) {
+        state.attachments.push({
+          name: uniqueName,
+          path: path,
+          type: info.mime_type,
+          dataUrl: `data:${info.mime_type};base64,${info.content}`,
+          content: info.content
+        });
+      } else {
+        state.attachments.push({
+          name: uniqueName,
+          path: path,
+          type: info.mime_type,
+          dataUrl: null,
+          content: info.content
+        });
+      }
+    } catch (e) {
+      toast(`Failed to attach file: ${e}`);
+    }
+  }
+  renderAttachments();
+  syncWindowSize();
+  updateActionBtn();
+}
+window.handleFilePaths = handleFilePaths;
 
 function renderAttachments() {
   const container = $('attachments-preview');
@@ -10016,10 +11132,10 @@ function renderAttachments() {
       imgHtml = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`;
     }
     return `
-      <div class="attachment-chip" data-idx="${i}">
+      <div class="attachment-chip" data-idx="${i}" onclick="previewAttachmentInput(${i}, event)">
         ${imgHtml}
         <span class="attachment-chip-name" title="${escAttr(att.name)}">${escHtml(att.name)}</span>
-        <button class="attachment-remove" onclick="removeAttachment(${i})" title="Remove">×</button>
+        <button class="attachment-remove" onclick="removeAttachment(${i}); event.stopPropagation();" title="Remove">×</button>
       </div>
     `;
   }).join('');
@@ -10030,19 +11146,97 @@ function removeAttachment(idx) {
     state.attachments.splice(idx, 1);
     renderAttachments();
     syncWindowSize();
+    updateActionBtn();
   }
 }
 window.removeAttachment = removeAttachment;
 
+function previewAttachmentInput(idx, event) {
+  if (event && event.target.closest('.attachment-remove')) return;
+  const att = state.attachments[idx];
+  if (!att) return;
+  
+  let previewType = 'file';
+  let previewData = att.content;
+  if (att.type.startsWith('image/')) {
+    previewType = 'image';
+    previewData = att.dataUrl;
+  } else if (att.type.startsWith('text/') || /\.(txt|js|ts|py|rs|go|c|cpp|h|css|html|json|yaml|yml|md|csv|ini|toml|sh|bat|ps1|conf)$/i.test(att.name)) {
+    previewType = 'text';
+  }
+  openGalleryPreview(att.name, previewType, previewData, att.type);
+}
+window.previewAttachmentInput = previewAttachmentInput;
+
+function openGalleryPreview(name, type, data, mimeType = '') {
+  const overlay = $('overlay-gallery');
+  const filenameEl = $('gallery-filename');
+  const contentEl = $('gallery-preview-content');
+  if (!overlay || !filenameEl || !contentEl) return;
+
+  filenameEl.textContent = name;
+  contentEl.innerHTML = '';
+
+  if (type === 'image') {
+    const img = document.createElement('img');
+    img.src = data;
+    img.className = 'gallery-image-preview';
+    contentEl.appendChild(img);
+  } else if (type === 'text') {
+    const pre = document.createElement('pre');
+    pre.className = 'gallery-text-preview';
+    
+    let textContent = data;
+    if (data && !data.includes('\n') && data.length % 4 === 0 && /^[A-Za-z0-9+/=]+$/.test(data)) {
+      try {
+        textContent = atob(data);
+      } catch(_) {}
+    }
+    pre.textContent = textContent;
+    contentEl.appendChild(pre);
+  } else {
+    const div = document.createElement('div');
+    div.className = 'gallery-generic-preview';
+    div.innerHTML = `
+      <svg viewBox="0 0 24 24" width="64" height="64" fill="none" stroke="currentColor" stroke-width="1.5" style="margin-bottom:16px; opacity:0.6;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      <h3>${escHtml(name)}</h3>
+      <p style="opacity:0.6; margin-top:8px;">Binary or non-previewable file type</p>
+      <p style="opacity:0.4; font-size:12px; margin-top:4px;">${escHtml(mimeType || 'unknown mime type')}</p>
+    `;
+    contentEl.appendChild(div);
+  }
+
+  openOverlay('gallery');
+}
+window.openGalleryPreview = openGalleryPreview;
+
 function initDragAndDrop() {
+  const overlay = $('drag-drop-overlay');
+
+  document.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (overlay) overlay.classList.remove('hidden');
+  });
+
   document.addEventListener('dragover', (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (overlay) overlay.classList.remove('hidden');
   });
-  
+
+  document.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.relatedTarget === null || e.clientX <= 0 || e.clientY <= 0 || e.clientX >= window.innerWidth || e.clientY >= window.innerHeight) {
+      if (overlay) overlay.classList.add('hidden');
+    }
+  });
+
   document.addEventListener('drop', (e) => {
     e.preventDefault();
     e.stopPropagation();
+    if (overlay) overlay.classList.add('hidden');
     const files = e.dataTransfer?.files;
     if (files && files.length > 0) {
       handleFiles(files);
@@ -10056,6 +11250,84 @@ function initDragAndDrop() {
       handleFiles(files);
     }
   });
+
+  if (window.__TAURI__) {
+    const { listen } = window.__TAURI__.event;
+    
+    listen('drag-over', () => {
+      if (overlay) overlay.classList.remove('hidden');
+    });
+    
+    listen('drag-leave', () => {
+      if (overlay) overlay.classList.add('hidden');
+    });
+    
+    listen('drag-drop', (event) => {
+      if (overlay) overlay.classList.add('hidden');
+      const paths = event.payload;
+      if (paths && paths.length > 0) {
+        handleFilePaths(paths);
+      }
+    });
+
+    listen('tauri://file-drop-hover', () => {
+      if (overlay) overlay.classList.remove('hidden');
+    });
+    
+    listen('tauri://file-drop-cancelled', () => {
+      if (overlay) overlay.classList.add('hidden');
+    });
+    
+    listen('tauri://file-drop', (event) => {
+      if (overlay) overlay.classList.add('hidden');
+      const paths = event.payload;
+      if (paths && paths.length > 0) {
+        handleFilePaths(paths);
+      }
+    });
+  }
+
+  const fileInput = $('attachment-file-input');
+  if (fileInput) {
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files && fileInput.files.length > 0) {
+        handleFiles(fileInput.files);
+        fileInput.value = '';
+      }
+    });
+  }
+
+  // Global Ctrl + U shortcut to open file selector
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'u') {
+      e.preventDefault();
+      if (fileInput) fileInput.click();
+    }
+  });
+
+  const brandBtn = $('brand-btn');
+  const brandMenu = $('brand-popup-menu');
+  if (brandBtn && brandMenu) {
+    brandBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      brandMenu.classList.toggle('hidden');
+    });
+  }
+  
+  document.addEventListener('click', (e) => {
+    if (brandMenu && !brandMenu.contains(e.target) && e.target !== brandBtn) {
+      brandMenu.classList.add('hidden');
+    }
+  });
+
+  const attachBtn = $('brand-menu-attach-btn');
+  if (attachBtn) {
+    attachBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (brandMenu) brandMenu.classList.add('hidden');
+      if (fileInput) fileInput.click();
+    });
+  }
 }
 
 // ── Native-Looking Context Menu ─────────────────────────────────────────
@@ -10354,13 +11626,209 @@ function initMaxDoubleClicks() {
   }
 }
 
-// Input focus shortcut (/ key to focus from anywhere)
+// Input focus shortcut (/ key to focus from anywhere) and keyboard shortcut navigation
+document.addEventListener('mousedown', () => {
+  document.body.classList.remove('keyboard-navigation');
+});
+
 document.addEventListener('keydown', e => {
-  if (e.key === '/' && document.activeElement !== input) {
-    e.preventDefault();
-    input.focus();
+  if (['Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+    document.body.classList.add('keyboard-navigation');
   }
-  if (e.key === 'Escape') closeAllOverlays();
+  // If we are currently recording/editing a shortcut in Settings:
+  if (currentListeningShortcutAction) {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Capture the key combination
+    const parts = [];
+    if (e.ctrlKey) parts.push('control');
+    if (e.metaKey) parts.push('meta');
+    if (e.shiftKey) parts.push('shift');
+    if (e.altKey) parts.push('alt');
+    
+    const key = e.key.toLowerCase();
+    // Do not add modifier key alone
+    if (key !== 'control' && key !== 'meta' && key !== 'shift' && key !== 'alt') {
+      parts.push(key);
+      const newShortcut = parts.join('+');
+      
+      const shortcuts = getShortcuts();
+      shortcuts[currentListeningShortcutAction] = newShortcut;
+      localStorage.setItem('customShortcuts', JSON.stringify(shortcuts));
+      
+      toast(`Shortcut for ${currentListeningShortcutAction} set to: ${newShortcut}`);
+      currentListeningShortcutAction = null;
+      
+      updateTooltipsWithShortcuts();
+      // Re-render Settings shortcuts list to update UI
+      renderSettings();
+    }
+    return;
+  }
+
+  const shortcuts = getShortcuts();
+  
+  // Escape key closes overlays and slash menu
+  if (e.key === 'Escape') {
+    closeAllOverlays();
+    const slashMenu = $('slash-menu');
+    if (slashMenu) slashMenu.classList.add('hidden');
+    return;
+  }
+  
+  // Enter/Space key simulator on custom tabindex focusable elements
+  if (e.key === 'Enter' || e.key === ' ') {
+    const active = document.activeElement;
+    if (active && active.hasAttribute('tabindex') && active.tagName.toLowerCase() !== 'button' && active.tagName.toLowerCase() !== 'input' && active.tagName.toLowerCase() !== 'select' && active.tagName.toLowerCase() !== 'textarea') {
+      e.preventDefault();
+      active.click();
+      return;
+    }
+  }
+  
+  // 1. Focus Input (slash key '/' is default or configured)
+  const active = document.activeElement;
+  const isTyping = active && (active.tagName.toLowerCase() === 'textarea' || (active.tagName.toLowerCase() === 'input' && active.type === 'text') || active.isContentEditable);
+  
+  if (matchShortcut(e, shortcuts.focus_input)) {
+    if (!isTyping) {
+      const input = $('input');
+      if (input) {
+        e.preventDefault();
+        input.focus();
+      }
+    }
+    return;
+  }
+  
+  // 2. Toggle Sidebar
+  if (matchShortcut(e, shortcuts.toggle_sidebar)) {
+    e.preventDefault();
+    toggleSidebar();
+    return;
+  }
+  
+  // 3. Open Settings
+  if (matchShortcut(e, shortcuts.open_settings)) {
+    e.preventDefault();
+    openOverlay('settings');
+    return;
+  }
+  
+  // 4. Open Models
+  if (matchShortcut(e, shortcuts.open_models)) {
+    e.preventDefault();
+    openOverlay('model');
+    return;
+  }
+  
+  // 5. Toggle Voice Mode
+  if (matchShortcut(e, shortcuts.toggle_voice)) {
+    e.preventDefault();
+    const micBtn = document.querySelector('.talkbar-mic-btn') || $('action-btn');
+    if (micBtn) micBtn.click();
+    return;
+  }
+  
+  // 6. Clear Chat
+  if (matchShortcut(e, shortcuts.clear_chat)) {
+    e.preventDefault();
+    const clearBtn = $('clear-btn') || document.querySelector('[title*="Clear"]');
+    if (clearBtn) clearBtn.click();
+    else {
+      const msgs = $('messages');
+      if (msgs) msgs.innerHTML = '';
+      state.currentConvId = '';
+      toast('Chat cleared');
+    }
+    return;
+  }
+
+  // 7. Toggle Maximize (Fullscreen)
+  if (matchShortcut(e, shortcuts.toggle_maximize)) {
+    e.preventDefault();
+    toggleMaximize();
+    return;
+  }
+
+  // 8. Switch to Compact View
+  if (matchShortcut(e, shortcuts.switch_compact)) {
+    e.preventDefault();
+    toggleCompactView();
+    return;
+  }
+
+  // 9. Switch to Restored Workspace View
+  if (matchShortcut(e, shortcuts.switch_workspace)) {
+    e.preventDefault();
+    if (document.body.classList.contains('window-maximized')) {
+      toggleMaximize();
+    } else if (unmaximizeToCompact || !state.forceExpanded) {
+      window._cww = null;
+      window._cwh = null;
+      unmaximizeTriggeredByButton = true;
+      unmaximizeToCompact = false;
+      state.forceExpanded = true;
+      document.body.classList.add('maximized');
+      syncWindowSize();
+    }
+    return;
+  }
+  
+  // ── Arrow navigation inside Sidebar (when open) ──
+  if (isSidebarOpen && !isTyping && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter')) {
+    const rows = Array.from(document.querySelectorAll('#sidebar-conv-list .conv-row'));
+    if (rows.length > 0) {
+      let focusedIdx = rows.findIndex(r => r === active || r.classList.contains('focused-shortcut'));
+      
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        rows.forEach(r => r.classList.remove('focused-shortcut'));
+        focusedIdx = (focusedIdx + 1) % rows.length;
+        rows[focusedIdx].classList.add('focused-shortcut');
+        rows[focusedIdx].focus();
+        rows[focusedIdx].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        rows.forEach(r => r.classList.remove('focused-shortcut'));
+        focusedIdx = (focusedIdx - 1 + rows.length) % rows.length;
+        rows[focusedIdx].classList.add('focused-shortcut');
+        rows[focusedIdx].focus();
+        rows[focusedIdx].scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter') {
+        if (focusedIdx !== -1) {
+          e.preventDefault();
+          rows[focusedIdx].click();
+        }
+      }
+      return;
+    }
+  }
+
+  // ── Arrow navigation inside open views / overlays / entire app ──
+  if (!isTyping && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    const openOverlay = document.querySelector('.overlay.open');
+    const container = openOverlay || document.body;
+    
+    // Select all visible focusable items
+    const focusable = Array.from(container.querySelectorAll('button, input, select, [tabindex="0"]')).filter(el => {
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0 && el.offsetHeight > 0;
+    });
+    
+    if (focusable.length > 0) {
+      e.preventDefault();
+      let activeIdx = focusable.indexOf(active);
+      if (e.key === 'ArrowDown') {
+        activeIdx = (activeIdx + 1) % focusable.length;
+      } else {
+        activeIdx = (activeIdx - 1 + focusable.length) % focusable.length;
+      }
+      focusable[activeIdx].focus();
+      return;
+    }
+  }
 });
 
 async function openSystemPermissions() {
@@ -11310,6 +12778,10 @@ onDOMContentLoaded(() => {
   let slashMenuSelectedIndex = 0;
   let filteredSlashCommands = [];
 
+  let atMenuVisible = false;
+  let atMenuSelectedIndex = 0;
+  let filteredAtFiles = [];
+
   function initSlashMenu() {
     const barShell = $('bar-shell');
     if (!barShell) return;
@@ -11330,10 +12802,21 @@ onDOMContentLoaded(() => {
 
     input.addEventListener('input', () => {
       const val = input.value;
-      if (val.startsWith('/')) {
-        const query = val.toLowerCase();
+      const selectionStart = input.selectionStart;
+
+      // Find the start of the current word being typed (before the cursor)
+      let wordStart = selectionStart - 1;
+      while (wordStart >= 0 && !/\s/.test(val.charAt(wordStart))) {
+        wordStart--;
+      }
+      wordStart++; // Move back to the character after whitespace
+
+      const currentWord = val.slice(wordStart, selectionStart);
+
+      if (currentWord.startsWith('/')) {
+        const query = currentWord.slice(1).toLowerCase();
         filteredSlashCommands = SLASH_COMMANDS.filter(cmd => 
-          cmd.name.startsWith(query) || cmd.desc.toLowerCase().includes(query)
+          cmd.name.slice(1).startsWith(query) || cmd.desc.toLowerCase().includes(query)
         );
 
         if (filteredSlashCommands.length > 0) {
@@ -11347,35 +12830,78 @@ onDOMContentLoaded(() => {
           slashMenuVisible = false;
           syncWindowSize();
         }
-      } else {
-        slashMenu.classList.add('hidden');
-        slashMenuVisible = false;
-        syncWindowSize();
+        atMenuVisible = false;
+        return;
       }
+
+      if (currentWord.startsWith('@')) {
+        const query = currentWord.slice(1).toLowerCase();
+        const attachments = state.attachments || [];
+
+        filteredAtFiles = attachments.filter(att => 
+          att.name.toLowerCase().includes(query)
+        ).map(att => att.name);
+
+        if (filteredAtFiles.length > 0) {
+          atMenuSelectedIndex = Math.min(atMenuSelectedIndex, filteredAtFiles.length - 1);
+          renderAtMenu(slashMenu);
+          slashMenu.classList.remove('hidden');
+          atMenuVisible = true;
+          syncWindowSize();
+        } else {
+          slashMenu.classList.add('hidden');
+          atMenuVisible = false;
+          syncWindowSize();
+        }
+        slashMenuVisible = false;
+        return;
+      }
+
+      slashMenu.classList.add('hidden');
+      slashMenuVisible = false;
+      atMenuVisible = false;
+      syncWindowSize();
     });
 
     input.addEventListener('keydown', e => {
-      if (!slashMenuVisible) return;
+      if (!slashMenuVisible && !atMenuVisible) return;
+
+      const listLength = slashMenuVisible ? filteredSlashCommands.length : filteredAtFiles.length;
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         e.stopPropagation();
-        slashMenuSelectedIndex = (slashMenuSelectedIndex + 1) % filteredSlashCommands.length;
-        renderSlashMenu(slashMenu);
+        if (slashMenuVisible) {
+          slashMenuSelectedIndex = (slashMenuSelectedIndex + 1) % listLength;
+          renderSlashMenu(slashMenu);
+        } else {
+          atMenuSelectedIndex = (atMenuSelectedIndex + 1) % listLength;
+          renderAtMenu(slashMenu);
+        }
       } else if (e.key === 'ArrowUp') {
         e.preventDefault();
         e.stopPropagation();
-        slashMenuSelectedIndex = (slashMenuSelectedIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
-        renderSlashMenu(slashMenu);
+        if (slashMenuVisible) {
+          slashMenuSelectedIndex = (slashMenuSelectedIndex - 1 + listLength) % listLength;
+          renderSlashMenu(slashMenu);
+        } else {
+          atMenuSelectedIndex = (atMenuSelectedIndex - 1 + listLength) % listLength;
+          renderAtMenu(slashMenu);
+        }
       } else if (e.key === 'Enter') {
         e.preventDefault();
         e.stopPropagation();
-        executeSelectedCommand();
+        if (slashMenuVisible) {
+          executeSelectedCommand();
+        } else {
+          executeSelectedAtFile();
+        }
       } else if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
         slashMenu.classList.add('hidden');
         slashMenuVisible = false;
+        atMenuVisible = false;
         syncWindowSize();
       }
     }, { capture: true });
@@ -11384,6 +12910,7 @@ onDOMContentLoaded(() => {
       if (slashMenu && !slashMenu.contains(e.target) && e.target !== input) {
         slashMenu.classList.add('hidden');
         slashMenuVisible = false;
+        atMenuVisible = false;
         syncWindowSize();
       }
     });
@@ -11420,14 +12947,56 @@ onDOMContentLoaded(() => {
     });
   }
 
+  function renderAtMenu(el) {
+    el.innerHTML = '';
+    filteredAtFiles.forEach((filename, idx) => {
+      const item = document.createElement('button');
+      item.className = 'slash-item' + (idx === atMenuSelectedIndex ? ' active' : '');
+      
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'slash-item-name';
+      nameSpan.textContent = `@${filename}`;
+      
+      const descSpan = document.createElement('span');
+      descSpan.className = 'slash-item-desc';
+      descSpan.textContent = 'Reference attached file';
+      
+      item.appendChild(nameSpan);
+      item.appendChild(descSpan);
+
+      item.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        atMenuSelectedIndex = idx;
+        executeSelectedAtFile();
+      });
+
+      item.addEventListener('mousedown', e => e.stopPropagation());
+      item.addEventListener('dblclick', e => e.stopPropagation());
+
+      el.appendChild(item);
+    });
+  }
+
   function executeSelectedCommand() {
     const cmd = filteredSlashCommands[slashMenuSelectedIndex];
     if (cmd) {
       const input = $('input');
       if (input) {
-        input.value = '';
+        const val = input.value;
+        const selectionStart = input.selectionStart;
+        
+        let wordStart = selectionStart - 1;
+        while (wordStart >= 0 && !/\s/.test(val.charAt(wordStart))) {
+          wordStart--;
+        }
+        wordStart++;
+
+        const newVal = val.slice(0, wordStart) + val.slice(selectionStart);
+        input.value = newVal;
         input.style.height = '32px';
         input.focus();
+        input.setSelectionRange(wordStart, wordStart);
       }
       const slashMenu = $('slash-menu');
       if (slashMenu) {
@@ -11436,6 +13005,35 @@ onDOMContentLoaded(() => {
       slashMenuVisible = false;
       syncWindowSize();
       cmd.action();
+    }
+  }
+
+  function executeSelectedAtFile() {
+    const filename = filteredAtFiles[atMenuSelectedIndex];
+    if (filename) {
+      const input = $('input');
+      if (input) {
+        const val = input.value;
+        const selectionStart = input.selectionStart;
+        
+        let wordStart = selectionStart - 1;
+        while (wordStart >= 0 && !/\s/.test(val.charAt(wordStart))) {
+          wordStart--;
+        }
+        wordStart++;
+
+        const newVal = val.slice(0, wordStart) + `@${filename} ` + val.slice(selectionStart);
+        input.value = newVal;
+        input.focus();
+        const newPos = wordStart + filename.length + 2;
+        input.setSelectionRange(newPos, newPos);
+      }
+      const slashMenu = $('slash-menu');
+      if (slashMenu) {
+        slashMenu.classList.add('hidden');
+      }
+      atMenuVisible = false;
+      syncWindowSize();
     }
   }
 

@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod debug_log;
+pub mod intent;
 pub mod config;
 pub mod db;
 pub mod device;
@@ -127,6 +129,10 @@ pub async fn run_main() -> Result<()> {
         cfg.ai.provider = String::new();
         let _ = config::save(&storage_dir, &cfg);
     }
+
+    std::thread::spawn(|| {
+        crate::ai::router::prewarm_router();
+    });
 
     match subcommand {
         "setup" => {
@@ -364,6 +370,8 @@ pub async fn run_main() -> Result<()> {
         || args.contains(&"--help".to_string());
     let is_gui_arg = subcommand == "gui" || args.contains(&"--gui".to_string());
 
+    let is_tauri_env = std::env::vars().any(|(k, _)| k.starts_with("TAURI_"));
+
     let run_tui_mode = if !has_tui {
         false
     } else if !has_gui {
@@ -371,6 +379,8 @@ pub async fn run_main() -> Result<()> {
     } else if is_tui_arg {
         true
     } else if is_gui_arg {
+        false
+    } else if is_tauri_env {
         false
     } else {
         is_terminal

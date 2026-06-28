@@ -576,41 +576,77 @@ pub fn handle_events(app: &mut App) -> Result<AppEvent> {
                 _ => {}
             },
 
-            AppMode::Clarification => match key.code {
-                KeyCode::Esc => {
-                    if let Some(tx) = app.clarification_tx.take() {
-                        let _ = tx.try_send("cancelled".to_string());
+            AppMode::Clarification => {
+                if app.clarification_typing {
+                    match key.code {
+                        KeyCode::Char(c) => {
+                            app.input.push(c);
+                            app.cursor_pos = app.input.len();
+                        }
+                        KeyCode::Backspace => {
+                            app.input.pop();
+                            app.cursor_pos = app.input.len();
+                        }
+                        KeyCode::Esc => {
+                            app.clarification_typing = false;
+                            app.input.clear();
+                            app.cursor_pos = 0;
+                        }
+                        KeyCode::Enter => {
+                            let entered = app.input.trim().to_string();
+                            if !entered.is_empty() {
+                                app.clarification_question = None;
+                                app.clarification_options.clear();
+                                app.mode = AppMode::Chat;
+                                app.clarification_typing = false;
+                                app.input.clear();
+                                app.cursor_pos = 0;
+
+                                app.push_message("user", &entered);
+                                app.start_thinking();
+                                return Ok(AppEvent::ClarificationAnswer(entered));
+                            }
+                        }
+                        _ => {}
                     }
-                    app.clarification_question = None;
-                    app.clarification_options.clear();
-                    app.mode = AppMode::Chat;
-                }
-                KeyCode::Up => {
-                    if app.clarification_cursor > 0 { app.clarification_cursor -= 1; }
-                }
-                KeyCode::Down => {
-                    if app.clarification_cursor + 1 < app.clarification_options.len() {
-                        app.clarification_cursor += 1;
+                } else {
+                    match key.code {
+                        KeyCode::Esc => {
+                            if let Some(tx) = app.clarification_tx.take() {
+                                let _ = tx.try_send("cancelled".to_string());
+                            }
+                            app.clarification_question = None;
+                            app.clarification_options.clear();
+                            app.mode = AppMode::Chat;
+                        }
+                        KeyCode::Up => {
+                            if app.clarification_cursor > 0 { app.clarification_cursor -= 1; }
+                        }
+                        KeyCode::Down => {
+                            if app.clarification_cursor + 1 < app.clarification_options.len() {
+                                app.clarification_cursor += 1;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let selected = app.clarification_options.get(app.clarification_cursor).cloned().unwrap_or_default();
+                            let is_custom = selected.to_lowercase().contains("custom") || selected.to_lowercase().contains("other");
+                            if is_custom {
+                                app.clarification_typing = true;
+                                app.input.clear();
+                                app.cursor_pos = 0;
+                            } else {
+                                app.push_message("user", &selected);
+                                app.clarification_question = None;
+                                app.clarification_options.clear();
+                                app.mode = AppMode::Chat;
+                                app.start_thinking();
+                                return Ok(AppEvent::ClarificationAnswer(selected));
+                            }
+                        }
+                        _ => {}
                     }
                 }
-                KeyCode::Enter => {
-                    let selected = app.clarification_options.get(app.clarification_cursor).cloned().unwrap_or_default();
-                    let is_custom = selected.to_lowercase().contains("custom") || selected.to_lowercase().contains("other");
-                    if is_custom {
-                        app.mode = AppMode::Chat;
-                        app.clarification_question = None;
-                        app.clarification_options.clear();
-                    } else {
-                        app.push_message("user", &selected);
-                        app.clarification_question = None;
-                        app.clarification_options.clear();
-                        app.mode = AppMode::Chat;
-                        app.start_thinking();
-                        return Ok(AppEvent::ClarificationAnswer(selected));
-                    }
-                }
-                _ => {}
-            },
+            }
 
             AppMode::ProviderSetup => match key.code {
                 KeyCode::Esc => { app.mode = AppMode::Chat; }
